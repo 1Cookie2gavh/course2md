@@ -77,6 +77,34 @@ pub struct RunOpts {
     #[arg(long)]
     pub no_download: bool,
 
+    /// 本次运行启用 LLM 字幕润色（覆盖配置文件）
+    #[arg(long)]
+    pub llm: bool,
+
+    /// 本次运行禁用 LLM 字幕润色
+    #[arg(long, conflicts_with = "llm")]
+    pub no_llm: bool,
+
+    /// 覆盖 LLM base URL（OpenAI 兼容）
+    #[arg(long)]
+    pub llm_base_url: Option<String>,
+
+    /// 覆盖 LLM API Key
+    #[arg(long)]
+    pub llm_api_key: Option<String>,
+
+    /// 覆盖 LLM 模型名
+    #[arg(long)]
+    pub llm_model: Option<String>,
+
+    /// 覆盖 LLM 校对提示词
+    #[arg(long)]
+    pub llm_prompt: Option<String>,
+
+    /// 关闭结束时「可开启 LLM」提示（本次运行）
+    #[arg(long)]
+    pub no_llm_hint: bool,
+
     /// 更详细日志
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -93,6 +121,31 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ModelsCmd,
     },
+    /// LLM 字幕润色配置
+    Llm {
+        #[command(subcommand)]
+        cmd: LlmCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LlmCmd {
+    /// 交互式配置并开启（缺省项会提示输入；也可全部用参数传入）
+    Setup {
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// 同时关闭结束提示
+        #[arg(long)]
+        disable_hint: bool,
+    },
+    /// 查看当前配置（密钥打码）
+    Status,
+    /// 关闭 LLM 润色（保留凭据）
+    Disable,
 }
 
 #[derive(Subcommand)]

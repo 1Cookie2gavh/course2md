@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod fetch;
+pub mod llm;
 pub mod media;
 pub mod models;
 pub mod pipeline;

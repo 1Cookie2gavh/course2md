@@ -177,6 +177,75 @@ out/<平台>/<标题>/<编号>/
 
 ---
 
+## LLM 字幕润色（可选）
+
+`course2md` 支持在 ASR 转写完成后，调用大语言模型（LLM）对字幕文本进行自动化校对与润色。
+
+- **润色目标**：修正语气词/口头禅（如「呃」、「嗯」、「这个那个」等）、重复字词、明显的同音错别字与专有名词拼写；**不增删实质内容、不翻译、不改变原意**。
+  - *示例*：`我我干了什么呢？我在，我这是我的Neo Vim` → `我干了什么呢？我在，这是我的Neo Vim`
+- **兼容接口**：支持任意 OpenAI 兼容的 `/chat/completions` 端点（如 DeepSeek、GLM、OpenAI 或本地部署的 vLLM / Ollama 等）。
+- **容错保证**：按 20 段语音合并批次并发起请求（`temperature=0`）。若某批次请求失败或响应解析异常，将自动回退保留 ASR 原始文本并给出警告，**绝不阻断整体转换流程**。
+
+### 快捷配置与命令
+
+通过 `llm` 子命令可以快速完成配置与管理（默认处于关闭状态）：
+
+```bash
+# 交互式配置并开启（缺省项提示输入，按回车可保留已配置项，保存后自动测试连通性）
+course2md llm setup
+
+# 也可以直接通过命令行参数非交互式配置
+course2md llm setup --base-url https://api.deepseek.com/v1 --api-key sk-xxxx --model deepseek-chat
+
+# 查看当前 LLM 配置状态（API Key 自动打码）
+course2md llm status
+
+# 暂时关闭 LLM 润色功能（保留已配置的凭据与端点）
+course2md llm disable
+```
+
+### 配置文件
+
+配置保存于本地 TOML 文件中：
+- **macOS / Linux**：`~/.config/course2md/config.toml`（遵循 `$XDG_CONFIG_HOME`）
+- **Windows**：`%APPDATA%\course2md\config.toml`
+
+文件结构示例：
+
+```toml
+[llm]
+enabled = true                               # 是否开启润色（默认 false）
+base_url = "https://api.deepseek.com/v1"     # OpenAI 兼容 API 地址（缺省协议自动补充 https://）
+api_key = "sk-xxxx"                          # API 密钥
+model = "deepseek-chat"                      # 模型名称
+prompt = ""                                  # 自定义校对提示词（可选，留空使用内置提示词）
+disable_hint = false                         # 是否永久关闭任务结束时的 LLM 开启提示（默认 false）
+```
+
+### 命令行运行时覆盖
+
+配置文件中的所有项均可在执行具体转换任务时通过命令行即时覆盖，无需修改配置文件：
+
+```bash
+# 本次运行强制启用 / 禁用 LLM
+course2md https://... --llm
+course2md https://... --no-llm
+
+# 临时指定其他模型或端点
+course2md https://... --llm --llm-base-url https://api.deepseek.com/v1 --llm-api-key sk-xxxx --llm-model deepseek-chat
+
+# 自定义校对提示词
+course2md https://... --llm --llm-prompt "请校对以下字幕..."
+```
+
+### 结束提示
+
+当 LLM 功能处于关闭状态时，每次转换任务完成后终端会打印一行关于可开启 LLM 润色的提示。若不需要该提示，可通过以下任一方式关闭：
+- 单次运行添加 `--no-llm-hint` 参数。
+- 在配置文件中设置 `disable_hint = true`，或运行 `course2md llm setup --disable-hint`。
+
+---
+
 ## 常用参数
 
 | 参数 | 说明 | 默认值 |
@@ -187,6 +256,9 @@ out/<平台>/<标题>/<编号>/
 | `--formats <格式>` | 输出格式，逗号分隔，可选 `md,html,json` | `md,html` |
 | `--provider <cpu/gpu>` | 指定推理后端；默认由 llama.cpp 自动调用 GPU | `gpu` |
 | `--keep-video` | 保留下载或提取的原始 `media.mp4` 文件 | 关闭 |
+| `--llm` | 本次运行启用 LLM 字幕润色（覆盖配置文件） | 关闭 |
+| `--no-llm` | 本次运行禁用 LLM 字幕润色（覆盖配置文件） | 关闭 |
+| `--no-llm-hint` | 本次运行关闭任务结束时的 LLM 开启提示 | 关闭 |
 
 查看完整参数与选项列表：
 
@@ -198,4 +270,4 @@ course2md --help
 
 ## 开源协议
 
-本项目基于 [MIT License](LICENSE) 开源。
+本项目基于 [MIT License](LICENSE) 开源。详见仓库根目录下的 [LICENSE](LICENSE) 文件。

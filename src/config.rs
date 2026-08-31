@@ -16,6 +16,8 @@ pub struct PipelineConfig {
     pub model_dir: PathBuf,
     pub keep_video: bool,
     pub no_download: bool,
+    /// LLM 字幕润色（已合并 CLI 覆盖后的生效配置）
+    pub llm: crate::llm::LlmSettings,
     /// `-o` 根目录，实际课程目录是 `{out_root}/{platform}/{title}/{id}/`
     pub out_root: PathBuf,
 }
@@ -100,6 +102,24 @@ impl PipelineConfig {
     pub fn meta_path(&self) -> PathBuf {
         self.out_dir.join("meta.json")
     }
+}
+
+/// 配置目录（XDG_CONFIG_HOME / Windows %APPDATA% / ~/.config）。
+pub fn config_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(d).join("course2md");
+    }
+    #[cfg(windows)]
+    {
+        if let Some(d) = std::env::var_os("APPDATA") {
+            return PathBuf::from(d).join("course2md");
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config").join("course2md")
 }
 
 /// 缓存目录（模型等）。

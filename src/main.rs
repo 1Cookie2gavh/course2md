@@ -1,6 +1,6 @@
 use clap::Parser;
-use course2md::cli::{Cli, Command, ModelsCmd, RunOpts};
-use course2md::{config, models, pipeline};
+use course2md::cli::{Cli, Command, LlmCmd, ModelsCmd, RunOpts};
+use course2md::{config, llm, models, pipeline};
 use tracing_subscriber::EnvFilter;
 
 fn init_logging(verbose: u8, quiet: bool) {
@@ -19,7 +19,34 @@ fn init_logging(verbose: u8, quiet: bool) {
         .init();
 }
 
+/// 配置文件 + CLI 覆盖 -> 生效 LLM 设置。
+fn resolve_llm(opts: &RunOpts) -> llm::LlmSettings {
+    let mut s = llm::load_config().llm;
+    if opts.no_llm {
+        s.enabled = false;
+    } else if opts.llm {
+        s.enabled = true;
+    }
+    if let Some(v) = &opts.llm_base_url {
+        s.base_url = v.clone();
+    }
+    if let Some(v) = &opts.llm_api_key {
+        s.api_key = v.clone();
+    }
+    if let Some(v) = &opts.llm_model {
+        s.model = v.clone();
+    }
+    if let Some(v) = &opts.llm_prompt {
+        s.prompt = Some(v.clone());
+    }
+    if opts.no_llm_hint {
+        s.disable_hint = true;
+    }
+    s
+}
+
 fn run_opts_to_cfg(source: String, opts: RunOpts) -> anyhow::Result<config::PipelineConfig> {
+    let llm = resolve_llm(&opts);
     Ok(config::PipelineConfig {
         url: source,
         out_root: opts.out.clone(),
@@ -35,6 +62,7 @@ fn run_opts_to_cfg(source: String, opts: RunOpts) -> anyhow::Result<config::Pipe
         model_dir: config::model_dir_from(opts.model_dir.as_deref()),
         keep_video: opts.keep_video,
         no_download: opts.no_download,
+        llm,
     })
 }
 
@@ -51,6 +79,39 @@ fn main() -> anyhow::Result<()> {
                 ModelsCmd::List { dir } => {
                     let root = config::model_dir_from(dir.as_deref());
                     models::list_models(&root);
+                }
+            }
+            Ok(())
+        }
+        Some(Command::Llm { cmd }) => {
+            init_logging(0, false);
+            match cmd {
+                LlmCmd::Setup {
+                    base_url,
+                    api_key,
+                    model,
+                    disable_hint,
+                } => {
+                    let cfg = llm::setup_interactive(
+                        llm::load_config(),
+                        base_url,
+                        api_key,
+                        model,
+                        disable_hint,
+                    )?;
+                    let path = llm::save_config(&cfg)?;
+                    println!("已写入并开启：{}", path.display());
+                    match llm::test_connection(&cfg.llm) {
+                        Ok(()) => println!("连接测试通过。"),
+                        Err(e) => eprintln!("连接测试未通过（已保存配置）：{e:#}"),
+                    }
+                }
+                LlmCmd::Status => llm::print_status(&llm::load_config()),
+                LlmCmd::Disable => {
+                    let mut cfg = llm::load_config();
+                    cfg.llm.enabled = false;
+                    let path = llm::save_config(&cfg)?;
+                    println!("已关闭 LLM 润色（凭据保留）：{}", path.display());
                 }
             }
             Ok(())

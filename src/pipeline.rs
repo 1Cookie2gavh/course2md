@@ -8,7 +8,7 @@ use crate::models;
 use crate::render;
 use crate::scene;
 use crate::timeline;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Instant;
 
@@ -105,6 +105,17 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     )
     .await?;
 
+    // 可选的 LLM 润色：尽早校验配置，避免跑完识别才发现配错
+    let events = if cfg.llm.enabled {
+        crate::llm::validate(&cfg.llm)?;
+        tracing::info!(model = %cfg.llm.model, "llm polish");
+        let ev = cfg.llm.clone();
+        let joined = tokio::task::spawn_blocking(move || crate::llm::polish(events, &ev)).await;
+        joined.context("LLM 线程 join 失败")?
+    } else {
+        events
+    };
+
     let sections = timeline::merge(frames.clone(), events.clone());
     timeline::write_jsonl(&cfg.timeline_path(), &frames, &events)?;
     tracing::info!(sections = sections.len(), "merged");
@@ -198,6 +209,9 @@ fn print_summary(
     }
     eprintln!("模型目录：{}", cfg.model_dir.display());
     eprintln!("──────────────────────────────");
+    if !cfg.llm.enabled && !cfg.llm.disable_hint {
+        crate::llm::write_hint_note(&crate::llm::config_path());
+    }
 }
 
 fn fmt_duration(secs: f64) -> String {
