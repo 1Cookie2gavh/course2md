@@ -27,8 +27,9 @@ course2md ./lecture.mp4
 ```
 
 > **首次运行说明**：
-> - **macOS (Apple Silicon)**：预编译版本默认使用 CoreML 后端，首次运行时会自动从 HuggingFace 拉取模型（约 1~2GB，保存在 `~/Library/Caches/qwen3-speech/`），无需额外配置即可全自动运行。
-> - **Linux / Windows**：默认使用 GPU/CPU 后端，首次运行时会自动下载 GGUF 识别模型（约 2.4GB，保存在 `~/.cache/course2md/models/`）。
+> - **macOS (Apple Silicon, `coreml`)**：首次交互式运行时，终端会提示选择下载的 ASR 模型：**Qwen3-ASR 0.6B**（默认，约 1~2GB）或 **Whisper large-v3-turbo**（约 1.5GB）。模型保存在 `~/Library/Caches/qwen3-speech/`。
+> - **Linux / Windows (`gpu` / `cpu`)**：默认下载 GGUF 识别模型（约 2.4GB，保存在 `~/.cache/course2md/models/`）。
+> - **云端 STT (`api`)**：无需下载任何本地模型，直接通过 OpenAI 兼容端点（如 OpenRouter）在线转写。
 
 ---
 
@@ -37,7 +38,7 @@ course2md ./lecture.mp4
 运行 `course2md` 依赖以下基础多媒体工具：
 - `ffmpeg` & `ffprobe`（音视频抽取与画面采样）
 - `yt-dlp`（在线视频解析与下载；仅处理在线链接时需要）
-- `llama-server`（由 `llama.cpp` 提供；仅在 `gpu` / `cpu` 识别后端下需要，macOS CoreML 模式无需安装）
+- `llama-server`（由 `llama.cpp` 提供；仅在本地 `gpu` / `cpu` 识别后端下需要，macOS `coreml` 与云端 `api` 模式无需安装）
 
 ---
 
@@ -139,14 +140,17 @@ cargo build --release
 
 ## 识别后端（ASR Backends）
 
-`course2md` 提供三种识别后端，可通过 `--provider <后端>` 或在配置文件中指定：
+`course2md` 提供多种识别后端，可通过 `--provider <后端>` 或在配置文件中指定：
 
 | 后端 (`--provider`) | 适用平台与默认策略 | 核心架构与模型 | 外部依赖 | 首次下载与缓存路径 | 特点 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`coreml`** | **macOS Apple Silicon**<br>(预编译包默认) | **Silero VAD v6.2.1 CoreML** (ANE)<br>+ **Qwen3-ASR 0.6B CoreML** ([speech-swift](https://github.com/soniqo/speech-swift)) | **零外部依赖**<br>(仅需同目录 `mlx.metallib`) | 约 1~2GB<br>`~/Library/Caches/qwen3-speech/`<br>*(支持 `HF_ENDPOINT` 镜像)* | 充分调用 Apple 神经网络引擎 (ANE) 与 GPU，内存开销小，无子进程 |
-| **`gpu`** | **Linux / Windows / Intel Mac**<br>(非 Apple Silicon 默认) | **ffmpeg silencedetect**<br>+ **Qwen3-ASR 1.7B GGUF Q8** | 需要 `llama-server`<br>(由 `llama.cpp` 提供) | 约 2.4GB<br>`~/.cache/course2md/models/` | 1.7B 高精度量化模型，支持 Metal / CUDA / Vulkan 等显卡加速 |
+| **`coreml`** | **macOS Apple Silicon**<br>(预编译包默认) | **Silero VAD v6.2.1 CoreML** (ANE)<br>+ **Qwen3-ASR 0.6B**（默认）或 **Whisper large-v3-turbo** ([speech-swift](https://github.com/soniqo/speech-swift)) | **零外部依赖**<br>(仅需同目录 `mlx.metallib`) | 约 1~2GB<br>`~/Library/Caches/qwen3-speech/`<br>*(支持 `HF_ENDPOINT` 镜像)* | 充分调用 Apple 神经网络引擎 (ANE) 与 GPU，功耗极低（3 分钟约 375 J），内存开销小，无子进程 |
+| **`gpu`** | **Linux / Windows / Intel Mac**<br>(非 Apple Silicon 默认) | **ffmpeg silencedetect**<br>+ **Qwen3-ASR 1.7B GGUF Q8** | 需要 `llama-server`<br>(由 `llama.cpp` 提供) | 约 2.4GB<br>`~/.cache/course2md/models/` | 1.7B 高精度量化模型，支持 Metal / CUDA / Vulkan 等显卡加速，吞吐极高 |
 | **`cpu`** | **通用兜底** | 同 `gpu`，禁用 GPU 卸载 (`-ngl 0`) | 需要 `llama-server` | 约 2.4GB<br>`~/.cache/course2md/models/` | 纯 CPU 计算，兼容性最高 |
+| **`api`** | **云端 STT（跨平台通用）** | **ffmpeg silencedetect**<br>+ OpenAI 兼容 `/audio/transcriptions` 端点（如 OpenRouter） | **零本地模型依赖**<br>(需网络与 API Key) | **无**（云端托管） | 零磁盘模型占用，低配置设备友好。*隐私提示：音频切片将上传云端。* |
 
+> **CoreML 模型切换**：使用 `--provider coreml` 时，可通过 `--asr-model qwen3`（默认）或 `--asr-model whisper` 切换。首次在交互式终端运行且未配置时，程序会提示选择并记忆至 `~/.config/course2md/asr_model`。
+>
 > **自动回落机制**：在 macOS 上如果 `coreml` 后端初始化或运行失败，系统会自动给出警告并无缝回退至 `gpu` / `llama-server` 模式，确保转换任务顺利完成。
 
 ---
@@ -193,11 +197,14 @@ cooldown = 10.0
 # 感兴趣区域（ROI），格式如 "40%,0%-100%,100%"，留空则比较全屏
 # roi = "40%,0%-100%,100%"
 
-# ASR 识别线程数
+# ASR 识别线程数（供本地 llama.cpp 使用）
 threads = 4
 
-# 识别后端：coreml（macOS Apple Silicon 推荐）| gpu | cpu
+# 识别后端：coreml（macOS Apple Silicon 推荐）| gpu | cpu | api
 # provider = "coreml"
+
+# CoreML 识别模型选择：qwen3（默认）| whisper（large-v3-turbo）
+# asr_model = "qwen3"
 
 # 单段语音最长切分秒数
 max_speech = 20.0
@@ -211,6 +218,14 @@ formats = ["md", "html"]
 # 是否保留下载的原始 media.mp4 文件
 keep_video = false
 
+[asr_api]
+# 云端 STT 配置（--provider api 时使用）
+# OpenAI 兼容 /audio/transcriptions 端点
+base_url = "https://openrouter.ai/api/v1"
+api_key = "sk-or-v1-xxxxxxxx"
+model = "qwen/qwen3-asr-flash-2026-02-10"
+# OpenRouter 上其他常用模型：openai/whisper-large-v3-turbo, qwen/qwen3-asr-1.7b
+
 [llm]
 # 是否默认开启 LLM 字幕润色（默认 false，运行 course2md llm setup 可交互式开启）
 enabled = false
@@ -218,7 +233,7 @@ enabled = false
 # OpenAI 兼容 API 地址（如未包含协议头会自动补全 https://）
 base_url = "https://api.deepseek.com/v1"
 
-# API 密钥（文件权限自动设置为 0600）
+# API 密钥（文件权限在 Unix 上自动设置为 0600）
 api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 # 使用的模型名称
@@ -230,6 +245,27 @@ prompt = ""
 # 是否永久关闭任务结束时的 LLM 开启提示（默认 false）
 disable_hint = false
 ```
+
+---
+
+## 云端 STT 支持 (`--provider api`)
+
+`course2md` 支持接入任意 OpenAI 兼容的 `/audio/transcriptions` 端点，无需本地显卡与大模型下载：
+
+- **推荐服务**：OpenRouter 托管的 `qwen/qwen3-asr-flash-2026-02-10`（约 $0.000035 / 秒音频）。
+- **兼容模型**：支持 `openai/whisper-large-v3-turbo`、`qwen/qwen3-asr-1.7b` 等。
+- **密钥获取与配置**：可通过 `--asr-api-key`、配置文件 `[asr_api].api_key` 或 `OPENROUTER_API_KEY` 环境变量传入。
+
+```bash
+# 通过环境变量使用 OpenRouter 转写
+export OPENROUTER_API_KEY=sk-or-v1-xxxx
+course2md https://... --provider api
+
+# 命令行即时覆盖模型
+course2md https://... --provider api --asr-api-model openai/whisper-large-v3-turbo
+```
+
+> **隐私提示**：使用 `--provider api` 时，语音切片将上传至所配置的云端服务完成转写；视频截图、SSIM 画面分析与 VAD 静音切分仍全部在本地执行。
 
 ---
 
@@ -274,6 +310,15 @@ course2md https://... --no-llm-hint
 
 ---
 
+## 语言与国际化（Language & i18n）
+
+`course2md` CLI 具备多语言自适应能力：
+
+- **默认语言**：英文（English）。
+- **自动本地化**：当系统环境变量（`LC_ALL`、`LC_MESSAGES` 或 `LANG`）以 `zh` 开头时，命令行帮助信息、完成摘要、提示信息与交互式输入均自动切换为中文。
+
+---
+
 ## 输出目录结构
 
 转换产物按 `out/<平台>/<标题>/<编号>/` 格式自动归档：
@@ -298,21 +343,21 @@ out/<平台>/<标题>/<编号>/
 
 ```text
 ──────── course2md 完成 ────────
-标题：计算机科学导论-第01讲
-输出目录：out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f
+标题: 计算机科学导论-第01讲
+输出目录: out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f
 
-文稿：
+文稿:
   out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/course.md
   out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/course.html
-截图：out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/frames/  （24 张）
-音频：out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/audio.wav
-视频：已删除（需要时加 --keep-video）
-时间线：out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/timeline.jsonl
+截图: out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/frames/ (24 张)
+音频: out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/audio.wav
+视频: 已删除 (--keep-video 可保留)
+时间线: out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/timeline.jsonl
 
-统计：24 张截图 / 142 段语音 / 8930 字
-耗时：47s
-峰值内存：1406 MB（course2md） + 最大子进程 59 MB（llama-server/ffmpeg 等）
-模型目录：/Users/username/.cache/course2md/models
+统计: 24 张截图 / 142 段语音 / 8930 字
+耗时: 47s
+峰值内存: 1406 MB (course2md) + 最大子进程 59 MB (llama-server/ffmpeg)
+模型目录: /Users/username/.cache/course2md/models
 ──────────────────────────────
 ```
 
@@ -323,13 +368,17 @@ out/<平台>/<标题>/<编号>/
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
 | `-o, --out <目录>` | 指定输出根目录 | `out` |
-| `--provider <coreml/gpu/cpu>` | 识别后端：`coreml`（macOS 默认）、`gpu`（非 Mac 默认）、`cpu` | 视平台而定 |
+| `--provider <coreml/gpu/cpu/api>` | 识别后端：`coreml`（macOS 默认）、`gpu`（非 Mac 默认）、`cpu`、`api`（云端 STT） | 视平台而定 |
+| `--asr-model <qwen3/whisper>` | CoreML 识别模型变体（`qwen3` 0.6B 或 `whisper` large-v3-turbo） | `qwen3` |
+| `--asr-api-base-url <URL>` | 云端 STT base URL（OpenAI 兼容） | `https://openrouter.ai/api/v1` |
+| `--asr-api-key <KEY>` | 云端 STT API Key（亦可设置 `OPENROUTER_API_KEY` 环境变量） | 配置文件 / 环境变量 |
+| `--asr-api-model <模型名>` | 云端 STT 模型名称（如 `qwen/qwen3-asr-flash-2026-02-10`） | `qwen/qwen3-asr-flash-2026-02-10` |
 | `--similarity <0~1>` | SSIM 画面相似度阈值；**数值越低截图越多** | `0.85` |
 | `--sample-interval <秒>` | 画面采样检查间隔（秒） | `1.0` |
 | `--cooldown <秒>` | 连续两张截图之间的最短间隔时间（秒） | `10.0` |
 | `--roi <x1,y1-x2,y2>` | 只比较画面指定区域（如 `40%,0%-100%,100%`） | 全屏 |
 | `--formats <格式>` | 输出格式，逗号分隔，可选 `md,html,json` | `md,html` |
-| `--threads <数量>` | ASR 识别线程数 | `4` |
+| `--threads <数量>` | ASR 识别线程数（供本地 `gpu`/`cpu` 后端使用） | `4` |
 | `--max-speech <秒>` | 单段语音最长切分秒数 | `20.0` |
 | `--keep-video` | 保留下载或提取的原始 `media.mp4` 文件 | 关闭 |
 | `--no-download` | 跳过下载（目录中已有 `media.mp4` 时） | 关闭 |
@@ -347,15 +396,19 @@ course2md --help
 
 ---
 
-## 性能实测（Benchmarks）
+## 性能与功耗实测（Benchmarks）
 
-测试素材：时长 **3 分钟** 的标准 1080p 教学课件录屏视频：
+在 Apple Silicon (arm64) 上运行 **3 分钟** 1080p 教学课件视频实测，通过 `powermetrics` 采集硬件功率（整机空闲基线 ≈ 1.9 W）：
 
-| 运行平台与硬件 | 识别后端 (`--provider`) | 端到端总耗时 | 峰值内存占用 | 依赖与资源特征 |
-| :--- | :--- | :--- | :--- | :--- |
-| **macOS arm64**<br>(Apple Silicon M系列) | `coreml`<br>*(默认)* | **47s** | 本进程 ~1.4 GB | **零外部依赖**，使用 Neural Engine + Metal 原生推理，缓存后模型加载仅需 ~5s |
-| **macOS arm64**<br>(Apple Silicon M系列) | `gpu`<br>*(llama.cpp Metal)* | **15s** | 本进程 ~20 MB<br>+ llama-server ~3.3 GB | 推理吞吐极高，需外部安装 `llama.cpp` 并加载 1.7B Q8 模型 |
-| **Arch Linux**<br>(x86_64, 16核) | `cpu` | **1m45s** | 本进程 ~13 MB<br>+ llama-server ~3.5 GB | 纯 CPU 计算，通用性强，无任何专有硬件依赖 |
+| 识别后端 (`--provider`) | 端到端耗时 | ASR 耗时 | 平均功率 (CPU / GPU / ANE) | 总消耗能量 | 峰值内存 (RSS) | 效率与特征 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`coreml` (qwen3 0.6B)**<br>*(macOS 默认)* | **48s** | 45.9s | 4.0 W / 0.2 W / **3.6 W** | **≈ 375 J** *(最省电)* | 1.41 GB（进程内） | **能效最高**；神经网络引擎 (ANE) 承担主要负载；适合笔记本电池运行；零外部依赖 |
+| **`coreml` (whisper-turbo)** | **86s** | 85.2s | 13.2 W / 0.2 W / 0.4 W | ≈ 1194 J | 1.51 GB（进程内） | 原生 Whisper large-v3-turbo CoreML；适合多语言及英文语音场景 |
+| **`gpu` (llama.cpp Metal)** | **12s** *(最快)* | 10.5s | 4.2 W / **17.6 W** / — | ≈ 263 J | 26 MB + 3.3 GB 子进程 | **吞吐最高**；Qwen3-ASR 1.7B Q8 跑满 GPU；需安装 `llama.cpp` |
+| **`cpu` (llama.cpp CPU)** | **27s** | 25.6s | 20.6 W / 0.9 W / — | ≈ 581 J | 26 MB + 4.8 GB 子进程 | 纯 CPU 计算，能耗较高；通用兜底方案 |
+| **`api` (云端 OpenRouter)** | **~10s** | — | < 1 W / — / — | 极小 | 极小 | 运算完全卸载至云端；低配硬件最佳方案 |
+
+👉 详见完整的 [macOS 性能与功耗基准报告](docs/BENCHMARKS.md)（含测试方法论、详细能耗拆解与复现脚本）。
 
 ---
 

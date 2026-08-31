@@ -27,8 +27,9 @@ course2md ./lecture.mp4
 ```
 
 > **First Run Note**:
-> - **macOS (Apple Silicon)**: Prebuilt binaries default to the CoreML backend. On the first run, model weights (~1–2 GB) are automatically fetched from HuggingFace to `~/Library/Caches/qwen3-speech/`. No manual setup required.
-> - **Linux / Windows**: Defaults to the GPU/CPU backend via `llama.cpp`. On the first run, the GGUF ASR model (~2.4 GB) is automatically downloaded to `~/.cache/course2md/models/`.
+> - **macOS (Apple Silicon, `coreml`)**: On first interactive run, `course2md` will prompt you to choose an ASR model to download: **Qwen3-ASR 0.6B** (~1–2 GB, default) or **Whisper large-v3-turbo** (~1.5 GB). Weights are cached under `~/Library/Caches/qwen3-speech/`.
+> - **Linux / Windows (`gpu` / `cpu`)**: Downloads the GGUF ASR model (~2.4 GB) to `~/.cache/course2md/models/`.
+> - **Cloud STT (`api`)**: No local model download needed; transcribes via an OpenAI-compatible endpoint (e.g. OpenRouter).
 
 ---
 
@@ -37,7 +38,7 @@ course2md ./lecture.mp4
 `course2md` relies on the following multimedia tools:
 - `ffmpeg` & `ffprobe` (Audio/video extraction and slide sampling)
 - `yt-dlp` (Online video parsing and downloading; only needed for online URLs)
-- `llama-server` (Provided by `llama.cpp`; only needed for `gpu` / `cpu` backends, not required for macOS CoreML mode)
+- `llama-server` (Provided by `llama.cpp`; only needed for local `gpu` / `cpu` backends, not required for macOS `coreml` or cloud `api` mode)
 
 ---
 
@@ -139,14 +140,17 @@ cargo build --release
 
 ## ASR Backends
 
-`course2md` supports three speech recognition backends via `--provider <backend>` or configuration:
+`course2md` provides multiple speech recognition backends via `--provider <backend>` or configuration:
 
 | Backend (`--provider`) | Target & Default Policy | Architecture & Models | External Dependencies | Model Download & Cache Path | Highlights |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`coreml`** | **macOS Apple Silicon**<br>(Default for prebuilt arm64) | **Silero VAD v6.2.1 CoreML** (ANE)<br>+ **Qwen3-ASR 0.6B CoreML** ([speech-swift](https://github.com/soniqo/speech-swift)) | **Zero external dependencies**<br>(requires co-located `mlx.metallib`) | ~1–2 GB<br>`~/Library/Caches/qwen3-speech/`<br>*(supports `HF_ENDPOINT` mirror)* | Leverages Apple Neural Engine (ANE) and Metal; lightweight memory footprint; no daemon process |
-| **`gpu`** | **Linux / Windows / Intel Mac**<br>(Default on non-Apple-Silicon) | **ffmpeg silencedetect**<br>+ **Qwen3-ASR 1.7B GGUF Q8** | Requires `llama-server`<br>(from `llama.cpp`) | ~2.4 GB<br>`~/.cache/course2md/models/` | High-precision 1.7B Q8 quantized model; accelerates via Metal / CUDA / Vulkan |
+| **`coreml`** | **macOS Apple Silicon**<br>(Default for prebuilt arm64) | **Silero VAD v6.2.1 CoreML** (ANE)<br>+ **Qwen3-ASR 0.6B** (default) or **Whisper large-v3-turbo** ([speech-swift](https://github.com/soniqo/speech-swift)) | **Zero external dependencies**<br>(requires co-located `mlx.metallib`) | ~1–2 GB<br>`~/Library/Caches/qwen3-speech/`<br>*(supports `HF_ENDPOINT` mirror)* | Leverages Apple Neural Engine (ANE) and Metal; lowest power consumption (~375 J per 3 min); lightweight memory footprint; no daemon process |
+| **`gpu`** | **Linux / Windows / Intel Mac**<br>(Default on non-Apple-Silicon) | **ffmpeg silencedetect**<br>+ **Qwen3-ASR 1.7B GGUF Q8** | Requires `llama-server`<br>(from `llama.cpp`) | ~2.4 GB<br>`~/.cache/course2md/models/` | High-precision 1.7B Q8 quantized model; fastest throughput via Metal / CUDA / Vulkan |
 | **`cpu`** | **Universal Fallback** | Same as `gpu`, with `-ngl 0` | Requires `llama-server` | ~2.4 GB<br>`~/.cache/course2md/models/` | Pure CPU execution; maximum hardware compatibility |
+| **`api`** | **Cloud STT (Any platform)** | **ffmpeg silencedetect**<br>+ OpenAI-compatible `/audio/transcriptions` (e.g. OpenRouter) | **Zero local model dependencies**<br>(requires network & API key) | **None** (Cloud-hosted) | Zero disk consumption, offloads computation to cloud. *Privacy note: audio chunks are uploaded.* |
 
+> **CoreML Model Selection**: When using `--provider coreml`, switch models via `--asr-model qwen3` (default) or `--asr-model whisper`. On first run in an interactive terminal, `course2md` will ask and remember your preference in `~/.config/course2md/asr_model`.
+>
 > **Automatic Fallback**: On macOS, if the `coreml` backend fails during initialization or runtime, `course2md` automatically logs a warning and falls back to the `gpu` / `llama-server` pipeline to ensure task completion.
 
 ---
@@ -193,11 +197,14 @@ cooldown = 10.0
 # Region of Interest (ROI), e.g. "40%,0%-100%,100%"; empty compares full frame
 # roi = "40%,0%-100%,100%"
 
-# ASR transcription thread count
+# ASR transcription thread count (for local llama.cpp)
 threads = 4
 
-# Inference backend: coreml (macOS Apple Silicon) | gpu | cpu
+# Inference backend: coreml (macOS Apple Silicon) | gpu | cpu | api
 # provider = "coreml"
+
+# CoreML model variant: qwen3 (default) | whisper (large-v3-turbo)
+# asr_model = "qwen3"
 
 # Maximum speech segment duration in seconds before splitting
 max_speech = 20.0
@@ -210,6 +217,14 @@ formats = ["md", "html"]
 
 # Keep downloaded media.mp4 video file after processing
 keep_video = false
+
+[asr_api]
+# Cloud STT settings (used when --provider api)
+# OpenAI-compatible /audio/transcriptions endpoint
+base_url = "https://openrouter.ai/api/v1"
+api_key = "sk-or-v1-xxxxxxxx"
+model = "qwen/qwen3-asr-flash-2026-02-10"
+# Other popular models on OpenRouter: openai/whisper-large-v3-turbo, qwen/qwen3-asr-1.7b
 
 [llm]
 # Enable LLM subtitle polishing by default (default: false; run `course2md llm setup` to configure)
@@ -230,6 +245,27 @@ prompt = ""
 # Permanently suppress the post-run LLM suggestion hint (default: false)
 disable_hint = false
 ```
+
+---
+
+## Cloud STT via OpenRouter (`--provider api`)
+
+`course2md` supports transcribing via any OpenAI-compatible `/audio/transcriptions` endpoint without requiring local GPU or ASR model downloads:
+
+- **Default Provider**: OpenRouter with `qwen/qwen3-asr-flash-2026-02-10` (~$0.000035/second of audio).
+- **Other Models**: Supports `openai/whisper-large-v3-turbo`, `qwen/qwen3-asr-1.7b`, etc.
+- **API Key Resolution**: Reads `--asr-api-key`, config file `[asr_api].api_key`, or the `OPENROUTER_API_KEY` environment variable.
+
+```bash
+# Transcribe using OpenRouter with an environment variable
+export OPENROUTER_API_KEY=sk-or-v1-xxxx
+course2md https://... --provider api
+
+# Override model or endpoint via CLI
+course2md https://... --provider api --asr-api-model openai/whisper-large-v3-turbo
+```
+
+> **Privacy Note**: With `--provider api`, speech audio chunks are uploaded to the specified cloud endpoint for transcription. Video frames, OCR/SSIM, and VAD segmentation remain strictly local.
 
 ---
 
@@ -273,6 +309,15 @@ course2md https://... --no-llm-hint
 
 ---
 
+## Language & Internationalization
+
+`course2md` automatically adapts its interface to your system environment:
+
+- **Default Language**: English.
+- **Automatic Localization**: If your system locale (`LC_ALL`, `LC_MESSAGES`, or `LANG`) starts with `zh`, help messages, runtime logs, completion summaries, and interactive prompts automatically switch to Chinese.
+
+---
+
 ## Output Structure
 
 Generated assets are organized into `out/<platform>/<title>/<id>/`:
@@ -296,23 +341,23 @@ out/<platform>/<title>/<id>/
 Upon completion, `course2md` outputs a comprehensive summary detailing paths, metrics, elapsed time, and resident memory usage (RSS):
 
 ```text
-──────── course2md Complete ────────
+──────── course2md done ────────
 Title: Introduction to Computer Science - Lecture 01
-Output Directory: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f
+Output dir: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f
 
 Documents:
   out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/course.md
   out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/course.html
-Frames: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/frames/ (24 images)
+Screenshots: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/frames/ (24 images)
 Audio: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/audio.wav
-Video: Cleaned up (pass --keep-video to preserve)
+Video: deleted (--keep-video)
 Timeline: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/timeline.jsonl
 
-Statistics: 24 slides / 142 speech segments / 8930 characters
+Stats: 24 screenshots / 142 speech segments / 8930 chars
 Elapsed: 47s
-Peak Memory: 1406 MB (course2md) + max child process 59 MB (llama-server/ffmpeg)
-Model Directory: /Users/username/.cache/course2md/models
-───────────────────────────────────
+Peak memory: 1406 MB (course2md) + largest child 59 MB (llama-server/ffmpeg)
+Model dir: /Users/username/.cache/course2md/models
+──────────────────────────────
 ```
 
 ---
@@ -322,13 +367,17 @@ Model Directory: /Users/username/.cache/course2md/models
 | Option | Description | Default |
 | :--- | :--- | :--- |
 | `-o, --out <DIR>` | Output root directory | `out` |
-| `--provider <coreml/gpu/cpu>` | ASR backend: `coreml` (macOS arm64), `gpu` (non-Mac), `cpu` | Platform default |
+| `--provider <coreml/gpu/cpu/api>` | ASR backend: `coreml` (macOS arm64), `gpu` (non-Mac), `cpu`, or `api` (cloud STT) | Platform default |
+| `--asr-model <qwen3/whisper>` | CoreML ASR model variant (`qwen3` 0.6B or `whisper` large-v3-turbo) | `qwen3` |
+| `--asr-api-base-url <URL>` | Cloud STT base URL (OpenAI-compatible) | `https://openrouter.ai/api/v1` |
+| `--asr-api-key <KEY>` | Cloud STT API Key (or set `OPENROUTER_API_KEY` env) | Config / Env |
+| `--asr-api-model <MODEL>` | Cloud STT model slug (e.g. `qwen/qwen3-asr-flash-2026-02-10`) | `qwen/qwen3-asr-flash-2026-02-10` |
 | `--similarity <0~1>` | SSIM similarity threshold; **lower = more slides captured** | `0.85` |
 | `--sample-interval <SEC>` | Frame sampling check interval in seconds | `1.0` |
 | `--cooldown <SEC>` | Minimum seconds between two consecutive slide captures | `10.0` |
 | `--roi <x1,y1-x2,y2>` | Region of interest for slide comparison (e.g. `40%,0%-100%,100%`) | Full frame |
 | `--formats <FORMATS>` | Comma-separated output formats: `md,html,json` | `md,html` |
-| `--threads <N>` | Number of ASR worker threads | `4` |
+| `--threads <N>` | Number of ASR worker threads (for local `gpu`/`cpu`) | `4` |
 | `--max-speech <SEC>` | Maximum speech segment duration in seconds | `20.0` |
 | `--keep-video` | Preserve downloaded/extracted `media.mp4` | Disabled |
 | `--no-download` | Skip downloading (when `media.mp4` exists in directory) | Disabled |
@@ -346,15 +395,19 @@ course2md --help
 
 ---
 
-## Benchmarks
+## Benchmarks & Power Metrics
 
-Measured on a **3-minute** 1080p recorded lecture video:
+Measured on Apple Silicon (arm64) running a **3-minute** 1080p recorded lecture clip with `powermetrics` hardware sampling (idle baseline ≈ 1.9 W):
 
-| Platform & Hardware | ASR Backend (`--provider`) | End-to-End Elapsed | Peak Memory (RSS) | Characteristics |
-| :--- | :--- | :--- | :--- | :--- |
-| **macOS arm64**<br>(Apple Silicon M-series) | `coreml`<br>*(Default)* | **47s** | Course2md ~1.4 GB | **Zero external dependencies**; utilizes Neural Engine + Metal; warm model load takes only ~5s |
-| **macOS arm64**<br>(Apple Silicon M-series) | `gpu`<br>*(llama.cpp Metal)* | **15s** | Course2md ~20 MB<br>+ llama-server ~3.3 GB | Highest throughput; requires `llama.cpp` and 1.7B Q8 GGUF model |
-| **Arch Linux**<br>(x86_64, 16-core) | `cpu` | **1m45s** | Course2md ~13 MB<br>+ llama-server ~3.5 GB | Pure CPU computation; runs on any standard x86_64 Linux environment |
+| Backend (`--provider`) | End-to-End Wall Time | ASR-Only Time | Avg Power (CPU / GPU / ANE) | Total Energy | Peak Memory (RSS) | Efficiency & Characteristics |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`coreml` (qwen3 0.6B)**<br>*(macOS Default)* | **48s** | 45.9s | 4.0 W / 0.2 W / **3.6 W** | **≈ 375 J** *(Lowest)* | 1.41 GB (in-process) | **Most energy-efficient**; Neural Engine handles heavy lifting; ideal for battery life; zero external dependencies |
+| **`coreml` (whisper-turbo)** | **86s** | 85.2s | 13.2 W / 0.2 W / 0.4 W | ≈ 1194 J | 1.51 GB (in-process) | Native Whisper large-v3-turbo CoreML; optimized for multilingual & English audio |
+| **`gpu` (llama.cpp Metal)** | **12s** *(Fastest)* | 10.5s | 4.2 W / **17.6 W** / — | ≈ 263 J | 26 MB + 3.3 GB child | **Highest throughput**; GPU bursts with Qwen3-ASR 1.7B Q8; requires `llama-server` |
+| **`cpu` (llama.cpp CPU)** | **27s** | 25.6s | 20.6 W / 0.9 W / — | ≈ 581 J | 26 MB + 4.8 GB child | Pure CPU execution; high power draw; universal fallback |
+| **`api` (Cloud OpenRouter)** | **~10s** | — | < 1 W / — / — | Negligible | Minimal | Offloaded to cloud; fastest on low-spec hardware |
+
+👉 See the comprehensive [macOS Benchmark Report](docs/BENCHMARKS.md) for full methodology, energy breakdowns, and reproduction scripts.
 
 ---
 
