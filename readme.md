@@ -14,8 +14,6 @@ course2md https://youtu.be/dQw4w9WgXcQ
 course2md ./lecture.mp4
 ```
 
-course2md 遵循 Unix 哲学：只做好“视频转图文文字稿”这一件事。v0.2.0 即将发布。
-
 ## 安装
 
 运行需要 `ffmpeg`、`ffprobe`、`yt-dlp` 和 llama.cpp 提供的 `llama-server`。
@@ -35,7 +33,7 @@ cd course2md
 cargo install --path .
 ```
 
-### Arch Linux / CachyOS
+### Arch Linux 
 
 ```bash
 sudo pacman -S ffmpeg yt-dlp
@@ -156,5 +154,3 @@ out/<平台>/<标题>/<编号>/
 ```bash
 course2md --help
 ```
-
-项目地址：https://github.com/mizorewww/course2md
