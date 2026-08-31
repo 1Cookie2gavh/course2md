@@ -16,9 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh
 
 需要：`ffmpeg`、`yt-dlp`、`llama-server`。macOS：`brew install ffmpeg yt-dlp llama.cpp`。
 
-```bash
-course2md models download
-```
+第一次运行会自动下载识别模型（约 2.4GB），期间不要退出。也可手动：`course2md models download`。
 
 结果在 `out/平台/标题/编号/`。
 

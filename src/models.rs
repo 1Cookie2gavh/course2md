@@ -141,15 +141,30 @@ pub fn llama_paths(root: &Path) -> LlamaAsr {
     }
 }
 
-pub fn ensure_llama(root: &Path) -> Result<LlamaAsr> {
+pub fn llama_ready(root: &Path) -> bool {
     let p = llama_paths(root);
-    if !p.model.is_file() || fs::metadata(&p.model)?.len() < 1_000_000 {
-        anyhow::bail!("缺少 Qwen3-ASR GGUF，请运行 `course2md models download`");
+    p.model.is_file()
+        && fs::metadata(&p.model).map(|m| m.len() > 1_000_000).unwrap_or(false)
+        && p.mmproj.is_file()
+        && fs::metadata(&p.mmproj).map(|m| m.len() > 1_000_000).unwrap_or(false)
+}
+
+pub fn ensure_llama(root: &Path) -> Result<LlamaAsr> {
+    if !llama_ready(root) {
+        anyhow::bail!("缺少识别模型");
     }
-    if !p.mmproj.is_file() || fs::metadata(&p.mmproj)?.len() < 1_000_000 {
-        anyhow::bail!("缺少 mmproj GGUF，请运行 `course2md models download`");
+    Ok(llama_paths(root))
+}
+
+/// 没有模型就下载；下载过程请保持进程运行。
+pub async fn ensure_llama_or_download(root: &Path) -> Result<LlamaAsr> {
+    if llama_ready(root) {
+        return ensure_llama(root);
     }
-    Ok(p)
+    tracing::warn!("第一次运行，正在下载识别模型（约 2.4GB），请不要退出");
+    eprintln!("第一次运行，正在下载识别模型（约 2.4GB），请不要退出。");
+    download_models(root, ModelSize::Q17B).await?;
+    ensure_llama(root)
 }
 
 /// 下载 llama.cpp Qwen3-ASR GGUF。

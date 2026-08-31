@@ -94,7 +94,7 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
 
     tracing::info!(device = %cfg.provider, "transcribe");
-    let llama = models::ensure_llama(&cfg.model_dir)?;
+    let llama = models::ensure_llama_or_download(&cfg.model_dir).await?;
     let events = asr::run(
         &cfg,
         AsrInput {

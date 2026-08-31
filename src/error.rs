@@ -20,7 +20,13 @@ pub fn cmd_error(program: &str, code: Option<i32>, stderr: &str) -> anyhow::Erro
 /// 校验外部工具存在（ffmpeg / yt-dlp）。
 pub fn require_cmd(cmd: &str) -> Result<()> {
     if which_sync(cmd).is_none() {
-        anyhow::bail!("required command not found: {cmd} (try: brew install {cmd})");
+        let hint = match cmd {
+            "llama-server" => "brew install llama.cpp",
+            "ffmpeg" | "ffprobe" => "brew install ffmpeg",
+            "yt-dlp" => "brew install yt-dlp",
+            other => other,
+        };
+        anyhow::bail!("未找到 {cmd}，请先安装：{hint}");
     }
     Ok(())
 }
