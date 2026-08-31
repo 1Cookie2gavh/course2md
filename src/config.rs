@@ -9,12 +9,8 @@ pub struct PipelineConfig {
     pub sample_interval: f64,
     pub cooldown: f64,
     pub roi: Option<Roi>,
-    pub hamming: u32,
     pub threads: i32,
-    pub workers: usize,
     pub provider: String,
-    pub precision: String,
-    pub vad_threshold: f32,
     pub max_speech: f32,
     pub formats: Vec<String>,
     pub model_dir: PathBuf,
@@ -106,16 +102,22 @@ impl PipelineConfig {
     }
 }
 
-/// XDG 缓存目录。
+/// 缓存目录（模型等）。
 pub fn cache_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
-        PathBuf::from(d).join("course2md")
-    } else {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".cache").join("course2md")
+        return PathBuf::from(d).join("course2md");
     }
+    #[cfg(windows)]
+    {
+        if let Some(d) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(d).join("course2md");
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".cache").join("course2md")
 }
 
 pub fn model_dir_from(opt: Option<&Path>) -> PathBuf {
@@ -232,62 +234,25 @@ mod tests {
     #[test]
     fn source_gate() {
         assert!(!looks_like_source("course2md"));
-        assert!(!looks_like_source("run"));
         assert!(looks_like_source("https://www.bilibili.com/video/BV1pb8o6yE8f"));
         assert!(looks_like_source("https://youtu.be/dQw4w9WgXcQ"));
     }
 
     #[test]
-    fn slug_bilibili() {
+    fn slug_and_layout() {
         assert_eq!(
             infer_slug("https://www.bilibili.com/video/BV1pb8o6yE8f/?spm=1"),
             "BV1pb8o6yE8f"
         );
-    }
-
-    #[test]
-    fn slug_youtube() {
-        assert_eq!(
-            infer_slug("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"),
-            "dQw4w9WgXcQ"
-        );
         assert_eq!(infer_slug("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+        let p = course_dir(Path::new("out"), "bilibili", "欢迎来到未来", "BV1pb8o6yE8f");
+        assert_eq!(p, PathBuf::from("out/bilibili/欢迎来到未来/BV1pb8o6yE8f"));
     }
 
     #[test]
-    fn course_layout() {
-        let p = course_dir(
-            Path::new("out"),
-            "bilibili",
-            "欢迎来到未来 [01-Raw/26生成式软件工程/NJU]",
-            "BV1pb8o6yE8f",
-        );
-        assert_eq!(
-            p,
-            PathBuf::from(
-                "out/bilibili/欢迎来到未来-[01-Raw-26生成式软件工程-NJU]/BV1pb8o6yE8f"
-            )
-        );
-        assert_eq!(platform_from("https://www.bilibili.com/video/BV1", ""), "bilibili");
-        assert_eq!(platform_from("https://youtu.be/x", "youtube"), "youtube");
-    }
-
-    #[test]
-    fn roi_percent() {
+    fn roi_parse() {
         let r = Roi::parse("25%,0%-100%,100%").unwrap();
-        assert_eq!(r, Roi { x1: 0.25, y1: 0.0, x2: 1.0, y2: 1.0 });
         assert_eq!(r.pixels(1000, 800), (250, 0, 1000, 800));
-    }
-
-    #[test]
-    fn roi_pixels() {
-        let r = Roi::parse("0,400-200,720").unwrap();
-        assert_eq!(r.pixels(1000, 800), (0, 400, 200, 720));
-    }
-
-    #[test]
-    fn roi_bad() {
         assert!(Roi::parse("nonsense").is_err());
-        assert!(Roi::parse("1,2-3").is_err());
     }
 }

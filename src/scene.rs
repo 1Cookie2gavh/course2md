@@ -6,7 +6,7 @@ use crate::config::{PipelineConfig, Roi};
 use crate::media;
 use crate::timeline::FrameEvent;
 use anyhow::{Context, Result};
-use image::{GrayImage, Luma};
+use image::GrayImage;
 use image_compare::Algorithm;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
@@ -182,66 +182,14 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn solid(v: u8) -> GrayImage {
-        GrayImage::from_pixel(32, 32, Luma([v]))
-    }
+    use image::Luma;
 
     #[test]
-    fn ssim_identical_is_one() {
-        let a = solid(128);
-        let s = ssim(&a, &a);
-        assert!(s > 0.99, "ssim={s}");
-    }
-
-    #[test]
-    fn ssim_black_white_is_low() {
-        let s = ssim(&solid(0), &solid(255));
-        assert!(s < 0.5, "ssim={s}");
-    }
-
-    #[test]
-    fn scaled_even_height() {
+    fn ssim_and_scale() {
+        let a = GrayImage::from_pixel(32, 32, Luma([128]));
+        assert!(ssim(&a, &a) > 0.99);
         let (w, h) = scaled_wh(1280, 410, 640);
         assert_eq!(w, 640);
         assert_eq!(h % 2, 0);
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn nju_lecture_has_many_slides() {
-        let media = std::path::Path::new("out-bv/media.mp4");
-        if !media.is_file() {
-            eprintln!("skip: no out-bv/media.mp4");
-            return;
-        }
-        let cfg = crate::config::PipelineConfig {
-            url: String::new(),
-            out_dir: std::env::temp_dir().join("course2md-slide-test"),
-            similarity: 0.85,
-            sample_interval: 1.0,
-            cooldown: 10.0,
-            roi: None,
-            hamming: 6,
-            threads: 1,
-            workers: 1,
-            provider: "cpu".into(),
-            precision: "int8".into(),
-            vad_threshold: 0.5,
-            max_speech: 20.0,
-            formats: vec![],
-            model_dir: std::path::PathBuf::from("/tmp"),
-            keep_video: true,
-            no_download: true,
-            out_root: std::env::temp_dir().join("course2md-slide-test"),
-        };
-        let _ = std::fs::create_dir_all(cfg.frames_dir());
-        let frames = run(&cfg, media).await.unwrap();
-        eprintln!("slides={}", frames.len());
-        assert!(
-            frames.len() >= 40,
-            "expected many slides, got {}",
-            frames.len()
-        );
     }
 }

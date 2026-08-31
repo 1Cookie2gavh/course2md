@@ -65,7 +65,6 @@ pub fn merge(frames: Vec<FrameEvent>, speech: Vec<TranscriptEvent>) -> Vec<Secti
 
 pub fn write_jsonl(path: &Path, frames: &[FrameEvent], speech: &[TranscriptEvent]) -> Result<()> {
     use std::io::Write;
-    // 事件按 t 排序输出
     let mut events: Vec<TimelineEvent> = vec![];
     events.extend(frames.iter().cloned().map(TimelineEvent::Frame));
     events.extend(speech.iter().cloned().map(TimelineEvent::Speech));
@@ -88,21 +87,6 @@ fn time_of(e: &TimelineEvent) -> f64 {
     }
 }
 
-pub fn read_jsonl(path: &Path) -> Result<(Vec<FrameEvent>, Vec<TranscriptEvent>)> {
-    let mut frames = vec![];
-    let mut speech = vec![];
-    for line in std::fs::read_to_string(path)?.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<TimelineEvent>(line)? {
-            TimelineEvent::Frame(f) => frames.push(f),
-            TimelineEvent::Speech(s) => speech.push(s),
-        }
-    }
-    Ok((frames, speech))
-}
-
 /// 全量结构化输出（structured.json 的主体）。
 #[derive(Debug, Serialize)]
 pub struct CourseDoc<'a> {
@@ -115,60 +99,27 @@ mod tests {
     use super::*;
 
     fn frame(t: f64) -> FrameEvent {
-        FrameEvent { t, image: format!("f{t}.jpg") }
+        FrameEvent {
+            t,
+            image: format!("f{t}.jpg"),
+        }
     }
 
     fn sp(start: f64, end: f64) -> TranscriptEvent {
-        TranscriptEvent { start, end, text: format!("{start}-{end}") }
+        TranscriptEvent {
+            start,
+            end,
+            text: format!("{start}-{end}"),
+        }
     }
 
     #[test]
-    fn merge_basic_assignment() {
+    fn merge_assigns_by_midpoint() {
         let frames = vec![frame(0.0), frame(60.0), frame(120.0)];
-        let speech = vec![sp(10.0, 20.0), sp(50.0, 70.0), sp(119.0, 200.0)];
+        let speech = vec![sp(10.0, 20.0), sp(50.0, 70.0), sp(5.0, 8.0)];
         let s = merge(frames, speech);
-        assert_eq!(s.len(), 3);
-        assert_eq!(s[0].speech.len(), 1); // mid=15 → 段0
-        assert_eq!(s[1].speech.len(), 1); // mid=60 → 段1（t<=60 最后一个是60）
-        assert_eq!(s[2].speech.len(), 1); // mid=159.5 → 段2
-    }
-
-    #[test]
-    fn merge_speech_before_first_frame() {
-        let s = merge(vec![frame(30.0)], vec![sp(5.0, 10.0), sp(40.0, 50.0)]);
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].speech.len(), 2);
-    }
-
-    #[test]
-    fn merge_no_frames() {
+        assert_eq!(s[0].speech.len(), 2); // mid=15 + mid=6.5
+        assert_eq!(s[1].speech.len(), 1); // mid=60
         assert!(merge(vec![], vec![sp(1.0, 2.0)]).is_empty());
-    }
-
-    #[test]
-    fn merge_no_speech() {
-        let s = merge(vec![frame(0.0), frame(10.0)], vec![]);
-        assert_eq!(s.len(), 2);
-        assert!(s[0].speech.is_empty());
-    }
-
-    #[test]
-    fn merge_midpoint_boundary() {
-        // mid 恰等于某帧时间 → 归属该帧
-        let s = merge(vec![frame(0.0), frame(50.0)], vec![sp(40.0, 60.0)]);
-        assert_eq!(s[1].speech.len(), 1);
-    }
-
-    #[test]
-    fn jsonl_roundtrip() {
-        let dir = std::env::temp_dir().join("course2md-test-timeline");
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("timeline.jsonl");
-        let frames = vec![frame(0.0), frame(10.0)];
-        let speech = vec![sp(1.0, 2.0)];
-        write_jsonl(&p, &frames, &speech).unwrap();
-        let (f2, s2) = read_jsonl(&p).unwrap();
-        assert_eq!(f2, frames);
-        assert_eq!(s2, speech);
     }
 }

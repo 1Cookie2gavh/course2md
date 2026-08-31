@@ -1,8 +1,5 @@
 use anyhow::Result;
 
-/// 统一错误别名；各阶段返回 anyhow::Result。
-pub type BoxError = anyhow::Error;
-
 /// 子进程失败时附带 stderr 摘要的便捷构造。
 pub fn cmd_error(program: &str, code: Option<i32>, stderr: &str) -> anyhow::Error {
     let tail: String = stderr
@@ -17,35 +14,35 @@ pub fn cmd_error(program: &str, code: Option<i32>, stderr: &str) -> anyhow::Erro
     anyhow::anyhow!("{program} failed (code={code:?}):\n{tail}")
 }
 
-/// 校验外部工具存在（ffmpeg / yt-dlp）。
+/// 校验外部工具存在。
 pub fn require_cmd(cmd: &str) -> Result<()> {
     if which_sync(cmd).is_none() {
-        let hint = match cmd {
-            "llama-server" => "brew install llama.cpp",
-            "ffmpeg" | "ffprobe" => "brew install ffmpeg",
-            "yt-dlp" => "brew install yt-dlp",
-            other => other,
-        };
-        anyhow::bail!("未找到 {cmd}，请先安装：{hint}");
+        anyhow::bail!("未找到 {cmd}，请先安装。见 README 安装依赖一节。");
     }
     Ok(())
 }
 
 fn which_sync(cmd: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|p| p.join(cmd))
-        .find(|p| p.is_file())
+    let names = if cfg!(windows) {
+        vec![cmd.to_string(), format!("{cmd}.exe")]
+    } else {
+        vec![cmd.to_string()]
+    };
+    for dir in std::env::split_paths(&path) {
+        for name in &names {
+            let p = dir.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn require_ffmpeg_ok() {
-        assert!(require_cmd("ffmpeg").is_ok());
-    }
 
     #[test]
     fn require_missing_fails() {

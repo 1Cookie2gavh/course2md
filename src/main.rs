@@ -8,8 +8,6 @@ fn init_logging(verbose: u8, quiet: bool) {
         "error"
     } else if verbose >= 2 {
         "debug"
-    } else if verbose == 1 {
-        "info"
     } else {
         "info"
     };
@@ -30,12 +28,8 @@ fn run_opts_to_cfg(source: String, opts: RunOpts) -> anyhow::Result<config::Pipe
         sample_interval: opts.sample_interval,
         cooldown: opts.cooldown,
         roi: opts.roi.map(|s| config::Roi::parse(&s)).transpose()?,
-        hamming: opts.hamming,
         threads: opts.threads,
-        workers: opts.workers,
         provider: opts.provider,
-        precision: opts.precision,
-        vad_threshold: opts.vad_threshold,
         max_speech: opts.max_speech,
         formats: opts.formats,
         model_dir: config::model_dir_from(opts.model_dir.as_deref()),
@@ -50,11 +44,9 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Models { cmd }) => {
             init_logging(0, false);
             match cmd {
-                ModelsCmd::Download { size, dir } => {
+                ModelsCmd::Download { dir } => {
                     let root = config::model_dir_from(dir.as_deref());
-                    let size = models::ModelSize::parse(&size)?;
-                    tokio::runtime::Runtime::new()?
-                        .block_on(models::download_models(&root, size))?;
+                    tokio::runtime::Runtime::new()?.block_on(models::download_models(&root))?;
                 }
                 ModelsCmd::List { dir } => {
                     let root = config::model_dir_from(dir.as_deref());

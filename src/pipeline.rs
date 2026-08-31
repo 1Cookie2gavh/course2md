@@ -114,10 +114,102 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         let _ = tokio::fs::remove_file(&media).await;
     }
 
-    tracing::info!(
-        secs = format_args!("{:.1}", t_total.elapsed().as_secs_f64()),
-        out = %cfg.out_dir.display(),
-        "done"
-    );
+    let elapsed = t_total.elapsed().as_secs_f64();
+    let peak = peak_rss_mb();
+    print_summary(&cfg, &meta, &sections, elapsed, peak);
     Ok(())
+}
+
+fn print_summary(
+    cfg: &PipelineConfig,
+    meta: &VideoMeta,
+    sections: &[timeline::Section],
+    elapsed_secs: f64,
+    peak_mb: Option<f64>,
+) {
+    let out = &cfg.out_dir;
+    let speech_n: usize = sections.iter().map(|s| s.speech.len()).sum();
+    let chars: usize = sections
+        .iter()
+        .flat_map(|s| s.speech.iter())
+        .map(|e| e.text.chars().count())
+        .sum();
+
+    eprintln!();
+    eprintln!("──────── course2md 完成 ────────");
+    eprintln!("标题：{}", meta.title);
+    eprintln!("输出目录：{}", out.display());
+    eprintln!();
+    eprintln!("文稿：");
+    for f in &cfg.formats {
+        let name = match f.as_str() {
+            "md" => "course.md",
+            "html" => "course.html",
+            "json" => "structured.json",
+            other => other,
+        };
+        let p = out.join(name);
+        if p.is_file() {
+            eprintln!("  {}", p.display());
+        }
+    }
+    eprintln!("截图：{}/frames/  （{} 张）", out.display(), sections.len());
+    eprintln!("音频：{}", cfg.audio_path().display());
+    if cfg.keep_video {
+        eprintln!("视频：{}  （已保留）", cfg.media_path().display());
+    } else {
+        eprintln!("视频：已删除（需要时加 --keep-video）");
+    }
+    eprintln!("时间线：{}", cfg.timeline_path().display());
+    eprintln!();
+    eprintln!(
+        "统计：{} 张截图 / {} 段语音 / {} 字",
+        sections.len(),
+        speech_n,
+        chars
+    );
+    eprintln!("耗时：{}", fmt_duration(elapsed_secs));
+    match peak_mb {
+        Some(mb) => eprintln!("峰值内存（本进程 RSS）：{mb:.0} MB"),
+        None => eprintln!("峰值内存：不可用"),
+    }
+    eprintln!("模型目录：{}", cfg.model_dir.display());
+    eprintln!("──────────────────────────────");
+}
+
+fn fmt_duration(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m{:02}s", s / 3600, (s % 3600) / 60, s % 60)
+    }
+}
+
+/// 本进程峰值常驻集。Linux 为 KB，macOS 为字节。不含 llama-server 子进程显存。
+fn peak_rss_mb() -> Option<f64> {
+    #[cfg(unix)]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        let rss = usage.ru_maxrss as f64;
+        #[cfg(target_os = "macos")]
+        {
+            return Some(rss / (1024.0 * 1024.0));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Some(rss / 1024.0);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }

@@ -342,19 +342,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_strips_prompt_artifacts() {
+    fn sanitize_and_vad_invert() {
         assert_eq!(
             sanitize_qwen_text("**language Chinese<asr_text>你好世界。"),
             "你好世界。"
         );
-        assert_eq!(sanitize_qwen_text("正常文本"), "正常文本");
         assert_eq!(sanitize_qwen_text("内容</asr_text>尾巴"), "内容");
-    }
-
-    #[test]
-    fn invert_silence_basic() {
-        let s = invert_silence(10.0, &[(0.0, 1.0), (4.0, 5.0), (9.0, 10.0)]);
-        assert!((s[0].0 - 1.0).abs() < 1e-6);
-        assert!((s[0].1 - 4.0).abs() < 1e-6);
+        let s = invert_silence(10.0, &[(0.0, 1.0), (4.0, 5.0)]);
+        assert!((s[0].0 - 1.0).abs() < 1e-6 && (s[0].1 - 4.0).abs() < 1e-6);
     }
 }

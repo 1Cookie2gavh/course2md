@@ -1,0 +1,77 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: course2md-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: course2md-linux-aarch64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: course2md-macos-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: course2md-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: course2md-windows-x86_64.exe
+            exe: true
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.exe != true
+        run: |
+          cp "target/${{ matrix.target }}/release/course2md" "${{ matrix.asset }}"
+          chmod +x "${{ matrix.asset }}"
+
+      - name: Package (windows)
+        if: matrix.exe == true
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/course2md.exe" "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

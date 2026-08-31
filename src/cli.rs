@@ -49,38 +49,27 @@ pub struct RunOpts {
     #[arg(long)]
     pub roi: Option<String>,
 
-    #[arg(long, default_value_t = 6, hide = true)]
-    pub hamming: u32,
-
     /// 识别线程数
     #[arg(long, default_value_t = 4)]
     pub threads: i32,
-
-    /// 并行识别路数
-    #[arg(long, default_value_t = 2)]
-    pub workers: usize,
 
     /// 识别设备：gpu（默认，Metal/CUDA）或 cpu
     #[arg(long, default_value = "gpu")]
     pub provider: String,
 
-    #[arg(long, default_value = "int8", hide = true)]
-    pub precision: String,
-
-    #[arg(long, default_value_t = 0.5, hide = true)]
-    pub vad_threshold: f32,
-
-    #[arg(long, default_value_t = 20.0, hide = true)]
+    /// 单段语音最长秒数（过长会切分）
+    #[arg(long, default_value_t = 20.0)]
     pub max_speech: f32,
 
     /// 输出格式
-    #[arg(long, value_delimiter = ',', default_value = "md,html,json")]
+    #[arg(long, value_delimiter = ',', default_value = "md,html")]
     pub formats: Vec<String>,
 
-    #[arg(long, hide = true)]
+    /// 模型目录（默认 ~/.cache/course2md/models）
+    #[arg(long)]
     pub model_dir: Option<PathBuf>,
 
-    /// 保留下载的视频文件
+    /// 保留下载的视频文件（media.mp4）
     #[arg(long)]
     pub keep_video: bool,
 
@@ -108,10 +97,8 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum ModelsCmd {
-    /// 下载离线识别模型
+    /// 下载离线识别模型（约 2.4GB）
     Download {
-        #[arg(long, default_value = "1.7b")]
-        size: String,
         #[arg(long)]
         dir: Option<PathBuf>,
     },

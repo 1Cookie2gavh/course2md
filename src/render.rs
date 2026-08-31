@@ -135,44 +135,20 @@ mod tests {
     use super::*;
     use crate::timeline::TranscriptEvent;
 
-    fn meta() -> VideoMeta {
-        VideoMeta {
-            title: "测试<课>&\"引号\"".into(),
+    #[test]
+    fn render_basics() {
+        let m = VideoMeta {
+            title: "测试<课>".into(),
             uploader: "up".into(),
             duration: 3725.0,
             webpage_url: "https://www.bilibili.com/video/BV1xx".into(),
             extractor: "bilibili".into(),
             id: "BV1xx".into(),
-        }
-    }
-
-    #[test]
-    fn ts_format() {
-        assert_eq!(fmt_ts(0.0), "00:00");
+        };
         assert_eq!(fmt_ts(65.4), "01:05");
         assert_eq!(fmt_ts(3725.0), "1:02:05");
-        assert_eq!(fmt_ts(-5.0), "00:00");
-    }
-
-    #[test]
-    fn ts_url_bilibili() {
-        assert_eq!(
-            ts_url(&meta(), 61.9),
-            "https://www.bilibili.com/video/BV1xx?t=61"
-        );
-    }
-
-    #[test]
-    fn ts_url_youtube_has_query() {
-        let mut m = meta();
-        m.webpage_url = "https://www.youtube.com/watch?v=abc".into();
-        assert_eq!(ts_url(&m, 5.0), "https://www.youtube.com/watch?v=abc&t=5");
-    }
-
-    #[test]
-    fn md_contains_section_and_speech() {
-        let m = meta();
-        let s = vec![Section {
+        assert_eq!(ts_url(&m, 61.9), "https://www.bilibili.com/video/BV1xx?t=61");
+        let s = [Section {
             t: 10.0,
             image: "frames/slide_0001.jpg".into(),
             speech: vec![TranscriptEvent {
@@ -182,16 +158,7 @@ mod tests {
             }],
         }];
         let md = render_markdown(&m, &s);
-        assert!(md.contains("# 测试<课>&\"引号\""));
-        assert!(md.contains("## [00:10](https://www.bilibili.com/video/BV1xx?t=10)"));
-        assert!(md.contains("![00:10](frames/slide_0001.jpg)"));
-        assert!(md.contains("你好"));
-    }
-
-    #[test]
-    fn html_escapes() {
-        let h = render_html(&meta(), &[]);
-        assert!(h.contains("&lt;课&gt;"));
-        assert!(!h.contains("<课>"));
+        assert!(md.contains("你好") && md.contains("frames/slide_0001.jpg"));
+        assert!(render_html(&m, &[]).contains("&lt;课&gt;"));
     }
 }

@@ -21,11 +21,6 @@ pub struct VideoMeta {
 }
 
 impl VideoMeta {
-    pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&raw)?)
-    }
-
     pub fn save(&self, path: &Path) -> Result<()> {
         std::fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())
@@ -115,26 +110,3 @@ async fn run_status(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn meta_roundtrip() {
-        let m = VideoMeta {
-            title: "t".into(),
-            uploader: "u".into(),
-            duration: 1.0,
-            webpage_url: "https://x".into(),
-            extractor: "generic".into(),
-            id: "id".into(),
-        };
-        let dir = std::env::temp_dir().join("course2md-test-meta");
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("meta.json");
-        m.save(&p).unwrap();
-        let m2 = VideoMeta::load(&p).unwrap();
-        assert_eq!(m.title, m2.title);
-        assert_eq!(m.duration, 1.0);
-    }
-}

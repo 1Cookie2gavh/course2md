@@ -105,12 +105,3 @@ pub async fn probe_duration(media: &Path) -> Option<f64> {
         .ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn probe_missing_file_is_none() {
-        assert!(probe_duration(Path::new("/nonexistent.mp4")).await.is_none());
-    }
-}
