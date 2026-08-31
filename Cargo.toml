@@ -1,6 +1,6 @@
 [package]
 name = "course2md"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Turn online course videos (YouTube/Bilibili) into image+transcript markdown notes"
 license = "MIT"
@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ureq = { version = "2", features = ["json"] }
+base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 indicatif = "0.17"

@@ -70,20 +70,20 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     );
 
     let dest = cfg.media_path();
-    if is_local {
+    // 本地文件直接原地处理，不拷贝；下载类输入落到 dest。
+    let media: std::path::PathBuf = if is_local {
         tracing::info!(path = %local.display(), "local video");
-        if dest != local && !dest.is_file() {
-            tokio::fs::copy(local, &dest).await?;
-        }
+        local.to_path_buf()
     } else if !cfg.no_download {
         tracing::info!("download video");
         fetch::download(&cfg.url, &dest, tracing::enabled!(tracing::Level::DEBUG)).await?;
+        dest
     } else {
         anyhow::ensure!(dest.is_file(), "--no-download 但 {} 不存在", dest.display());
-    }
+        dest
+    };
 
     tracing::info!("extract slides and audio");
-    let media = cfg.media_path();
     let audio_path = cfg.audio_path();
     let (frames_res, audio_res) = tokio::join!(
         scene::run(&cfg, &media),
@@ -110,22 +110,40 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     tracing::info!(sections = sections.len(), "merged");
 
     render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats).await?;
-    if !cfg.keep_video {
+    // 只删自己下载的视频；本地输入文件不动。
+    if !cfg.keep_video && media != local {
         let _ = tokio::fs::remove_file(&media).await;
     }
 
-    let elapsed = t_total.elapsed().as_secs_f64();
-    let peak = peak_rss_mb();
-    print_summary(&cfg, &meta, &sections, elapsed, peak);
+    #[cfg(unix)]
+    let (peak_mb, child_peak_mb) = (
+        peak_rss_mb(libc::RUSAGE_SELF),
+        peak_rss_mb(libc::RUSAGE_CHILDREN),
+    );
+    #[cfg(not(unix))]
+    let (peak_mb, child_peak_mb) = (None, None);
+    let stats = RunStats {
+        elapsed_secs: t_total.elapsed().as_secs_f64(),
+        peak_mb,
+        child_peak_mb,
+    };
+    print_summary(&cfg, &meta, &sections, &stats, &media, is_local);
     Ok(())
+}
+
+struct RunStats {
+    elapsed_secs: f64,
+    peak_mb: Option<f64>,
+    child_peak_mb: Option<f64>,
 }
 
 fn print_summary(
     cfg: &PipelineConfig,
     meta: &VideoMeta,
     sections: &[timeline::Section],
-    elapsed_secs: f64,
-    peak_mb: Option<f64>,
+    stats: &RunStats,
+    media: &Path,
+    is_local: bool,
 ) {
     let out = &cfg.out_dir;
     let speech_n: usize = sections.iter().map(|s| s.speech.len()).sum();
@@ -155,8 +173,10 @@ fn print_summary(
     }
     eprintln!("截图：{}/frames/  （{} 张）", out.display(), sections.len());
     eprintln!("音频：{}", cfg.audio_path().display());
-    if cfg.keep_video {
-        eprintln!("视频：{}  （已保留）", cfg.media_path().display());
+    if is_local {
+        eprintln!("视频：{}  （本地输入，未改动）", media.display());
+    } else if cfg.keep_video {
+        eprintln!("视频：{}  （已保留）", media.display());
     } else {
         eprintln!("视频：已删除（需要时加 --keep-video）");
     }
@@ -168,10 +188,13 @@ fn print_summary(
         speech_n,
         chars
     );
-    eprintln!("耗时：{}", fmt_duration(elapsed_secs));
-    match peak_mb {
-        Some(mb) => eprintln!("峰值内存（本进程 RSS）：{mb:.0} MB"),
-        None => eprintln!("峰值内存：不可用"),
+    eprintln!("耗时：{}", fmt_duration(stats.elapsed_secs));
+    match (stats.peak_mb, stats.child_peak_mb) {
+        (Some(mb), Some(c)) => eprintln!(
+            "峰值内存：{mb:.0} MB（course2md）+ 最大子进程 {c:.0} MB（llama-server/ffmpeg 等）"
+        ),
+        (Some(mb), None) => eprintln!("峰值内存（本进程 RSS）：{mb:.0} MB"),
+        _ => eprintln!("峰值内存：不可用"),
     }
     eprintln!("模型目录：{}", cfg.model_dir.display());
     eprintln!("──────────────────────────────");
@@ -188,12 +211,12 @@ fn fmt_duration(secs: f64) -> String {
     }
 }
 
-/// 本进程峰值常驻集。Linux 为 KB，macOS 为字节。不含 llama-server 子进程显存。
-fn peak_rss_mb() -> Option<f64> {
+/// 峰值常驻集（Linux 为 KB，macOS 为字节）。RUSAGE_CHILDREN 口径含 llama-server/ffmpeg。
+fn peak_rss_mb(who: libc::c_int) -> Option<f64> {
     #[cfg(unix)]
     {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        let rc = unsafe { libc::getrusage(who, usage.as_mut_ptr()) };
         if rc != 0 {
             return None;
         }
@@ -201,11 +224,11 @@ fn peak_rss_mb() -> Option<f64> {
         let rss = usage.ru_maxrss as f64;
         #[cfg(target_os = "macos")]
         {
-            return Some(rss / (1024.0 * 1024.0));
+            Some(rss / (1024.0 * 1024.0))
         }
         #[cfg(not(target_os = "macos"))]
         {
-            return Some(rss / 1024.0);
+            Some(rss / 1024.0)
         }
     }
     #[cfg(not(unix))]

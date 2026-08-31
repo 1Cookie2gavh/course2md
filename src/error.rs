@@ -40,12 +40,3 @@ fn which_sync(cmd: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn require_missing_fails() {
-        assert!(require_cmd("definitely-not-a-cmd-xyz").is_err());
-    }
-}

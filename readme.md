@@ -53,13 +53,8 @@ curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh
 ### Arch Linux / CachyOS
 
 ```bash
-# 1. 安装依赖
-sudo pacman -S ffmpeg yt-dlp
-
-# 安装 llama.cpp（官方源 / CachyOS 源 / AUR）
-sudo pacman -S llama-cpp
-# 或通过 AUR 安装:
-# yay -S llama.cpp
+# 1. 安装依赖（官方源及 CachyOS 均已包含 llama-cpp 与 llama-server）
+sudo pacman -S ffmpeg yt-dlp llama-cpp
 
 # 2. 安装 course2md
 curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | bash
@@ -170,15 +165,15 @@ out/<平台>/<标题>/<编号>/
 ├── course.html        # 独立排版 HTML 页面（默认生成）
 ├── structured.json    # 结构化数据（指定 --formats 包含 json 时生成）
 ├── frames/            # 文稿中引用的幻灯片/关键帧截图
-│   ├── frame_001.jpg
+│   ├── slide_0001.jpg
 │   └── ...
-├── audio.wav          # 提取的音频切片
+├── audio.wav          # 提取的音频（16kHz 单声道 WAV）
 ├── timeline.jsonl     # 带时间戳对齐的原始识别序列
 ├── meta.json          # 视频标题、作者、时长等元数据
-└── media.mp4          # 原始视频（默认转换完成后自动删除）
+└── media.mp4          # 下载的视频（本地文件输入时不复制；默认转换完成后自动删除）
 ```
 
-任务完成后，终端会打印生成的文稿路径、音视频路径、总耗时以及本进程峰值内存占用（RSS）。
+任务完成后，终端会详细打印生成文稿、截图、音频、视频及时间线路径，汇总统计（截图数/语音段数/字数）、总耗时，以及两项峰值内存占用（course2md 进程 RSS + 最大子进程如 llama-server/ffmpeg 等），让资源开销清晰透明。
 
 ---
 

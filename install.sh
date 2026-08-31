@@ -30,7 +30,7 @@ need llama-server
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "缺少依赖：${missing[*]}" >&2
   echo "macOS:  brew install ffmpeg yt-dlp llama.cpp" >&2
-  echo "Arch:   sudo pacman -S ffmpeg yt-dlp && 安装 llama.cpp（见 README）" >&2
+  echo "Arch:   sudo pacman -S ffmpeg yt-dlp llama-cpp" >&2
   echo "Debian: sudo apt install ffmpeg yt-dlp && 安装 llama.cpp（见 README）" >&2
   exit 1
 fi

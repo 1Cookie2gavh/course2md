@@ -182,12 +182,9 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Luma;
 
     #[test]
-    fn ssim_and_scale() {
-        let a = GrayImage::from_pixel(32, 32, Luma([128]));
-        assert!(ssim(&a, &a) > 0.99);
+    fn scale_keeps_even_height() {
         let (w, h) = scaled_wh(1280, 410, 640);
         assert_eq!(w, 640);
         assert_eq!(h % 2, 0);

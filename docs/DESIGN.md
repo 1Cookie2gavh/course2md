@@ -6,7 +6,8 @@ course2md 是单一用途的命令行工具：把 YouTube、Bilibili 或本地�
 
 ```text
 URL ── yt-dlp ─┐
-本地文件 ──────┴─> media.mp4 + meta.json
+               ├─> 视频源 + meta.json
+本地文件 ──────┘     (本地原地读取，在线下载为 media.mp4)
                          │
               ┌──────────┴──────────┐
               │                     │
@@ -18,7 +19,7 @@ URL ── yt-dlp ─┐
               │                     │
               │                     ▼
               │          llama-server + Qwen3-ASR
-              │          GGUF 本地语音识别
+              │          GGUF 本地语音识别 (300s 就绪超时)
               └──────────┬──────────┘
                          ▼
               按时间合并截图与语音
@@ -28,9 +29,9 @@ URL ── yt-dlp ─┐
           course.md / course.html / structured.json
 ```
 
-截图与音频提取并行执行。SSIM 只比较当前采样画面和上一张保留画面；低于 `--similarity` 时视为新画面，`--cooldown` 控制最短截图间隔。语音由 ffmpeg `silencedetect` 划分，再逐段提交给本机 `llama-server`。ASR 模型是约 2.4GB 的 Qwen3-ASR GGUF，缺失时自动下载。
+截图与音频提取并行执行。SSIM 只比较当前采样画面和上一张保留画面；低于 `--similarity` 时视为新画面，`--cooldown` 控制最短截图间隔。语音由 ffmpeg `silencedetect` 划分，再逐段提交给本机 `llama-server`（ASR 请求由标准 base64 编码，服务就绪超时放宽至 300 秒以适配纯 CPU 与慢盘环境）。ASR 模型是约 2.4GB 的 Qwen3-ASR GGUF，缺失时自动下载。
 
-时间线合并时，每段语音按时间中点归入当时最近的一张截图。默认生成 Markdown 和 HTML；JSON 通过 `--formats` 启用。完成后默认删除 `media.mp4`，其他中间产物保留。
+时间线合并时，每段语音按时间中点归入当时最近的一张截图。默认生成 Markdown 和 HTML；JSON 通过 `--formats` 启用。对于本地文件输入，直接原地处理且不改动原文件；对于在线下载的 `media.mp4`，转换完成后默认删除。完成摘要会清晰打印各产物路径、统计数据、总耗时以及本进程与子进程（llama-server/ffmpeg）的峰值常驻内存（RSS）。
 
 ## 模块
 

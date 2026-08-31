@@ -50,13 +50,12 @@ pub fn ensure_llama(root: &Path) -> Result<LlamaAsr> {
 
 /// 没有模型就下载；下载过程请保持进程运行。
 pub async fn ensure_llama_or_download(root: &Path) -> Result<LlamaAsr> {
-    if llama_ready(root) {
-        return ensure_llama(root);
+    if !llama_ready(root) {
+        tracing::warn!("第一次运行，正在下载识别模型（约 2.4GB），请不要退出");
+        eprintln!("第一次运行，正在下载识别模型（约 2.4GB），请不要退出。");
+        download_models(root).await?;
     }
-    tracing::warn!("第一次运行，正在下载识别模型（约 2.4GB），请不要退出");
-    eprintln!("第一次运行，正在下载识别模型（约 2.4GB），请不要退出。");
-    download_models(root).await?;
-    ensure_llama(root)
+    Ok(llama_paths(root))
 }
 
 /// 下载 llama.cpp Qwen3-ASR GGUF。

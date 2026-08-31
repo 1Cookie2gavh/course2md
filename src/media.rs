@@ -66,10 +66,10 @@ pub async fn probe_video(media: &Path) -> Option<VideoInfo> {
         .split(|c: char| c == ',' || c.is_whitespace())
         .filter_map(|t| t.trim().parse().ok())
         .collect();
-    if nums.len() < 3 {
-        if let Some(d) = probe_duration(media).await {
-            nums.push(d);
-        }
+    if nums.len() < 3
+        && let Some(d) = probe_duration(media).await
+    {
+        nums.push(d);
     }
     if nums.len() < 3 {
         return None;
@@ -95,6 +95,29 @@ pub async fn probe_duration(media: &Path) -> Option<f64> {
         .arg(media)
         .output()
         .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
+}
+
+/// [`probe_duration`] 的同步版（供阻塞线程使用）。
+pub fn probe_duration_blocking(media: &Path) -> Option<f64> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(media)
+        .output()
         .ok()?;
     if !out.status.success() {
         return None;

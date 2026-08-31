@@ -27,13 +27,13 @@ pub fn sanitize_qwen_text(s: &str) -> String {
         t = t[p + "<asr_text>".len()..].trim();
     }
     let lower = t.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("language ") {
-        if let Some(i) = rest.find(char::is_whitespace) {
-            // 原串对齐
-            let skip = "language ".len() + i + 1;
-            if skip <= t.len() {
-                t = t[skip..].trim();
-            }
+    if let Some(rest) = lower.strip_prefix("language ")
+        && let Some(i) = rest.find(char::is_whitespace)
+    {
+        // 原串对齐
+        let skip = "language ".len() + i + 1;
+        if skip <= t.len() {
+            t = t[skip..].trim();
         }
     }
     t.to_string()
@@ -70,7 +70,7 @@ fn run_blocking(
     tracing::info!(bin = %bin.display(), port, ngl, "llama-server");
     let mut child = spawn_server(&bin, &input.model, &input.mmproj, ngl, threads, port)?;
     let base = format!("http://127.0.0.1:{port}");
-    if let Err(e) = wait_ready(&base, Duration::from_secs(120)) {
+    if let Err(e) = wait_ready(&base, Duration::from_secs(300)) {
         let _ = child.kill();
         return Err(e);
     }
@@ -187,7 +187,8 @@ fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
 
 fn transcribe_file(base: &str, wav: &Path) -> Result<String> {
     let bytes = std::fs::read(wav)?;
-    let b64 = b64(&bytes);
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let body = serde_json::json!({
         "temperature": 0.0,
         "max_tokens": 256,
@@ -215,30 +216,6 @@ fn transcribe_file(base: &str, wav: &Path) -> Result<String> {
     Ok(text)
 }
 
-fn b64(data: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for c in data.chunks(3) {
-        let a = c[0] as u32;
-        let b = if c.len() > 1 { c[1] as u32 } else { 0 };
-        let d = if c.len() > 2 { c[2] as u32 } else { 0 };
-        let n = (a << 16) | (b << 8) | d;
-        out.push(T[((n >> 18) & 63) as usize] as char);
-        out.push(T[((n >> 12) & 63) as usize] as char);
-        if c.len() > 1 {
-            out.push(T[((n >> 6) & 63) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if c.len() > 2 {
-            out.push(T[(n & 63) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
 fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<(f64, f64)>> {
     let out = Command::new("ffmpeg")
         .args([
@@ -250,7 +227,7 @@ fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<(f64, f64)>> {
         .output()
         .context("ffmpeg silencedetect")?;
     let log = String::from_utf8_lossy(&out.stderr);
-    let dur = crate_probe_dur(wav).unwrap_or(0.0);
+    let dur = crate::media::probe_duration_blocking(wav).unwrap_or(0.0);
     let mut silences: Vec<(f64, f64)> = vec![];
     let mut start: Option<f64> = None;
     for line in log.lines() {
@@ -300,22 +277,6 @@ fn split_max(segs: Vec<(f64, f64)>, max: f64) -> Vec<(f64, f64)> {
         }
     }
     out
-}
-
-fn crate_probe_dur(wav: &Path) -> Option<f64> {
-    let out = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(wav)
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 fn cut_wav(src: &Path, start: f64, end: f64, dest: &Path) -> Result<()> {

@@ -29,7 +29,7 @@ impl VideoMeta {
 
 /// 抓取元数据（不下载）。
 pub async fn fetch_meta(url: &str) -> Result<VideoMeta> {
-    let out = run(&mut Command::new("yt-dlp").args([
+    let out = run(Command::new("yt-dlp").args([
         "-J",
         "--no-warnings",
         "--no-playlist",

@@ -8,3 +8,4 @@ models/
 out-bv/
 out-bench/
 out-gpu/
+out-smoke/
