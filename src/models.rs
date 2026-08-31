@@ -124,50 +124,50 @@ pub fn ensure_models_prec(root: &Path, size: ModelSize, precision: &str) -> Resu
     Ok((vad, q))
 }
 
-/// 下载模型（带进度条）。幂等：已存在且非空则跳过。
-pub async fn download_models(root: &Path, size: ModelSize) -> Result<()> {
+const HF_GGUF: &str =
+    "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/main";
+
+#[derive(Debug, Clone)]
+pub struct LlamaAsr {
+    pub model: PathBuf,
+    pub mmproj: PathBuf,
+}
+
+pub fn llama_paths(root: &Path) -> LlamaAsr {
+    let d = root.join("llama-qwen3-1.7b");
+    LlamaAsr {
+        model: d.join("Qwen3-ASR-1.7B-Q8_0.gguf"),
+        mmproj: d.join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"),
+    }
+}
+
+pub fn ensure_llama(root: &Path) -> Result<LlamaAsr> {
+    let p = llama_paths(root);
+    if !p.model.is_file() || fs::metadata(&p.model)?.len() < 1_000_000 {
+        anyhow::bail!("缺少 Qwen3-ASR GGUF，请运行 `course2md models download`");
+    }
+    if !p.mmproj.is_file() || fs::metadata(&p.mmproj)?.len() < 1_000_000 {
+        anyhow::bail!("缺少 mmproj GGUF，请运行 `course2md models download`");
+    }
+    Ok(p)
+}
+
+/// 下载 llama.cpp Qwen3-ASR GGUF。
+pub async fn download_models(root: &Path, _size: ModelSize) -> Result<()> {
     fs::create_dir_all(root)?;
-    let vad = vad_path(root);
+    let p = llama_paths(root);
     download_file(
-        &format!("{GITHUB_ASR}/silero_vad.onnx"),
-        &vad,
-        "Silero VAD",
+        &format!("{HF_GGUF}/Qwen3-ASR-1.7B-Q8_0.gguf"),
+        &p.model,
+        "Qwen3-ASR-1.7B-Q8_0.gguf",
     )
     .await?;
-
-    let q = qwen3_paths(root, size);
-    fs::create_dir_all(&q.tokenizer)?;
-    match size {
-        ModelSize::Q17B => {
-            for (url, dest, label) in [
-                (format!("{MODELSCOPE_BASE}/model_1.7B/conv_frontend.onnx"), q.conv_frontend.clone(), "conv_frontend"),
-                (format!("{MODELSCOPE_BASE}/model_1.7B/encoder.int8.onnx"), q.encoder.clone(), "encoder.int8"),
-                (format!("{MODELSCOPE_BASE}/model_1.7B/decoder.int8.onnx"), q.decoder.clone(), "decoder.int8"),
-            ] {
-                download_file(&url, &dest, label).await?;
-            }
-            for f in ["vocab.json", "merges.txt", "tokenizer_config.json"] {
-                let _ = download_file(
-                    &format!("{MODELSCOPE_BASE}/tokenizer/{f}"),
-                    &q.tokenizer.join(f),
-                    f,
-                )
-                .await;
-            }
-        }
-        ModelSize::Q06B => {
-            // GitHub release 提供整包 tar.bz2
-            let tmp = std::env::temp_dir().join(format!("course2md-qwen3-0.6b-{}.tar.bz2", std::process::id()));
-            download_file(
-                &format!("{GITHUB_ASR}/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2"),
-                &tmp,
-                "qwen3-0.6b tar.bz2",
-            )
-            .await?;
-            extract_tar_bz2(&tmp, root, "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25", "qwen3-0.6b")?;
-            let _ = fs::remove_file(&tmp);
-        }
-    }
+    download_file(
+        &format!("{HF_GGUF}/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"),
+        &p.mmproj,
+        "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+    )
+    .await?;
     tracing::info!(path = %root.display(), "models ready");
     Ok(())
 }

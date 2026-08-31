@@ -1,168 +1,83 @@
-//! ASR 阶段：Silero VAD 切分语音段 → Qwen3-ASR 逐段离线解码。
+//! 语音识别：ffmpeg 静音检测分段 + llama.cpp（Qwen3-ASR）。
 //!
-//! sherpa-onnx 的类型虽标注了 Send，但推理本身是 CPU 密集的同步 C 调用：
-//! 整个阶段在单个阻塞线程内完成（构造 → VAD → 循环解码 → 返回事件），
-//! 对 tokio 而言就是一个可 await 的阻塞任务。
+//! 通过 `llama-server` 常驻进程走 GPU（macOS Metal / NVIDIA CUDA / CPU），
+//! 跨平台只依赖 PATH 上的 llama.cpp。
 
 use crate::config::PipelineConfig;
-use crate::models::Qwen3Paths;
 use crate::timeline::TranscriptEvent;
 use anyhow::{Context, Result};
-use sherpa_onnx::{
-    OfflineQwen3ASRModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
-    SileroVadModelConfig, VadModelConfig, VoiceActivityDetector, Wave,
-};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub struct AsrInput {
     pub wav: PathBuf,
-    pub vad_model: PathBuf,
-    pub qwen: Qwen3Paths,
+    pub model: PathBuf,
+    pub mmproj: PathBuf,
 }
 
-struct Seg {
-    start_sample: usize,
-    samples: Vec<f32>,
-}
-
-/// ASR 阶段入口（阻塞任务）。返回按时间升序的 TranscriptEvent 列表。
-pub async fn run(cfg: &PipelineConfig, input: AsrInput) -> Result<Vec<TranscriptEvent>> {
-    let threads = cfg.threads;
-    let workers = cfg.workers.max(1);
-    let vad_threshold = cfg.vad_threshold;
-    let max_speech = cfg.max_speech;
-    let provider = cfg.provider.clone();
-    tokio::task::spawn_blocking(move || {
-        run_blocking(&input, threads, vad_threshold, max_speech, workers, provider)
-    })
-        .await
-        .context("ASR 线程 join 失败")?
-}
-
-/// 清洗 Qwen3 转写中的提示词残留（如 `**language Chinese<asr_text>` 前缀与 `</asr_text>` 后缀）。
+/// 清洗 Qwen3 转写中的提示词残留。
 pub fn sanitize_qwen_text(s: &str) -> String {
     let mut t = s.trim();
-    // 去掉闭合标记后缀
     if let Some(p) = t.find("</asr_text>") {
         t = t[..p].trim();
     }
-    // 去掉最后一个 <asr_text> 及其之前的内容（含 **language 等提示）
     if let Some(p) = t.rfind("<asr_text>") {
         t = t[p + "<asr_text>".len()..].trim();
+    }
+    let lower = t.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("language ") {
+        if let Some(i) = rest.find(char::is_whitespace) {
+            // 原串对齐
+            let skip = "language ".len() + i + 1;
+            if skip <= t.len() {
+                t = t[skip..].trim();
+            }
+        }
     }
     t.to_string()
 }
 
+pub async fn run(cfg: &PipelineConfig, input: AsrInput) -> Result<Vec<TranscriptEvent>> {
+    let ngl = if cfg.provider.eq_ignore_ascii_case("cpu") {
+        0
+    } else {
+        99
+    };
+    let threads = cfg.threads;
+    let max_speech = cfg.max_speech;
+    tokio::task::spawn_blocking(move || run_blocking(&input, ngl, threads, max_speech))
+        .await
+        .context("ASR 线程 join 失败")?
+}
+
 fn run_blocking(
     input: &AsrInput,
+    ngl: i32,
     threads: i32,
-    vad_threshold: f32,
     max_speech: f32,
-    workers: usize,
-    provider: String,
 ) -> Result<Vec<TranscriptEvent>> {
-    let t0 = std::time::Instant::now();
-
-    let wave = Wave::read(
-        input
-            .wav
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("wav 路径非 UTF-8"))?,
-    )
-    .context("读取 audio.wav 失败（sherpa Wave::read）")?;
-    let sr = wave.sample_rate() as usize;
-    let samples = wave.samples();
-    let total = samples.len();
-    tracing::info!(secs = format_args!("{:.1}", total as f64 / sr as f64), sr, samples = total, "audio");
-
-    // ---- VAD ----
-    let mut vad_cfg = VadModelConfig::default();
-    vad_cfg.silero_vad = SileroVadModelConfig {
-        model: Some(
-            input
-                .vad_model
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("VAD 路径非 UTF-8"))?
-                .to_string(),
-        ),
-        threshold: vad_threshold,
-        min_silence_duration: 0.5,
-        min_speech_duration: 0.25,
-        window_size: 512,
-        max_speech_duration: max_speech,
-    };
-    vad_cfg.sample_rate = 16000;
-    let vad = VoiceActivityDetector::create(&vad_cfg, 60.0).context("创建 Silero VAD 失败")?;
-
-    let window = vad_cfg.silero_vad.window_size as usize;
-    let mut segs: Vec<Seg> = vec![];
-    let drain = |vad: &VoiceActivityDetector, segs: &mut Vec<Seg>| loop {
-        if vad.is_empty() {
-            break;
-        }
-        if let Some(s) = vad.front() {
-            segs.push(Seg {
-                start_sample: s.start().max(0) as usize,
-                samples: s.samples().to_vec(),
-            });
-            vad.pop();
-        } else {
-            break;
-        }
-    };
-    let mut i = 0usize;
-    while i + window <= total {
-        vad.accept_waveform(&samples[i..i + window]);
-        drain(&vad, &mut segs);
-        i += window;
+    let t0 = Instant::now();
+    let segs = ffmpeg_vad(&input.wav, max_speech)?;
+    tracing::info!(segs = segs.len(), "vad");
+    if segs.is_empty() {
+        anyhow::bail!("没有检测到语音");
     }
-    if total > i {
-        vad.accept_waveform(&samples[i..]);
+
+    let bin = find_llama_server()?;
+    let port = free_port()?;
+    tracing::info!(bin = %bin.display(), port, ngl, "llama-server");
+    let mut child = spawn_server(&bin, &input.model, &input.mmproj, ngl, threads, port)?;
+    let base = format!("http://127.0.0.1:{port}");
+    if let Err(e) = wait_ready(&base, Duration::from_secs(120)) {
+        let _ = child.kill();
+        return Err(e);
     }
-    vad.flush();
-    drain(&vad, &mut segs);
-    let vad_secs = t0.elapsed().as_secs_f64();
-    let speech_secs: f64 = segs.iter().map(|s| s.samples.len()).sum::<usize>() as f64 / sr as f64;
-    tracing::info!(
-        segs = segs.len(),
-        speech = format_args!("{:.0}s", speech_secs),
-        audio = format_args!("{:.0}s", total as f64 / sr as f64),
-        secs = format_args!("{:.1}", vad_secs),
-        "vad"
-    );
+    tracing::info!(secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "server ready");
 
-    // Qwen3-ASR（sherpa-onnx）
-    // LLM 自回归解码 batch=1，intra-op 并行扩展性差；段间独立，进程内并行收益近线性。
-    let q = &input.qwen;
-    let make_config = |num_threads: i32| {
-        let mut rc = OfflineRecognizerConfig::default();
-        rc.model_config.qwen3_asr = OfflineQwen3ASRModelConfig {
-            conv_frontend: Some(q.conv_frontend.display().to_string()),
-            encoder: Some(q.encoder.display().to_string()),
-            decoder: Some(q.decoder.display().to_string()),
-            tokenizer: Some(q.tokenizer.display().to_string()),
-            max_total_len: 1024,
-            max_new_tokens: 1024,
-            ..Default::default()
-        };
-        rc.model_config.tokens = Some(String::new());
-        rc.model_config.num_threads = num_threads;
-        rc.model_config.provider = Some(provider.clone());
-        rc
-    };
-
-    let per_worker_threads = (threads / workers as i32).max(1);
-    tracing::info!(provider = %provider, workers, threads = per_worker_threads, "onnx asr");
-    let t_load = std::time::Instant::now();
-
-    struct SegOut {
-        start: f64,
-        end: f64,
-        text: String,
-    }
-    let results: std::sync::Mutex<Vec<SegOut>> = Default::default();
-    let queue: std::sync::Mutex<std::collections::VecDeque<usize>> =
-        std::sync::Mutex::new((0..segs.len()).collect());
+    let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
     let pb = indicatif::ProgressBar::new(segs.len() as u64);
     pb.set_style(
         indicatif::ProgressStyle::with_template(
@@ -172,120 +87,254 @@ fn run_blocking(
         .progress_chars("##-"),
     );
 
-    let decode_t0 = std::time::Instant::now();
-    std::thread::scope(|scope| -> anyhow::Result<()> {
-        let mut handles = vec![];
-        for w in 0..workers {
-            let queue = &queue;
-            let results = &results;
-            let segs = &segs;
-            let pb = pb.clone();
-            let rc = make_config(per_worker_threads);
-            handles.push(scope.spawn(move || -> anyhow::Result<()> {
-                let recognizer = OfflineRecognizer::create(&rc)
-                    .context("创建 Qwen3-ASR recognizer 失败（检查模型文件/内存）")?;
-                if w == 0 {
-                    tracing::info!(secs = format_args!("{:.1}", t_load.elapsed().as_secs_f64()), "recognizer ready");
-                }
-                loop {
-                    let Some(i) = queue.lock().unwrap().pop_front() else {
-                        break;
-                    };
-                    let seg = &segs[i];
-                    let stream = recognizer.create_stream();
-                    stream.accept_waveform(16000, &seg.samples);
-                    recognizer.decode(&stream);
-                    let start = seg.start_sample as f64 / sr as f64;
-                    let end = start + seg.samples.len() as f64 / sr as f64;
-                    if let Some(result) = stream.get_result() {
-                        let text = sanitize_qwen_text(&result.text);
-                        if !text.is_empty() {
-                            results.lock().unwrap().push(SegOut { start, end, text });
-                        }
-                    }
-                    pb.inc(1);
-                }
-                Ok(())
-            }));
+    let mut events = vec![];
+    let mut err: Option<anyhow::Error> = None;
+    for (i, (start, end)) in segs.iter().copied().enumerate() {
+        let chunk = tmp.join(format!("c{i:04}.wav"));
+        if let Err(e) = cut_wav(&input.wav, start, end, &chunk) {
+            err = Some(e);
+            break;
         }
-        for h in handles {
-            h.join().map_err(|_| anyhow::anyhow!("ASR worker 线程 panic"))??;
+        match transcribe_file(&base, &chunk) {
+            Ok(raw) => {
+                let text = sanitize_qwen_text(&raw);
+                if !text.is_empty() {
+                    events.push(TranscriptEvent { start, end, text });
+                }
+            }
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
         }
-        Ok(())
-    })?;
+        let _ = std::fs::remove_file(&chunk);
+        pb.inc(1);
+    }
     pb.finish_and_clear();
-
-    let mut events: Vec<TranscriptEvent> = results
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .map(|o| TranscriptEvent {
-            start: o.start,
-            end: o.end,
-            text: o.text,
-        })
-        .collect();
-    events.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    let chars: usize = events.iter().map(|e| e.text.chars().count()).sum();
-    let el = decode_t0.elapsed().as_secs_f64();
-    let rtf = if speech_secs > 0.0 { el / speech_secs } else { 0.0 };
-    tracing::info!(
-        events = events.len(),
-        segs = segs.len(),
-        chars,
-        workers,
-        secs = format_args!("{el:.1}"),
-        rtf = format_args!("{rtf:.2}"),
-        "asr done"
-    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&tmp);
+    if let Some(e) = err {
+        return Err(e);
+    }
+    tracing::info!(n = events.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
     Ok(events)
 }
 
-/// 供单测/冒烟：对一个 wav 只跑 VAD（不加载大模型），返回段列表 (start_s, dur_s)。
-#[allow(dead_code)]
-pub fn vad_only(vad_model: &Path, wav: &Path, threshold: f32) -> Result<Vec<(f64, f64)>> {
-    let wave = Wave::read(wav.to_str().unwrap()).context("read wav")?;
-    let sr = wave.sample_rate() as usize;
-    let samples = wave.samples();
-    let mut vad_cfg = VadModelConfig::default();
-    vad_cfg.silero_vad = SileroVadModelConfig {
-        model: Some(vad_model.display().to_string()),
-        threshold,
-        min_silence_duration: 0.5,
-        min_speech_duration: 0.25,
-        window_size: 512,
-        max_speech_duration: 20.0,
-    };
-    vad_cfg.sample_rate = 16000;
-    let vad = VoiceActivityDetector::create(&vad_cfg, 60.0).context("create vad")?;
-    let window = 512usize;
-    let mut out = vec![];
-    let collect = |vad: &VoiceActivityDetector, out: &mut Vec<(f64, f64)>| loop {
-        if vad.is_empty() {
-            break;
+fn find_llama_server() -> Result<PathBuf> {
+    for name in ["llama-server", "llama-server.exe"] {
+        if let Some(p) = which(name) {
+            return Ok(p);
         }
-        if let Some(s) = vad.front() {
-            out.push((
-                s.start().max(0) as f64 / sr as f64,
-                s.samples().len() as f64 / sr as f64,
-            ));
-            vad.pop();
+    }
+    anyhow::bail!("找不到 llama-server，请安装 llama.cpp 并加入 PATH")
+}
+
+fn which(cmd: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|p| p.join(cmd))
+        .find(|p| p.is_file())
+}
+
+fn free_port() -> Result<u16> {
+    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+}
+
+fn spawn_server(
+    bin: &Path,
+    model: &Path,
+    mmproj: &Path,
+    ngl: i32,
+    threads: i32,
+    port: u16,
+) -> Result<Child> {
+    let mut cmd = Command::new(bin);
+    cmd.arg("-m")
+        .arg(model)
+        .arg("--mmproj")
+        .arg(mmproj)
+        .arg("-ngl")
+        .arg(ngl.to_string())
+        .arg("-c")
+        .arg("4096")
+        .arg("-n")
+        .arg("256")
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--host")
+        .arg("127.0.0.1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    cmd.spawn().context("启动 llama-server 失败")
+}
+
+fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
+    let t0 = Instant::now();
+    let url = format!("{base}/health");
+    loop {
+        if t0.elapsed() > timeout {
+            anyhow::bail!("llama-server 启动超时");
+        }
+        if ureq::get(&url).timeout(Duration::from_secs(2)).call().is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+fn transcribe_file(base: &str, wav: &Path) -> Result<String> {
+    let bytes = std::fs::read(wav)?;
+    let b64 = b64(&bytes);
+    let body = serde_json::json!({
+        "temperature": 0.0,
+        "max_tokens": 256,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Transcribe the audio."},
+                {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}
+            ]
+        }]
+    });
+    let resp = ureq::post(&format!("{base}/v1/chat/completions"))
+        .timeout(Duration::from_secs(180))
+        .set("Content-Type", "application/json")
+        .send_json(body)
+        .context("llama-server 识别请求失败")?;
+    let v: serde_json::Value = resp.into_json()?;
+    let text = v["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if text.is_empty() {
+        anyhow::bail!("llama-server 返回空文本: {v}");
+    }
+    Ok(text)
+}
+
+fn b64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for c in data.chunks(3) {
+        let a = c[0] as u32;
+        let b = if c.len() > 1 { c[1] as u32 } else { 0 };
+        let d = if c.len() > 2 { c[2] as u32 } else { 0 };
+        let n = (a << 16) | (b << 8) | d;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        if c.len() > 1 {
+            out.push(T[((n >> 6) & 63) as usize] as char);
         } else {
-            break;
+            out.push('=');
         }
-    };
-    let mut i = 0usize;
-    while i + window <= samples.len() {
-        vad.accept_waveform(&samples[i..i + window]);
-        collect(&vad, &mut out);
-        i += window;
+        if c.len() > 2 {
+            out.push(T[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
     }
-    if samples.len() > i {
-        vad.accept_waveform(&samples[i..]);
+    out
+}
+
+fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<(f64, f64)>> {
+    let out = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-i",
+        ])
+        .arg(wav)
+        .args(["-af", "silencedetect=noise=-28dB:d=0.4", "-f", "null", "-"])
+        .output()
+        .context("ffmpeg silencedetect")?;
+    let log = String::from_utf8_lossy(&out.stderr);
+    let dur = crate_probe_dur(wav).unwrap_or(0.0);
+    let mut silences: Vec<(f64, f64)> = vec![];
+    let mut start: Option<f64> = None;
+    for line in log.lines() {
+        if let Some(v) = line.split("silence_start:").nth(1) {
+            start = v.trim().parse().ok();
+        } else if let Some(v) = line.split("silence_end:").nth(1) {
+            let end: f64 = v.split_whitespace().next().unwrap_or("").parse().unwrap_or(0.0);
+            if let Some(s) = start.take() {
+                silences.push((s, end));
+            }
+        }
     }
-    vad.flush();
-    collect(&vad, &mut out);
-    Ok(out)
+    let mut speech = invert_silence(dur, &silences);
+    speech = split_max(speech, max_speech as f64);
+    speech.retain(|(a, b)| b - a >= 0.2);
+    if speech.is_empty() && dur > 0.2 {
+        speech = split_max(vec![(0.0, dur)], max_speech as f64);
+    }
+    Ok(speech)
+}
+
+fn invert_silence(dur: f64, sil: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut t = 0.0;
+    let mut out = vec![];
+    for &(s, e) in sil {
+        if s > t + 0.15 {
+            out.push((t, s));
+        }
+        t = e.max(t);
+    }
+    if dur > t + 0.15 {
+        out.push((t, dur));
+    }
+    out
+}
+
+fn split_max(segs: Vec<(f64, f64)>, max: f64) -> Vec<(f64, f64)> {
+    let mut out = vec![];
+    for (a, b) in segs {
+        let mut x = a;
+        while b - x > max {
+            out.push((x, x + max));
+            x += max;
+        }
+        if b - x >= 0.2 {
+            out.push((x, b));
+        }
+    }
+    out
+}
+
+fn crate_probe_dur(wav: &Path) -> Option<f64> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(wav)
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+fn cut_wav(src: &Path, start: f64, end: f64, dest: &Path) -> Result<()> {
+    let dur = (end - start).max(0.05);
+    let st = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-ss"])
+        .arg(format!("{start:.3}"))
+        .arg("-t")
+        .arg(format!("{dur:.3}"))
+        .arg("-i")
+        .arg(src)
+        .args(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
+        .arg(dest)
+        .status()
+        .context("ffmpeg cut")?;
+    if !st.success() {
+        anyhow::bail!("ffmpeg 切分失败");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -300,7 +349,12 @@ mod tests {
         );
         assert_eq!(sanitize_qwen_text("正常文本"), "正常文本");
         assert_eq!(sanitize_qwen_text("内容</asr_text>尾巴"), "内容");
-        assert_eq!(sanitize_qwen_text("**language Chinese<asr_text>你好</asr_text>"), "你好");
-        assert_eq!(sanitize_qwen_text("  空白  "), "空白");
+    }
+
+    #[test]
+    fn invert_silence_basic() {
+        let s = invert_silence(10.0, &[(0.0, 1.0), (4.0, 5.0), (9.0, 10.0)]);
+        assert!((s[0].0 - 1.0).abs() < 1e-6);
+        assert!((s[0].1 - 4.0).abs() < 1e-6);
     }
 }

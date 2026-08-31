@@ -60,8 +60,8 @@ pub struct RunOpts {
     #[arg(long, default_value_t = 2)]
     pub workers: usize,
 
-    /// 识别设备：cpu / coreml
-    #[arg(long, default_value = "cpu")]
+    /// 识别设备：gpu（默认，Metal/CUDA）或 cpu
+    #[arg(long, default_value = "gpu")]
     pub provider: String,
 
     #[arg(long, default_value = "int8", hide = true)]

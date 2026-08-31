@@ -4,7 +4,7 @@ use crate::asr::{self, AsrInput};
 use crate::config::{self, PipelineConfig};
 use crate::fetch::{self, VideoMeta};
 use crate::media;
-use crate::models::{self, ModelSize};
+use crate::models;
 use crate::render;
 use crate::scene;
 use crate::timeline;
@@ -16,6 +16,7 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     let t_total = Instant::now();
     crate::error::require_cmd("ffmpeg")?;
     crate::error::require_cmd("ffprobe")?;
+    crate::error::require_cmd("llama-server")?;
 
     let local = Path::new(&cfg.url);
     let is_local = local.is_file();
@@ -93,14 +94,13 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
 
     tracing::info!(device = %cfg.provider, "transcribe");
-    let (vad_path, qwen_paths) =
-        models::ensure_models_prec(&cfg.model_dir, ModelSize::Q17B, &cfg.precision)?;
+    let llama = models::ensure_llama(&cfg.model_dir)?;
     let events = asr::run(
         &cfg,
         AsrInput {
             wav: cfg.audio_path(),
-            vad_model: vad_path,
-            qwen: qwen_paths,
+            model: llama.model,
+            mmproj: llama.mmproj,
         },
     )
     .await?;

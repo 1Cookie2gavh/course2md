@@ -12,8 +12,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-sherpa-onnx = { version = "1.13.6", default-features = false, features = ["shared"] }
-ureq = { version = "2", features = ["gzip"] }
+ureq = { version = "2", features = ["json"] }
 tar = "0.4"
 bzip2-rs = "0.1"
 tracing = "0.1"
