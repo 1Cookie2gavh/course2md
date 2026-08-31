@@ -1,9 +1,12 @@
 mod cli;
 mod config;
 mod error;
+mod img_hash;
+mod scene;
 mod fetch;
 mod media;
 mod models;
+mod timeline;
 
 use clap::Parser;
 
