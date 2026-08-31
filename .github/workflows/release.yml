@@ -50,6 +50,8 @@ jobs:
         run: |
           cp "target/${{ matrix.target }}/release/course2md" "${{ matrix.asset }}"
           chmod +x "${{ matrix.asset }}"
+          # macOS：ad-hoc 签名（ARM64 无签名二进制会被直接 SIGKILL）
+          if [[ "$RUNNER_OS" == "macOS" ]]; then codesign --force --sign - "${{ matrix.asset }}"; fi
 
       - name: Package (windows)
         if: matrix.exe == true
