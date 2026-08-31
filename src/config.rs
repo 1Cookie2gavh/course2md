@@ -120,9 +120,91 @@ pub fn model_dir_from(opt: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| cache_dir().join("models"))
 }
 
+/// 未指定 -o 时：`out/<bvid|yt-id|文件名>/`
+pub fn infer_out_dir(source: &str) -> PathBuf {
+    PathBuf::from("out").join(infer_slug(source))
+}
+
+pub fn infer_slug(source: &str) -> String {
+    let p = Path::new(source);
+    if p.is_file() {
+        return sanitize(p.file_stem().and_then(|s| s.to_str()).unwrap_or("local"));
+    }
+    if let Some(id) = bvid(source) {
+        return id;
+    }
+    if let Some(id) = youtube_id(source) {
+        return format!("yt-{id}");
+    }
+    sanitize(source)
+}
+
+fn bvid(s: &str) -> Option<String> {
+    let i = s.find("BV")?;
+    let id: String = s[i..].chars().take(12).collect();
+    if id.len() >= 6 && id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+fn youtube_id(s: &str) -> Option<String> {
+    if let Some(rest) = s.split_once("v=").map(|(_, r)| r) {
+        let id = rest.split(['&', '#', '/']).next()?;
+        if id.len() >= 6 {
+            return Some(id.to_string());
+        }
+    }
+    if let Some(rest) = s.split_once("youtu.be/").map(|(_, r)| r) {
+        let id = rest.split(['?', '&', '#', '/']).next()?;
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+fn sanitize(s: &str) -> String {
+    let s: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let s = s.trim_matches('-');
+    let s: String = s.chars().take(60).collect();
+    if s.is_empty() {
+        "untitled".into()
+    } else {
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slug_bilibili() {
+        assert_eq!(
+            infer_slug("https://www.bilibili.com/video/BV1pb8o6yE8f/?spm=1"),
+            "BV1pb8o6yE8f"
+        );
+    }
+
+    #[test]
+    fn slug_youtube() {
+        assert_eq!(
+            infer_slug("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"),
+            "yt-dQw4w9WgXcQ"
+        );
+        assert_eq!(infer_slug("https://youtu.be/dQw4w9WgXcQ"), "yt-dQw4w9WgXcQ");
+    }
 
     #[test]
     fn roi_percent() {

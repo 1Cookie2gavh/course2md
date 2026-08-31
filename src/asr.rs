@@ -125,12 +125,8 @@ fn run_mps(
             writeln!(f, "{}", serde_json::json!({"start": start, "end": end}))?;
         }
     }
-    println!(
-        "  [asr] provider=mps (Metal GPU)  model={model}  {} 段 / {:.0}s 语音",
-        segs.len(),
-        speech_secs
-    );
-    let status = std::process::Command::new(&py)
+    tracing::info!(model = %model, segs = segs.len(), speech = format_args!("{:.0}s", speech_secs), "mps asr");
+    let mut child = std::process::Command::new(&py)
         .arg(&script)
         .arg("--model")
         .arg(&model)
@@ -142,8 +138,18 @@ fn run_mps(
         .arg(&out_path)
         .arg("--batch")
         .arg("8")
-        .status()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
         .context("启动 qwen3_mps.py 失败")?;
+    if let Some(out) = child.stdout.take() {
+        use std::io::BufRead;
+        let r = std::io::BufReader::new(out);
+        for line in r.lines().map_while(Result::ok) {
+            tracing::info!(target: "mps", "{line}");
+        }
+    }
+    let status = child.wait()?;
     if !status.success() {
         anyhow::bail!("qwen3_mps.py 失败 code={:?}（确认 MPS 可用且已下载 Qwen3-ASR-1.7B）", status.code());
     }
@@ -164,7 +170,7 @@ fn run_mps(
         });
     }
     events.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    println!("  [asr] MPS 完成：{} 条转写", events.len());
+    tracing::info!(n = events.len(), "mps done");
     Ok(events)
 }
 
@@ -188,10 +194,7 @@ fn run_blocking(
     let sr = wave.sample_rate() as usize;
     let samples = wave.samples();
     let total = samples.len();
-    println!(
-        "  [asr] 音频 {:.1}s（sr={sr}, samples={total}）",
-        total as f64 / sr as f64
-    );
+    tracing::info!(secs = format_args!("{:.1}", total as f64 / sr as f64), sr, samples = total, "audio");
 
     // ---- VAD ----
     let mut vad_cfg = VadModelConfig::default();
@@ -241,12 +244,12 @@ fn run_blocking(
     drain(&vad, &mut segs);
     let vad_secs = t0.elapsed().as_secs_f64();
     let speech_secs: f64 = segs.iter().map(|s| s.samples.len()).sum::<usize>() as f64 / sr as f64;
-    println!(
-        "  [asr] VAD 完成：{} 段，语音共 {:.0}s / {:.0}s（{:.1}s）",
-        segs.len(),
-        speech_secs,
-        total as f64 / sr as f64,
-        vad_secs
+    tracing::info!(
+        segs = segs.len(),
+        speech = format_args!("{:.0}s", speech_secs),
+        audio = format_args!("{:.0}s", total as f64 / sr as f64),
+        secs = format_args!("{:.1}", vad_secs),
+        "vad"
     );
 
     let p = provider.to_ascii_lowercase();
@@ -275,10 +278,7 @@ fn run_blocking(
     };
 
     let per_worker_threads = (threads / workers as i32).max(1);
-    println!(
-        "  [asr] provider={provider}，{workers} worker × {per_worker_threads} 线程（约 {:.1}GB 权重）",
-        workers as f64 * 2.6
-    );
+    tracing::info!(provider = %provider, workers, threads = per_worker_threads, "onnx asr");
     let t_load = std::time::Instant::now();
 
     struct SegOut {
@@ -289,7 +289,14 @@ fn run_blocking(
     let results: std::sync::Mutex<Vec<SegOut>> = Default::default();
     let queue: std::sync::Mutex<std::collections::VecDeque<usize>> =
         std::sync::Mutex::new((0..segs.len()).collect());
-    let done = std::sync::atomic::AtomicUsize::new(0);
+    let pb = indicatif::ProgressBar::new(segs.len() as u64);
+    pb.set_style(
+        indicatif::ProgressStyle::with_template(
+            "{spinner:.green} asr {pos}/{len} [{bar:32.cyan/blue}] {elapsed} {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
 
     let decode_t0 = std::time::Instant::now();
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -297,17 +304,14 @@ fn run_blocking(
         for w in 0..workers {
             let queue = &queue;
             let results = &results;
-            let done = &done;
             let segs = &segs;
+            let pb = pb.clone();
             let rc = make_config(per_worker_threads);
             handles.push(scope.spawn(move || -> anyhow::Result<()> {
                 let recognizer = OfflineRecognizer::create(&rc)
                     .context("创建 Qwen3-ASR recognizer 失败（检查模型文件/内存）")?;
                 if w == 0 {
-                    println!(
-                        "  [asr] recognizer 就绪（{:.1}s），开始解码…",
-                        t_load.elapsed().as_secs_f64()
-                    );
+                    tracing::info!(secs = format_args!("{:.1}", t_load.elapsed().as_secs_f64()), "recognizer ready");
                 }
                 loop {
                     let Some(i) = queue.lock().unwrap().pop_front() else {
@@ -325,17 +329,7 @@ fn run_blocking(
                             results.lock().unwrap().push(SegOut { start, end, text });
                         }
                     }
-                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n % 50 == 0 || n == segs.len() {
-                        let el = decode_t0.elapsed().as_secs_f64();
-                        let decoded_secs = speech_secs * n as f64 / segs.len() as f64;
-                        let rtf = if decoded_secs > 0.0 { el / decoded_secs } else { 0.0 };
-                        println!(
-                            "  [asr] {n}/{} 段，≈{:.0}s 语音，RTF={rtf:.2}",
-                            segs.len(),
-                            decoded_secs
-                        );
-                    }
+                    pb.inc(1);
                 }
                 Ok(())
             }));
@@ -345,6 +339,7 @@ fn run_blocking(
         }
         Ok(())
     })?;
+    pb.finish_and_clear();
 
     let mut events: Vec<TranscriptEvent> = results
         .into_inner()
@@ -360,11 +355,14 @@ fn run_blocking(
     let chars: usize = events.iter().map(|e| e.text.chars().count()).sum();
     let el = decode_t0.elapsed().as_secs_f64();
     let rtf = if speech_secs > 0.0 { el / speech_secs } else { 0.0 };
-    println!(
-        "  [asr] 完成：{} 条转写 / {} 段，{} 字符，{workers} worker 解码 {el:.1}s，RTF={rtf:.2}",
-        events.len(),
-        segs.len(),
-        chars
+    tracing::info!(
+        events = events.len(),
+        segs = segs.len(),
+        chars,
+        workers,
+        secs = format_args!("{el:.1}"),
+        rtf = format_args!("{rtf:.2}"),
+        "asr done"
     );
     Ok(events)
 }

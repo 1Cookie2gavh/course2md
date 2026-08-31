@@ -8,6 +8,7 @@ use crate::config::PipelineConfig;
 use crate::img_hash::{dhash_file, hamming};
 use crate::timeline::FrameEvent;
 use anyhow::{Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
 use tokio::process::Command;
 
@@ -117,36 +118,37 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
 
     let t0 = std::time::Instant::now();
     let cands = detect_scenes(media, cfg.scene_threshold).await?;
-    println!(
-        "  [scene] 候选 {} 个（阈值 {}，耗时 {:.1}s）",
-        cands.len(),
-        cfg.scene_threshold,
-        t0.elapsed().as_secs_f64()
+    tracing::info!(
+        candidates = cands.len(),
+        threshold = cfg.scene_threshold,
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "scene candidates"
     );
 
     let times = apply_cooldown(&cands, cfg.cooldown);
-    println!(
-        "  [scene] 冷却 {}s 后保留 {} 个候选",
-        cfg.cooldown,
-        times.len()
-    );
+    tracing::info!(kept = times.len(), cooldown = cfg.cooldown, "scene cooldown");
 
+    let pb = ProgressBar::new(times.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} scene {pos}/{len} [{bar:32.cyan/blue}] {msg}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
     let mut kept: Vec<FrameEvent> = vec![];
     let mut last_hash: Option<u64> = None;
     for (i, &t) in times.iter().enumerate() {
         let name = format!("slide_{:04}.jpg", i + 1);
         let path = frames_dir.join(&name);
         extract_frame(media, t, &path).await?;
-        // dHash 去重（阻塞解码丢线程池）
         let roi = cfg.roi;
         let hash = tokio::task::spawn_blocking(move || dhash_file(&path, roi))
             .await
             .context("hash 线程失败")??;
         if let Some(lh) = last_hash {
-            // 哈希为 0 表示帧几乎无梯度信息（纯色/极暗），不可作为去重依据
             let informative = hash.0 != 0 && lh != 0;
             if informative && hamming(crate::img_hash::DHash(lh), hash) <= cfg.hamming {
                 let _ = tokio::fs::remove_file(frames_dir.join(&name)).await;
+                pb.inc(1);
                 continue;
             }
         }
@@ -155,15 +157,10 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
             t,
             image: format!("frames/{name}"),
         });
-        print!(
-            "  [scene] {:>4}/{} t={:8.1}s 保留 {}\r",
-            kept.len(),
-            times.len(),
-            t,
-            name
-        );
+        pb.set_message(format!("t={t:.1}s"));
+        pb.inc(1);
     }
-    println!();
+    pb.finish_and_clear();
     // 去重可能淘汰帧导致编号空洞：重命名为连续序号
     let mut frames = vec![];
     for (i, mut ev) in kept.into_iter().enumerate() {
@@ -176,11 +173,11 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
         ev.image = format!("frames/{new_name}");
         frames.push(ev);
     }
-    println!(
-        "  [scene] 最终保留 {} 帧（dHash 阈值 {}），总耗时 {:.1}s",
-        frames.len(),
-        cfg.hamming,
-        t0.elapsed().as_secs_f64()
+    tracing::info!(
+        frames = frames.len(),
+        hamming = cfg.hamming,
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "scene done"
     );
     Ok(frames)
 }

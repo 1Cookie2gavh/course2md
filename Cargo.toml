@@ -16,6 +16,9 @@ sherpa-onnx = { version = "1.13.6", default-features = false, features = ["share
 ureq = { version = "2", features = ["gzip"] }
 tar = "0.4"
 bzip2-rs = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+indicatif = "0.17"
 
 [profile.release]
 lto = "thin"

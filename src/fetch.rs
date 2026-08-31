@@ -49,7 +49,7 @@ pub async fn fetch_meta(url: &str) -> Result<VideoMeta> {
 /// 下载视频到 `dest`（720p 上限，mp4 合并）。已存在则跳过。
 pub async fn download(url: &str, dest: &Path, verbose: bool) -> Result<()> {
     if dest.is_file() {
-        println!("  [跳过] 媒体已存在: {}", dest.display());
+        tracing::info!(path = %dest.display(), "media exists, skip download");
         return Ok(());
     }
     if let Some(p) = dest.parent() {
@@ -60,7 +60,7 @@ pub async fn download(url: &str, dest: &Path, verbose: bool) -> Result<()> {
     let mut last_err = None;
     for attempt in 0..3 {
         if attempt > 0 {
-            println!("  [重试] 第 {attempt} 次");
+            tracing::warn!(attempt, "retry yt-dlp");
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
         let mut cmd = Command::new("yt-dlp");
@@ -77,8 +77,8 @@ pub async fn download(url: &str, dest: &Path, verbose: bool) -> Result<()> {
         ])
         .arg(&tmp)
         .arg(url);
-        if !verbose {
-            cmd.arg("-q");
+        if verbose {
+            cmd.arg("-v");
         }
         match run_status(&mut cmd).await {
             Ok(()) => {

@@ -1,64 +1,55 @@
 # course2md
 
-把一门网课视频（YouTube / Bilibili）变成一份「截图 + 语音转写」按时间顺序排列的课程文字版本。
+把一门网课视频变成「截图 + 语音转写」按时间排列的课程文字版。
 
+贴链接或本地文件即可：
+
+```bash
+course2md https://www.bilibili.com/video/BV1pb8o6yE8f
+course2md https://youtu.be/dQw4w9WgXcQ
+course2md ./lecture.mp4
 ```
-URL ──► yt-dlp ──► ffmpeg(场景检测+抽帧) ─┐
-                └─► ffmpeg(PCM 16k) ─► Silero VAD ─► Qwen3-ASR ─┐
-                                                                ▼
-                       ┌──────────── timeline merger ◄──────────┘
-                       ▼
-              timeline.jsonl ──► course.md / course.html / structured.json
-```
 
-- 全本地推理，无云端 API；Rust 异步编排，yt-dlp / ffmpeg 走 subprocess。
-- ASR：Qwen3-ASR（sherpa-onnx，ONNX int8）+ Silero VAD。
+## 依赖
 
-## 安装
-
-依赖：Rust ≥1.85、`ffmpeg`、`yt-dlp`（macOS：`brew install ffmpeg yt-dlp`）。
+- Rust、`ffmpeg`、`yt-dlp`（macOS：`brew install ffmpeg yt-dlp`）
+- Apple GPU 路径还需要项目里的 `.venv`：`uv venv && uv pip install qwen-asr torch`
 
 ```bash
 cargo install --path .
 ```
 
-## 模型准备（首次必做）
+首次：
 
 ```bash
-course2md models download --size 1.7b   # Qwen3-ASR 1.7B int8 (~2.4GB) + Silero VAD
-# 或 --size 0.6b  (~950MB，更快，精度略低)
+course2md models download          # ONNX int8 + Silero（CPU 后备）
+# Qwen3-ASR 1.7B 官方权重放到 ~/.cache/course2md/models/Qwen3-ASR-1.7B/
 ```
 
-模型缓存于 `~/.cache/course2md/models/`。
+## CLI
 
-## 使用
-
-```bash
-course2md run "https://www.bilibili.com/video/BV1pb8o6yE8f" -o out/nju-01
+```
+course2md <url|文件> [选项]
+course2md models download [--size 1.7b|0.6b]
+course2md models list
 ```
 
-常用参数：
-
-| 参数 | 默认 | 说明 |
+| 选项 | 默认 | 说明 |
 |---|---|---|
-| `--scene-threshold` | 0.35 | ffmpeg scene 分数阈值，越小越敏感 |
-| `--cooldown` | 10 | 两次截图最小间隔秒数 |
-| `--roi x1,y1-x2,y2` | 无 | 去重时只比较该区域（支持 `25%,0%-100%,100%` 百分比）|
-| `--hamming` | 6 | dHash 汉明距离 ≤ 此值视为重复帧 |
-| `--threads` | 4 | ASR 推理线程数 |
-| `--keep-video` | 关 | 保留下载的 media.mp4 |
-| `--formats md,html,json` | 全部 | 输出格式 |
+| `-o, --out` | `out/<视频id>/` | 输出目录 |
+| `--provider` | `mps` | `mps`（Apple GPU）/ `cpu` / `coreml` |
+| `--keep-video` | 关 | 保留 media.mp4 |
+| `-v / -q` | info | 更详细 / 只报错 |
 
-输出目录：
+输出：
 
 ```
-out/nju-01/
-├── media.mp4          # (--keep-video 时保留)
-├── audio.wav          # 16k mono PCM
-├── meta.json          # 视频元数据
+out/BV1pb8o6yE8f/
 ├── frames/slide_0001.jpg ...
-├── timeline.jsonl     # 中间产物：frame/speech 事件流
-├── course.md / course.html / structured.json
+├── timeline.jsonl
+├── course.md
+├── course.html
+└── structured.json
 ```
 
 ## 设计

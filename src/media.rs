@@ -7,7 +7,7 @@ use tokio::process::Command;
 /// 抽取 16kHz 单声道 s16 wav。已存在则跳过。
 pub async fn extract_audio(media: &Path, dest: &Path) -> Result<()> {
     if dest.is_file() {
-        println!("  [跳过] 音频已存在: {}", dest.display());
+        tracing::info!(path = %dest.display(), "audio exists, skip extract");
         return Ok(());
     }
     if let Some(p) = dest.parent() {

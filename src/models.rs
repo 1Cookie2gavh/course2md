@@ -168,12 +168,12 @@ pub async fn download_models(root: &Path, size: ModelSize) -> Result<()> {
             let _ = fs::remove_file(&tmp);
         }
     }
-    println!("模型就绪：{}", root.display());
+    tracing::info!(path = %root.display(), "models ready");
     Ok(())
 }
 
 fn extract_tar_bz2(tarbz2: &Path, root: &Path, inner: &str, dest_name: &str) -> Result<()> {
-    println!("解压 {tarbz2:?} …");
+    tracing::info!(path = %tarbz2.display(), "extract tar.bz2");
     let f = fs::File::open(tarbz2)?;
     let bz = bzip2_rs::DecoderReader::new(f);
     let dest = root.join(dest_name);
@@ -204,7 +204,7 @@ fn extract_tar_bz2(tarbz2: &Path, root: &Path, inner: &str, dest_name: &str) -> 
 
 async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
     if dest.is_file() && fs::metadata(dest)?.len() > 0 {
-        println!("  [跳过] {label}（已存在）");
+        tracing::info!(label, "skip existing");
         return Ok(());
     }
     if let Some(p) = dest.parent() {
@@ -216,16 +216,25 @@ async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
     let label = label.to_string();
     // ureq 是阻塞的，放到阻塞线程池
     tokio::task::spawn_blocking(move || -> Result<()> {
-        println!("  [下载] {label} ← {url}");
+        tracing::info!(label = %label, url = %url, "download");
         let resp = ureq::get(&url).call().context("请求失败")?;
-        let total: Option<u64> = resp
+        let total: u64 = resp
             .header("content-length")
-            .and_then(|v| v.parse().ok());
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let pb = indicatif::ProgressBar::new(total.max(1));
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{spinner:.green} {msg} [{bar:32.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        pb.set_message(label.clone());
         let mut reader = resp.into_reader();
         let mut out = fs::File::create(&tmp)?;
         let mut buf = vec![0u8; 1024 * 512];
         let mut done: u64 = 0;
-        let mut last_pct = u64::MAX;
         loop {
             let n = reader.read(&mut buf)?;
             if n == 0 {
@@ -233,18 +242,13 @@ async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
             }
             std::io::Write::write_all(&mut out, &buf[..n])?;
             done += n as u64;
-            if let Some(t) = total {
-                let pct = done * 100 / t.max(1);
-                if pct != last_pct && pct % 5 == 0 {
-                    println!("    {label}: {pct}% ({}/{})", human_bytes(done), human_bytes(t));
-                    last_pct = pct;
-                }
-            }
+            pb.set_position(done);
         }
         out.sync_all()?;
         drop(out);
         fs::rename(&tmp, &dest)?;
-        println!("    {label}: 完成 ({})", human_bytes(done));
+        pb.finish_and_clear();
+        tracing::info!(label = %label, bytes = done, "downloaded");
         Ok(())
     })
     .await
@@ -252,23 +256,10 @@ async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn human_bytes(n: u64) -> String {
-    let f = n as f64;
-    if f >= 1e9 {
-        format!("{:.2}GB", f / 1e9)
-    } else if f >= 1e6 {
-        format!("{:.1}MB", f / 1e6)
-    } else if f >= 1e3 {
-        format!("{:.0}KB", f / 1e3)
-    } else {
-        format!("{n}B")
-    }
-}
-
 pub fn list_models(root: &Path) {
-    println!("模型根目录: {}", root.display());
+    tracing::info!(path = %root.display(), "model dir");
     let vad = vad_path(root);
-    println!("  silero_vad.onnx : {}", mark(vad.is_file()));
+    tracing::info!(ok = vad.is_file(), "silero_vad.onnx");
     for (size, name) in [(ModelSize::Q17B, "1.7b"), (ModelSize::Q06B, "0.6b")] {
         let q = qwen3_paths(root, size);
         let files = [
@@ -278,19 +269,13 @@ pub fn list_models(root: &Path) {
             ("tokenizer/vocab.json", q.tokenizer.join("vocab.json").is_file()),
         ];
         let ok = files.iter().all(|f| f.1);
-        println!("  qwen3-{name}     : {}", if ok { "✓ 完整" } else { "✗ 不完整" });
+        tracing::info!(model = name, complete = ok, "qwen3");
         for (n, exists) in files {
             if !exists {
-                println!("      缺 {n}");
+                tracing::warn!(file = n, "missing");
             }
         }
     }
 }
 
-fn mark(ok: bool) -> &'static str {
-    if ok {
-        "✓"
-    } else {
-        "✗ 缺失"
-    }
-}
+
