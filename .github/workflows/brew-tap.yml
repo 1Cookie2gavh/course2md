@@ -1,0 +1,88 @@
+name: brew-tap
+
+on:
+  # release 由 GITHUB_TOKEN 创建，不会触发 release 事件（防递归），故用链式触发
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的版本（不带 v 前缀，如 0.5.0）"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  update-tap:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v')) }}
+    steps:
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq coreutils
+
+      - uses: actions/checkout@v4
+
+      - name: Setup GitHub SSH
+        env:
+          GH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -dm700 ~/.ssh
+          printf '%s\n' "$GH_KEY" > ~/.ssh/gh_key
+          chmod 600 ~/.ssh/gh_key
+          printf 'Host github.com\n  User git\n  IdentityFile ~/.ssh/gh_key\n  StrictHostKeyChecking accept-new\n' > ~/.ssh/config
+
+      - name: Update tap formula
+        env:
+          VERSION: ${{ inputs.version || github.event.workflow_run.head_branch }}
+        run: |
+          V="${VERSION#v}"
+          REPO=mizorewww/course2md
+          BASE="https://github.com/${REPO}/releases/download/v${V}"
+          sha() { curl -fsSL "$1" | sha256sum | cut -d' ' -f1; }
+          echo "computing checksums for v${V}..."
+          SHA_ARM=$(sha "${BASE}/course2md-macos-arm64")
+          SHA_INTEL=$(sha "${BASE}/course2md-macos-x86_64")
+          SHA_MLX=$(sha "${BASE}/mlx-macos-arm64.metallib")
+          SHA_LINUX_X86=$(sha "${BASE}/course2md-linux-x86_64")
+          SHA_LINUX_ARM=$(sha "${BASE}/course2md-linux-aarch64")
+
+          git config --global user.name "mizorewww (ci)"
+          git config --global user.email "mizorewww@users.noreply.github.com"
+          git clone -q git@github.com:mizorewww/homebrew-tap.git tap
+          F=tap/Formula/course2md.rb
+          sed -i \
+            -e "s|releases/download/v[0-9.]*/course2md-macos-arm64|releases/download/v${V}/course2md-macos-arm64|" \
+            -e "s|releases/download/v[0-9.]*/mlx-macos-arm64.metallib|releases/download/v${V}/mlx-macos-arm64.metallib|" \
+            -e "s|releases/download/v[0-9.]*/course2md-macos-x86_64|releases/download/v${V}/course2md-macos-x86_64|" \
+            -e "s|releases/download/v[0-9.]*/course2md-linux-x86_64|releases/download/v${V}/course2md-linux-x86_64|" \
+            -e "s|releases/download/v[0-9.]*/course2md-linux-aarch64|releases/download/v${V}/course2md-linux-aarch64|" \
+            -e "s|^  version \".*\"|  version \"${V}\"|" \
+            -e "s|sha256 \"[0-9a-f]*\" #? *mlx|sha256 \"${SHA_MLX}\" # mlx|" \
+            "$F"
+          # 逐个替换（sha256 出现顺序与 sed 全局替换容易错位，改为按 URL 邻近原则逐行处理）
+          python3 - "$F" "$V" "$SHA_ARM" "$SHA_INTEL" "$SHA_MLX" "$SHA_LINUX_X86" "$SHA_LINUX_ARM" <<'PY'
+          import re, sys
+          f, v, arm, intel, mlx, lx86, larm = sys.argv[1:8]
+          src = open(f).read()
+          def set_sha(url_part, sha):
+                nonlocal_marker = url_part
+                global src
+                # 找到包含 url_part 的 url 行，然后其后最近的一行 sha256
+                pat = re.compile(r'(url "[^"]*' + re.escape(url_part) + r'"\n(?:.*\n)??.*?sha256 ")[0-9a-f]+(")')
+                src, n = pat.subn(r'\g<1>' + sha + r'\g<2>', src, count=1)
+                assert n == 1, f"url {url_part} sha not set"
+          set_sha("course2md-macos-arm64", arm)
+          set_sha("mlx-macos-arm64.metallib", mlx)
+          set_sha("course2md-macos-x86_64", intel)
+          set_sha("course2md-linux-x86_64", lx86)
+          set_sha("course2md-linux-aarch64", larm)
+          src = re.sub(r'version "[0-9.]+"', f'version "{v}"', src)
+          open(f, "w").write(src)
+          PY
+          cd tap
+          if git diff --quiet; then echo "tap 已是 ${V}"; exit 0; fi
+          git add -A && git commit -qm "course2md ${V}"
+          git push -q origin main
+          echo "homebrew-tap 已更新到 ${V}"
