@@ -8,7 +8,13 @@ course2md https://youtu.be/dQw4w9WgXcQ
 course2md ./lecture.mp4
 ```
 
-需要：`ffmpeg`、`yt-dlp`、`llama-server`（llama.cpp）。macOS：`brew install ffmpeg yt-dlp llama.cpp`。
+macOS Apple Silicon 一键安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | zsh
+```
+
+需要：`ffmpeg`、`yt-dlp`、`llama-server`。macOS：`brew install ffmpeg yt-dlp llama.cpp`。
 
 ```bash
 course2md models download
