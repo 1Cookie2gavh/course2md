@@ -1,0 +1,20 @@
+[package]
+name = "course2md"
+version = "0.1.0"
+edition = "2024"
+description = "Turn online course videos (YouTube/Bilibili) into image+transcript markdown notes"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+sherpa-onnx = "1.13"
+ureq = { version = "2", features = ["gzip"] }
+
+[profile.release]
+lto = "thin"
+strip = true
