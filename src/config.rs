@@ -20,6 +20,8 @@ pub struct PipelineConfig {
     pub model_dir: PathBuf,
     pub keep_video: bool,
     pub no_download: bool,
+    /// `-o` 根目录，实际课程目录是 `{out_root}/{platform}/{title}/{id}/`
+    pub out_root: PathBuf,
 }
 
 /// 感兴趣区域；坐标可为像素或比例（0.0-1.0）。
@@ -135,23 +137,41 @@ pub fn looks_like_source(s: &str) -> bool {
         || t.contains("youtu.be/")
 }
 
-/// 未指定 -o 时：`out/<bvid|yt-id|文件名>/`
-pub fn infer_out_dir(source: &str) -> PathBuf {
-    PathBuf::from("out").join(infer_slug(source))
+/// `{root}/{platform}/{title}/{id}/`
+pub fn course_dir(root: &Path, platform: &str, title: &str, id: &str) -> PathBuf {
+    root.join(sanitize_component(platform))
+        .join(sanitize_component(title))
+        .join(sanitize_component(id))
+}
+
+pub fn platform_from(source: &str, extractor: &str) -> String {
+    let e = extractor.to_ascii_lowercase();
+    let s = source.to_ascii_lowercase();
+    if Path::new(source).is_file() || e == "local" {
+        "local".into()
+    } else if e.contains("bili") || s.contains("bilibili.com") {
+        "bilibili".into()
+    } else if e.contains("youtube") || s.contains("youtube.com") || s.contains("youtu.be") {
+        "youtube".into()
+    } else if !e.is_empty() {
+        sanitize_component(&e)
+    } else {
+        "web".into()
+    }
 }
 
 pub fn infer_slug(source: &str) -> String {
     let p = Path::new(source);
     if p.is_file() {
-        return sanitize(p.file_stem().and_then(|s| s.to_str()).unwrap_or("local"));
+        return sanitize_component(p.file_stem().and_then(|s| s.to_str()).unwrap_or("local"));
     }
     if let Some(id) = bvid(source) {
         return id;
     }
     if let Some(id) = youtube_id(source) {
-        return format!("yt-{id}");
+        return id;
     }
-    sanitize(source)
+    sanitize_component(source)
 }
 
 fn bvid(s: &str) -> Option<String> {
@@ -180,23 +200,28 @@ fn youtube_id(s: &str) -> Option<String> {
     None
 }
 
-fn sanitize(s: &str) -> String {
-    let s: String = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
+/// 保留中文等标题字符，去掉路径非法符。
+pub fn sanitize_component(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in s.chars() {
+        let bad = c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
+        if bad || c.is_whitespace() {
+            if !prev_dash && !out.is_empty() {
+                out.push('-');
+                prev_dash = true;
             }
-        })
-        .collect();
-    let s = s.trim_matches('-');
-    let s: String = s.chars().take(60).collect();
-    if s.is_empty() {
+        } else {
+            out.push(c);
+            prev_dash = false;
+        }
+    }
+    let out = out.trim_matches(['-', '.', ' ']).to_string();
+    let out: String = out.chars().take(80).collect();
+    if out.is_empty() {
         "untitled".into()
     } else {
-        s
+        out
     }
 }
 
@@ -224,9 +249,27 @@ mod tests {
     fn slug_youtube() {
         assert_eq!(
             infer_slug("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"),
-            "yt-dQw4w9WgXcQ"
+            "dQw4w9WgXcQ"
         );
-        assert_eq!(infer_slug("https://youtu.be/dQw4w9WgXcQ"), "yt-dQw4w9WgXcQ");
+        assert_eq!(infer_slug("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+    }
+
+    #[test]
+    fn course_layout() {
+        let p = course_dir(
+            Path::new("out"),
+            "bilibili",
+            "欢迎来到未来 [01-Raw/26生成式软件工程/NJU]",
+            "BV1pb8o6yE8f",
+        );
+        assert_eq!(
+            p,
+            PathBuf::from(
+                "out/bilibili/欢迎来到未来-[01-Raw-26生成式软件工程-NJU]/BV1pb8o6yE8f"
+            )
+        );
+        assert_eq!(platform_from("https://www.bilibili.com/video/BV1", ""), "bilibili");
+        assert_eq!(platform_from("https://youtu.be/x", "youtube"), "youtube");
     }
 
     #[test]

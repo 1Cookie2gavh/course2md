@@ -233,6 +233,7 @@ mod tests {
             model_dir: std::path::PathBuf::from("/tmp"),
             keep_video: true,
             no_download: true,
+            out_root: std::env::temp_dir().join("course2md-slide-test"),
         };
         let _ = std::fs::create_dir_all(cfg.frames_dir());
         let frames = run(&cfg, media).await.unwrap();

@@ -22,12 +22,10 @@ fn init_logging(verbose: u8, quiet: bool) {
 }
 
 fn run_opts_to_cfg(source: String, opts: RunOpts) -> anyhow::Result<config::PipelineConfig> {
-    let out_dir = opts
-        .out
-        .unwrap_or_else(|| config::infer_out_dir(&source));
     Ok(config::PipelineConfig {
         url: source,
-        out_dir,
+        out_root: opts.out.clone(),
+        out_dir: opts.out,
         similarity: opts.similarity,
         sample_interval: opts.sample_interval,
         cooldown: opts.cooldown,

@@ -34,6 +34,7 @@ fn default_cfg() -> PipelineConfig {
         model_dir: model_root(),
         keep_video: false,
         no_download: true,
+        out_root: std::path::PathBuf::from("/tmp"),
     }
 }
 

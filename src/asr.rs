@@ -53,127 +53,6 @@ pub fn sanitize_qwen_text(s: &str) -> String {
     t.to_string()
 }
 
-fn find_mps_python() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("COURSE2MD_PYTHON") {
-        return Ok(PathBuf::from(p));
-    }
-    let cwd = std::env::current_dir()?;
-    for c in [
-        cwd.join(".venv/bin/python"),
-        cwd.join(".venv/bin/python3"),
-    ] {
-        if c.is_file() {
-            return Ok(c);
-        }
-    }
-    anyhow::bail!("GPU 路径需要项目根 .venv（uv venv && uv pip install qwen-asr torch）")
-}
-
-fn find_mps_script() -> Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
-    let c = cwd.join("scripts/qwen3_mps.py");
-    if c.is_file() {
-        return Ok(c);
-    }
-    anyhow::bail!("找不到 scripts/qwen3_mps.py（请在仓库根目录运行）")
-}
-
-fn find_qwen3_hf_dir() -> Result<String> {
-    if let Ok(p) = std::env::var("COURSE2MD_QWEN3") {
-        return Ok(p);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let roots = [
-        format!("{home}/.cache/course2md/models/Qwen/Qwen3-ASR-1.7B"),
-        format!("{home}/.cache/course2md/models/Qwen3-ASR-1.7B"),
-    ];
-    for r in &roots {
-        if Path::new(r).join("config.json").is_file() {
-            return Ok(r.clone());
-        }
-        // modelscope 可能套一层 snapshot hash
-        if let Ok(rd) = std::fs::read_dir(r) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.join("config.json").is_file() {
-                    return Ok(p.display().to_string());
-                }
-            }
-        }
-    }
-    Ok("Qwen/Qwen3-ASR-1.7B".into())
-}
-
-fn run_mps(
-    wav: &Path,
-    segs: &[Seg],
-    sr: usize,
-    speech_secs: f64,
-) -> Result<Vec<TranscriptEvent>> {
-    let py = find_mps_python()?;
-    let script = find_mps_script()?;
-    let model = find_qwen3_hf_dir()?;
-    let dir = wav.parent().unwrap_or(Path::new("."));
-    let seg_path = dir.join("vad_segments.jsonl");
-    let out_path = dir.join("asr_mps.jsonl");
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&seg_path)?;
-        for s in segs {
-            let start = s.start_sample as f64 / sr as f64;
-            let end = start + s.samples.len() as f64 / sr as f64;
-            writeln!(f, "{}", serde_json::json!({"start": start, "end": end}))?;
-        }
-    }
-    tracing::info!(model = %model, segs = segs.len(), speech = format_args!("{:.0}s", speech_secs), "mps asr");
-    let mut child = std::process::Command::new(&py)
-        .arg(&script)
-        .arg("--model")
-        .arg(&model)
-        .arg("--wav")
-        .arg(wav)
-        .arg("--segments")
-        .arg(&seg_path)
-        .arg("--out")
-        .arg(&out_path)
-        .arg("--batch")
-        .arg("8")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .context("启动 qwen3_mps.py 失败")?;
-    if let Some(out) = child.stdout.take() {
-        use std::io::BufRead;
-        let r = std::io::BufReader::new(out);
-        for line in r.lines().map_while(Result::ok) {
-            tracing::info!(target: "mps", "{line}");
-        }
-    }
-    let status = child.wait()?;
-    if !status.success() {
-        anyhow::bail!("qwen3_mps.py 失败 code={:?}（确认 MPS 可用且已下载 Qwen3-ASR-1.7B）", status.code());
-    }
-    let mut events = vec![];
-    for line in std::fs::read_to_string(&out_path)?.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = serde_json::from_str(line)?;
-        let text = sanitize_qwen_text(v["text"].as_str().unwrap_or(""));
-        if text.is_empty() {
-            continue;
-        }
-        events.push(TranscriptEvent {
-            start: v["start"].as_f64().unwrap_or(0.0),
-            end: v["end"].as_f64().unwrap_or(0.0),
-            text,
-        });
-    }
-    events.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    tracing::info!(n = events.len(), "mps done");
-    Ok(events)
-}
-
 fn run_blocking(
     input: &AsrInput,
     threads: i32,
@@ -252,12 +131,7 @@ fn run_blocking(
         "vad"
     );
 
-    let p = provider.to_ascii_lowercase();
-    if p == "mps" || p == "gpu" || p == "metal" {
-        return run_mps(&input.wav, &segs, sr, speech_secs);
-    }
-
-    // ---- Qwen3-ASR ONNX（CPU / CoreML）：N 个 worker ----
+    // Qwen3-ASR（sherpa-onnx）
     // LLM 自回归解码 batch=1，intra-op 并行扩展性差；段间独立，进程内并行收益近线性。
     let q = &input.qwen;
     let make_config = |num_threads: i32| {
