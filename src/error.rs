@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// 统一错误别名；各阶段返回 anyhow::Result。
 pub type BoxError = anyhow::Error;
