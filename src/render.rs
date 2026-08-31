@@ -1,0 +1,197 @@
+//! 输出渲染：course.md / course.html / structured.json。
+
+use crate::fetch::VideoMeta;
+use crate::timeline::Section;
+use anyhow::Result;
+use std::path::Path;
+
+/// mm:ss 或 h:mm:ss
+pub fn fmt_ts(sec: f64) -> String {
+    let s = sec.max(0.0).floor() as u64;
+    let (h, m, s) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// 指向源视频某时刻的 URL（bilibili/youtube 的 t 参数语义一致）。
+pub fn ts_url(meta: &VideoMeta, sec: f64) -> String {
+    let base = meta.webpage_url.trim();
+    let sep = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{sep}t={}", sec.floor() as u64)
+}
+
+pub fn render_markdown(meta: &VideoMeta, sections: &[Section]) -> String {
+    let mut md = String::new();
+    md.push_str(&format!("# {}\n\n", meta.title));
+    md.push_str(&format!(
+        "- 作者：{}\n- 时长：{}\n- 来源：[{}]({})\n- 由 course2md 生成（{} 张截图 / {} 段语音）\n\n",
+        if meta.uploader.is_empty() { "未知" } else { &meta.uploader },
+        fmt_ts(meta.duration),
+        meta.webpage_url,
+        meta.webpage_url,
+        sections.len(),
+        sections.iter().map(|s| s.speech.len()).sum::<usize>(),
+    ));
+    md.push_str("---\n\n");
+    for s in sections {
+        md.push_str(&format!(
+            "## [{}]({})\n\n![{}]({})\n\n",
+            fmt_ts(s.t),
+            ts_url(meta, s.t),
+            fmt_ts(s.t),
+            s.image
+        ));
+        if s.speech.is_empty() {
+            md.push_str("_(本段无语音)_\n\n");
+        } else {
+            for ev in &s.speech {
+                md.push_str(&format!("{}\n\n", ev.text));
+            }
+        }
+    }
+    md
+}
+
+pub fn render_html(meta: &VideoMeta, sections: &[Section]) -> String {
+    let mut body = String::new();
+    body.push_str(&format!(
+        "<header><h1>{}</h1><p>作者 {} · 时长 {} · <a href=\"{}\">源视频</a> · {} 张截图 / {} 段语音</p></header>\n",
+        esc(&meta.title),
+        esc(if meta.uploader.is_empty() { "未知" } else { &meta.uploader }),
+        fmt_ts(meta.duration),
+        esc(&meta.webpage_url),
+        sections.len(),
+        sections.iter().map(|s| s.speech.len()).sum::<usize>(),
+    ));
+    for s in sections {
+        body.push_str(&format!(
+            "<section id=\"t{ts}\"><h2><a href=\"{url}\" target=\"_blank\">[{t}]</a></h2>\n<a href=\"{url}\" target=\"_blank\"><img loading=\"lazy\" src=\"{img}\" alt=\"{t}\"></a>\n",
+            ts = s.t.floor() as u64,
+            url = esc(&ts_url(meta, s.t)),
+            t = esc(&fmt_ts(s.t)),
+            img = esc(&s.image),
+        ));
+        if s.speech.is_empty() {
+            body.push_str("<p class=\"mute\">（本段无语音）</p>\n");
+        } else {
+            for ev in &s.speech {
+                body.push_str(&format!("<p>「{}」</p>\n", esc(&ev.text)));
+            }
+        }
+        body.push_str("</section>\n");
+    }
+    format!(
+        "<!DOCTYPE html>\n<html lang=\"zh\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{title}</title>\n<style>\n:root {{ color-scheme: light dark; }}\nbody {{ max-width: 920px; margin: 0 auto; padding: 1rem; font-family: system-ui, -apple-system, sans-serif; line-height: 1.7; }}\nheader h1 {{ font-size: 1.5rem; }}\nheader p {{ color: #888; }}\nsection {{ margin: 2rem 0; }}\nsection h2 {{ font-size: 1rem; font-weight: 600; }}\nsection h2 a {{ color: #0969da; text-decoration: none; }}\nimg {{ max-width: 100%; border: 1px solid #8884; border-radius: 6px; }}\np {{ margin: .4rem 0; }}\np.mute {{ color: #888; }}\n</style>\n</head>\n<body>\n{body}</body>\n</html>\n",
+        title = esc(&meta.title),
+    )
+}
+
+pub fn render_json(meta: &VideoMeta, sections: &[Section]) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&crate::timeline::CourseDoc {
+        meta,
+        sections,
+    })?)
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// 按 formats 集合写文件。
+pub async fn write_outputs(
+    out_dir: &Path,
+    meta: &VideoMeta,
+    sections: &[Section],
+    formats: &[String],
+) -> Result<()> {
+    for f in formats {
+        match f.as_str() {
+            "md" => {
+                tokio::fs::write(out_dir.join("course.md"), render_markdown(meta, sections))
+                    .await?;
+            }
+            "html" => {
+                tokio::fs::write(out_dir.join("course.html"), render_html(meta, sections))
+                    .await?;
+            }
+            "json" => {
+                tokio::fs::write(out_dir.join("structured.json"), render_json(meta, sections)?)
+                    .await?;
+            }
+            other => anyhow::bail!("未知输出格式 {other:?}（可选 md/html/json）"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timeline::TranscriptEvent;
+
+    fn meta() -> VideoMeta {
+        VideoMeta {
+            title: "测试<课>&\"引号\"".into(),
+            uploader: "up".into(),
+            duration: 3725.0,
+            webpage_url: "https://www.bilibili.com/video/BV1xx".into(),
+            extractor: "bilibili".into(),
+            id: "BV1xx".into(),
+        }
+    }
+
+    #[test]
+    fn ts_format() {
+        assert_eq!(fmt_ts(0.0), "00:00");
+        assert_eq!(fmt_ts(65.4), "01:05");
+        assert_eq!(fmt_ts(3725.0), "1:02:05");
+        assert_eq!(fmt_ts(-5.0), "00:00");
+    }
+
+    #[test]
+    fn ts_url_bilibili() {
+        assert_eq!(
+            ts_url(&meta(), 61.9),
+            "https://www.bilibili.com/video/BV1xx?t=61"
+        );
+    }
+
+    #[test]
+    fn ts_url_youtube_has_query() {
+        let mut m = meta();
+        m.webpage_url = "https://www.youtube.com/watch?v=abc".into();
+        assert_eq!(ts_url(&m, 5.0), "https://www.youtube.com/watch?v=abc&t=5");
+    }
+
+    #[test]
+    fn md_contains_section_and_speech() {
+        let m = meta();
+        let s = vec![Section {
+            t: 10.0,
+            image: "frames/slide_0001.jpg".into(),
+            speech: vec![TranscriptEvent {
+                start: 10.2,
+                end: 12.5,
+                text: "你好".into(),
+            }],
+        }];
+        let md = render_markdown(&m, &s);
+        assert!(md.contains("# 测试<课>&\"引号\""));
+        assert!(md.contains("## [00:10](https://www.bilibili.com/video/BV1xx?t=10)"));
+        assert!(md.contains("![00:10](frames/slide_0001.jpg)"));
+        assert!(md.contains("你好"));
+    }
+
+    #[test]
+    fn html_escapes() {
+        let h = render_html(&meta(), &[]);
+        assert!(h.contains("&lt;课&gt;"));
+        assert!(!h.contains("<课>"));
+    }
+}
