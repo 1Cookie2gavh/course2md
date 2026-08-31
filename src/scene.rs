@@ -134,7 +134,9 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
             .await
             .context("hash 线程失败")??;
         if let Some(lh) = last_hash {
-            if hamming(crate::img_hash::DHash(lh), hash) <= cfg.hamming {
+            // 哈希为 0 表示帧几乎无梯度信息（纯色/极暗），不可作为去重依据
+            let informative = hash.0 != 0 && lh != 0;
+            if informative && hamming(crate::img_hash::DHash(lh), hash) <= cfg.hamming {
                 let _ = tokio::fs::remove_file(frames_dir.join(&name)).await;
                 continue;
             }
