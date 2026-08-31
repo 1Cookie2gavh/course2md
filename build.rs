@@ -160,8 +160,20 @@ fn swiftc_available() -> bool {
 }
 
 fn run(cmd: &mut Command) -> bool {
-    match cmd.status() {
-        Ok(st) => st.success(),
+    match cmd.output() {
+        Ok(out) => {
+            if !out.status.success() {
+                let so = String::from_utf8_lossy(&out.stdout);
+                let se = String::from_utf8_lossy(&out.stderr);
+                println!(
+                    "cargo:warning=swift build 退出码 {:?}（stdout 尾部）:\n{}\n（stderr 尾部）:\n{}",
+                    out.status.code(),
+                    so.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
+                    se.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
+                );
+            }
+            out.status.success()
+        }
         Err(e) => {
             println!("cargo:warning=无法执行 {:?}: {e}", cmd.get_program());
             false
