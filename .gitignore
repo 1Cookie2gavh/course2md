@@ -1,0 +1,6 @@
+/target
+out/
+models/
+*.wav
+*.mp4
+.DS_Store
