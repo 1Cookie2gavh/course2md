@@ -28,7 +28,8 @@ fn run_opts_to_cfg(source: String, opts: RunOpts) -> anyhow::Result<config::Pipe
     Ok(config::PipelineConfig {
         url: source,
         out_dir,
-        scene_threshold: opts.scene_threshold,
+        similarity: opts.similarity,
+        sample_interval: opts.sample_interval,
         cooldown: opts.cooldown,
         roi: opts.roi.map(|s| config::Roi::parse(&s)).transpose()?,
         hamming: opts.hamming,

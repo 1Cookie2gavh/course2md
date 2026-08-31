@@ -35,11 +35,15 @@ pub struct RunOpts {
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
-    /// ffmpeg scene 阈值（0-1，越小越敏感）
-    #[arg(long, default_value_t = 0.35)]
-    pub scene_threshold: f64,
+    /// SSIM 低于此值视为新幻灯片（与 yt-slide-mark 相同，默认 0.85）
+    #[arg(long, default_value_t = 0.85)]
+    pub similarity: f64,
 
-    /// 两次截图的最小间隔（秒）
+    /// 采样间隔（秒），每秒看一帧
+    #[arg(long, default_value_t = 1.0)]
+    pub sample_interval: f64,
+
+    /// 检出新幻灯片后跳过的秒数
     #[arg(long, default_value_t = 10.0)]
     pub cooldown: f64,
 

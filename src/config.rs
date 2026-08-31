@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 pub struct PipelineConfig {
     pub url: String,
     pub out_dir: PathBuf,
-    pub scene_threshold: f64,
+    pub similarity: f64,
+    pub sample_interval: f64,
     pub cooldown: f64,
     pub roi: Option<Roi>,
     pub hamming: u32,

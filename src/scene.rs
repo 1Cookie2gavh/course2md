@@ -1,96 +1,39 @@
-//! 场景检测与抽帧：
-//! 1) ffmpeg `select=gt(scene,τ)` 过一遍（低分辨率解码）拿候选时间点与分数；
-//! 2) 冷却期去抖；
-//! 3) 逐点 `-ss` 精确抽帧；
-//! 4) 可选 ROI + dHash 去重。
+//! 幻灯片抽帧：对齐 yt-slide-mark
+//! 每 `sample_interval` 秒取一帧，与上一张保留帧做 SSIM；
+//! 低于 `similarity` 则保存，并跳过 `cooldown` 秒。
 
-use crate::config::PipelineConfig;
-use crate::img_hash::{dhash_file, hamming};
+use crate::config::{PipelineConfig, Roi};
+use crate::media;
 use crate::timeline::FrameEvent;
 use anyhow::{Context, Result};
+use image::{GrayImage, Luma};
+use image_compare::Algorithm;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-/// select+metadata 输出解析出的原始候选。
-#[derive(Debug, Clone, Copy)]
-struct Candidate {
-    t: f64,
-    #[allow(dead_code)]
-    score: f64,
+fn scaled_wh(ow: u32, oh: u32, target_w: u32) -> (u32, u32) {
+    let h = ((oh as u64 * target_w as u64) / ow.max(1) as u64) as u32;
+    (target_w, (h & !1).max(2))
 }
 
-/// 解析 `metadata=print` 输出：`pts_time:X` 与 `lavfi.scene_score=Y` 交替出现。
-fn parse_candidates(stdout: &str) -> Vec<Candidate> {
-    let mut out = vec![];
-    let mut pending_t: Option<f64> = None;
-    for line in stdout.lines() {
-        let line = line.trim();
-        // pts_time 出现在行中（如 "frame:10 pts:4000 pts_time:4.000"）
-        let pts_t = line.split("pts_time:").nth(1).map(|v| v.trim().parse::<f64>().ok()).flatten();
-        if pts_t.is_some() {
-            pending_t = pts_t;
-        } else if let Some(v) = line
-            .strip_prefix("lavfi.scene_score=")
-            .or_else(|| line.strip_prefix("lavfi.scd.score="))
-        {
-            if let (Some(t), Ok(s)) = (pending_t, v.trim().parse::<f64>()) {
-                out.push(Candidate { t, score: s });
-            }
-            pending_t = None;
-        }
-    }
-    out
+fn crop_roi(img: &GrayImage, roi: Option<Roi>) -> GrayImage {
+    let Some(r) = roi else {
+        return img.clone();
+    };
+    let (w, h) = img.dimensions();
+    let (x1, y1, x2, y2) = r.pixels(w, h);
+    image::imageops::crop_imm(img, x1, y1, (x2 - x1).max(1), (y2 - y1).max(1)).to_image()
 }
 
-/// Pass 1：场景检测（缩小解码提速）。
-async fn detect_scenes(media: &Path, threshold: f64) -> Result<Vec<Candidate>> {
-    // fps=1：只抽 1 帧/秒（课件翻页粒度足够）；videotoolbox 走 GPU 硬解。
-    let vf = format!(
-        "fps=1,scale=640:-2,select='gt(scene,{threshold})',metadata=print:file=-"
-    );
-    let out = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostats",
-            "-hwaccel",
-            "videotoolbox",
-            "-an",
-        ])
-        .arg("-i")
-        .arg(media)
-        .args(["-vf", &vf, "-f", "null", "-"])
-        .output()
-        .await
-        .context("启动 ffmpeg 场景检测失败")?;
-    if !out.status.success() {
-        return Err(crate::error::cmd_error(
-            "ffmpeg",
-            out.status.code(),
-            &String::from_utf8_lossy(&out.stderr),
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(parse_candidates(&stdout))
+fn ssim(a: &GrayImage, b: &GrayImage) -> f64 {
+    image_compare::gray_similarity_structure(&Algorithm::MSSIMSimple, a, b)
+        .map(|s| s.score)
+        .unwrap_or(0.0)
 }
 
-/// 冷却去抖：首帧 t=0 恒保留；与上一保留点间隔 < cooldown 的候选丢弃。
-fn apply_cooldown(cands: &[Candidate], cooldown: f64) -> Vec<f64> {
-    let mut kept: Vec<f64> = vec![0.0];
-    for c in cands {
-        if c.t <= 0.0 {
-            continue; // 首帧已保留
-        }
-        if c.t - kept.last().copied().unwrap_or(0.0) >= cooldown {
-            kept.push(c.t);
-        }
-    }
-    kept
-}
-
-/// 单点精确抽帧。
+/// 单点精确抽帧（全分辨率 JPEG）。
 async fn extract_frame(media: &Path, t: f64, dest: &Path) -> Result<()> {
     let ss = format!("{t:.3}");
     let out = Command::new("ffmpeg")
@@ -112,49 +55,115 @@ async fn extract_frame(media: &Path, t: f64, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 场景阶段入口：返回保留的 FrameEvent 列表（t 升序）。
-pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> {
-    let frames_dir = cfg.frames_dir();
-    tokio::fs::create_dir_all(&frames_dir).await?;
+/// 1fps（或 sample_interval）灰度流 + SSIM，得到新幻灯片时间点。
+async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<f64>> {
+    let info = media::probe_video(media)
+        .await
+        .context("ffprobe 无法读取视频宽高")?;
+    let interval = cfg.sample_interval.max(0.2);
+    let (tw, th) = scaled_wh(info.width, info.height, 640);
+    let fps = 1.0 / interval;
+    let vf = format!("fps={fps:.6},scale={tw}:{th},format=gray");
+    let total = ((info.duration / interval).ceil() as u64).max(1);
 
-    let t0 = std::time::Instant::now();
-    let cands = detect_scenes(media, cfg.scene_threshold).await?;
     tracing::info!(
-        candidates = cands.len(),
-        threshold = cfg.scene_threshold,
-        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
-        "scene candidates"
+        w = info.width,
+        h = info.height,
+        duration = format_args!("{:.0}s", info.duration),
+        interval,
+        similarity = cfg.similarity,
+        cooldown = cfg.cooldown,
+        "slide sample"
     );
 
-    let times = apply_cooldown(&cands, cfg.cooldown);
-    tracing::info!(kept = times.len(), cooldown = cfg.cooldown, "scene cooldown");
-
-    let pb = ProgressBar::new(times.len() as u64);
+    let mut child = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-an"])
+        .arg("-i")
+        .arg(media)
+        .args(["-vf", &vf, "-f", "rawvideo", "pipe:1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("启动 ffmpeg 采样失败")?;
+    let mut stdout = child.stdout.take().context("ffmpeg stdout")?;
+    let frame_len = (tw as usize) * (th as usize);
+    let mut buf = vec![0u8; frame_len];
+    let pb = ProgressBar::new(total);
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} scene {pos}/{len} [{bar:32.cyan/blue}] {msg}")
+        ProgressStyle::with_template("{spinner:.green} sample {pos}/{len} [{bar:32.cyan/blue}] {msg}")
             .unwrap()
             .progress_chars("##-"),
     );
-    let mut kept: Vec<FrameEvent> = vec![];
-    let mut last_hash: Option<u64> = None;
+
+    let mut times = vec![];
+    let mut last: Option<GrayImage> = None;
+    let mut skip: u32 = 0;
+    let skip_after = ((cfg.cooldown / interval).round() as u32).max(1).saturating_sub(1);
+    let mut i: u64 = 0;
+    loop {
+        match stdout.read_exact(&mut buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let t = i as f64 * interval;
+        i += 1;
+        pb.inc(1);
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        let gray = GrayImage::from_raw(tw, th, buf.clone())
+            .ok_or_else(|| anyhow::anyhow!("灰度帧尺寸不匹配 {tw}x{th}"))?;
+        let cmp = crop_roi(&gray, cfg.roi);
+        let (is_new, score) = match &last {
+            None => (true, None),
+            Some(prev) => {
+                if prev.dimensions() != cmp.dimensions() {
+                    (true, None)
+                } else {
+                    let s = ssim(prev, &cmp);
+                    (s < cfg.similarity, Some(s))
+                }
+            }
+        };
+        if is_new {
+            times.push(t);
+            last = Some(cmp);
+            skip = skip_after;
+            pb.set_message(format!(
+                "slides={} t={t:.0}s ssim={}",
+                times.len(),
+                score.map(|s| format!("{s:.2}")).unwrap_or_else(|| "-".into())
+            ));
+        }
+    }
+    pb.finish_and_clear();
+    let _ = child.wait().await;
+    tracing::info!(slides = times.len(), frames = i, "ssim scan done");
+    Ok(times)
+}
+
+/// 场景阶段入口。
+pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> {
+    let frames_dir = cfg.frames_dir();
+    tokio::fs::create_dir_all(&frames_dir).await?;
+    let t0 = std::time::Instant::now();
+    let times = sample_timestamps(cfg, media).await?;
+    anyhow::ensure!(!times.is_empty(), "未采样到任何帧");
+
+    let pb = ProgressBar::new(times.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} extract {pos}/{len} [{bar:32.cyan/blue}] {msg}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    let mut frames = vec![];
     for (i, &t) in times.iter().enumerate() {
         let name = format!("slide_{:04}.jpg", i + 1);
         let path = frames_dir.join(&name);
         extract_frame(media, t, &path).await?;
-        let roi = cfg.roi;
-        let hash = tokio::task::spawn_blocking(move || dhash_file(&path, roi))
-            .await
-            .context("hash 线程失败")??;
-        if let Some(lh) = last_hash {
-            let informative = hash.0 != 0 && lh != 0;
-            if informative && hamming(crate::img_hash::DHash(lh), hash) <= cfg.hamming {
-                let _ = tokio::fs::remove_file(frames_dir.join(&name)).await;
-                pb.inc(1);
-                continue;
-            }
-        }
-        last_hash = Some(hash.0);
-        kept.push(FrameEvent {
+        frames.push(FrameEvent {
             t,
             image: format!("frames/{name}"),
         });
@@ -162,23 +171,10 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
         pb.inc(1);
     }
     pb.finish_and_clear();
-    // 去重可能淘汰帧导致编号空洞：重命名为连续序号
-    let mut frames = vec![];
-    for (i, mut ev) in kept.into_iter().enumerate() {
-        let new_name = format!("slide_{:04}.jpg", i + 1);
-        let old = frames_dir.join(&ev.image);
-        let new = frames_dir.join(&new_name);
-        if old != new {
-            let _ = tokio::fs::rename(&old, &new).await;
-        }
-        ev.image = format!("frames/{new_name}");
-        frames.push(ev);
-    }
     tracing::info!(
         frames = frames.len(),
-        hamming = cfg.hamming,
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
-        "scene done"
+        "slides extracted"
     );
     Ok(frames)
 }
@@ -187,38 +183,64 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_meta_output() {
-        let s = "frame:10   pts:4000  pts_time:4.000\nlavfi.scene_score=0.6\nframe:20 pts:8000 pts_time:8.5\nlavfi.scene_score=0.9\n";
-        let c = parse_candidates(s);
-        assert_eq!(c.len(), 2);
-        assert!((c[0].t - 4.0).abs() < 1e-9 && (c[0].score - 0.6).abs() < 1e-9);
-        assert!((c[1].t - 8.5).abs() < 1e-9);
+    fn solid(v: u8) -> GrayImage {
+        GrayImage::from_pixel(32, 32, Luma([v]))
     }
 
     #[test]
-    fn parse_ignores_garbage() {
-        let s = "pts_time:abc\nlavfi.scene_score=1\n";
-        assert!(parse_candidates(s).is_empty());
-        assert!(parse_candidates("").is_empty());
+    fn ssim_identical_is_one() {
+        let a = solid(128);
+        let s = ssim(&a, &a);
+        assert!(s > 0.99, "ssim={s}");
     }
 
     #[test]
-    fn cooldown_keeps_spaced() {
-        let c = [
-            Candidate { t: 1.0, score: 0.5 },
-            Candidate { t: 2.0, score: 0.5 },
-            Candidate { t: 15.0, score: 0.5 },
-            Candidate { t: 40.0, score: 0.5 },
-            Candidate { t: 44.0, score: 0.5 },
-        ];
-        let kept = apply_cooldown(&c, 10.0);
-        assert_eq!(kept, vec![0.0, 15.0, 40.0]);
+    fn ssim_black_white_is_low() {
+        let s = ssim(&solid(0), &solid(255));
+        assert!(s < 0.5, "ssim={s}");
     }
 
     #[test]
-    fn cooldown_always_keeps_zero() {
-        let kept = apply_cooldown(&[], 10.0);
-        assert_eq!(kept, vec![0.0]);
+    fn scaled_even_height() {
+        let (w, h) = scaled_wh(1280, 410, 640);
+        assert_eq!(w, 640);
+        assert_eq!(h % 2, 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn nju_lecture_has_many_slides() {
+        let media = std::path::Path::new("out-bv/media.mp4");
+        if !media.is_file() {
+            eprintln!("skip: no out-bv/media.mp4");
+            return;
+        }
+        let cfg = crate::config::PipelineConfig {
+            url: String::new(),
+            out_dir: std::env::temp_dir().join("course2md-slide-test"),
+            similarity: 0.85,
+            sample_interval: 1.0,
+            cooldown: 10.0,
+            roi: None,
+            hamming: 6,
+            threads: 1,
+            workers: 1,
+            provider: "cpu".into(),
+            precision: "int8".into(),
+            vad_threshold: 0.5,
+            max_speech: 20.0,
+            formats: vec![],
+            model_dir: std::path::PathBuf::from("/tmp"),
+            keep_video: true,
+            no_download: true,
+        };
+        let _ = std::fs::create_dir_all(cfg.frames_dir());
+        let frames = run(&cfg, media).await.unwrap();
+        eprintln!("slides={}", frames.len());
+        assert!(
+            frames.len() >= 40,
+            "expected many slides, got {}",
+            frames.len()
+        );
     }
 }

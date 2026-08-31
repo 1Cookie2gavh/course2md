@@ -19,7 +19,8 @@ fn default_cfg() -> PipelineConfig {
     PipelineConfig {
         url: String::new(),
         out_dir: std::path::PathBuf::from("/tmp"),
-        scene_threshold: 0.35,
+        similarity: 0.85,
+        sample_interval: 1.0,
         cooldown: 10.0,
         roi: None,
         hamming: 6,
