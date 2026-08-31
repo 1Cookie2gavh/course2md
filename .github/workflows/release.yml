@@ -50,8 +50,23 @@ jobs:
         run: |
           cp "target/${{ matrix.target }}/release/course2md" "${{ matrix.asset }}"
           chmod +x "${{ matrix.asset }}"
-          # macOS：ad-hoc 签名（ARM64 无签名二进制会被直接 SIGKILL）
-          if [[ "$RUNNER_OS" == "macOS" ]]; then codesign --force --sign - "${{ matrix.asset }}"; fi
+          if [[ "$RUNNER_OS" != "macOS" ]]; then exit 0; fi
+          if [ -z "${{ secrets.MACOS_CERT_P12 }}" ]; then
+            # 无证书时退回 ad-hoc（ARM64 无签名会被 SIGKILL）
+            codesign --force --sign - "${{ matrix.asset }}"
+            exit 0
+          fi
+          echo "${{ secrets.MACOS_CERT_P12 }}" | base64 -d > /tmp/cert.p12
+          security create-keychain -p build /tmp/build.keychain
+          security import /tmp/cert.p12 -k /tmp/build.keychain -P "${{ secrets.MACOS_CERT_PASS }}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k build /tmp/build.keychain
+          security list-keychains -d user -s /tmp/build.keychain login.keychain-db
+          curl -fsSL -o /tmp/g2.cer https://www.apple.com/certificatedata/DeveloperIDG2.cer || true
+          security import /tmp/g2.cer -k /tmp/build.keychain || true
+          IDENTITY="$(security find-identity -v -p codesigning /tmp/build.keychain | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          codesign --force --options runtime --timestamp -s "$IDENTITY" "${{ matrix.asset }}"
+          codesign --verify --verbose=2 "${{ matrix.asset }}"
+          security delete-keychain /tmp/build.keychain
 
       - name: Package (windows)
         if: matrix.exe == true
