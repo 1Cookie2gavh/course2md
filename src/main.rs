@@ -1,3 +1,4 @@
+mod asr;
 mod cli;
 mod config;
 mod error;
