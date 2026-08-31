@@ -29,15 +29,18 @@ jobs:
         env:
           AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
-          install -dm700 ~/.ssh
-          printf '%s\n' "$AUR_KEY" > ~/.ssh/aur_key
-          chmod 600 ~/.ssh/aur_key
+          install -dm700 /root/.ssh ~/.ssh
+          printf '%s\n' "$AUR_KEY" > /root/.ssh/aur_key
+          cp /root/.ssh/aur_key ~/.ssh/aur_key
+          chmod 600 /root/.ssh/aur_key ~/.ssh/aur_key
           printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile ~/.ssh/aur_key\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile ~/.ssh/known_hosts\n' > ~/.ssh/config
-          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -t ed25519 aur.archlinux.org >> /root/.ssh/known_hosts 2>/dev/null || true
+          cp /root/.ssh/known_hosts ~/.ssh/known_hosts 2>/dev/null || true
           echo "known_hosts lines: $(wc -l < ~/.ssh/known_hosts)"
 
       - name: Update AUR package
         env:
           VERSION: ${{ inputs.version || github.event.workflow_run.head_branch }}
+          GIT_SSH_COMMAND: ssh -i /root/.ssh/aur_key -o User=aur -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/root/.ssh/known_hosts -o IdentitiesOnly=yes
         run: |
           packaging/aur/update-aur.sh "${VERSION#v}"
