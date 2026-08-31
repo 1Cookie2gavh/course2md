@@ -39,7 +39,34 @@ pub fn sanitize_qwen_text(s: &str) -> String {
     t.to_string()
 }
 
-pub async fn run(cfg: &PipelineConfig, input: AsrInput) -> Result<Vec<TranscriptEvent>> {
+pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<TranscriptEvent>> {
+    if cfg.provider.eq_ignore_ascii_case("coreml") {
+        #[cfg(apple_native)]
+        {
+            let wav = wav.to_path_buf();
+            let max_speech = cfg.max_speech as f64;
+            let joined = tokio::task::spawn_blocking(move || {
+                let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&tmp);
+                let res = crate::apple::run_coreml(&wav, max_speech, cut_wav, &tmp);
+                let _ = std::fs::remove_dir_all(&tmp);
+                res
+            })
+            .await
+            .context("ASR 线程 join 失败")?;
+            match joined {
+                Ok(events) if !events.is_empty() => return Ok(events),
+                Ok(_) => tracing::warn!("CoreML 未识别到语音，回落 llama-server"),
+                Err(e) => tracing::warn!("CoreML 后端失败（{e:#}），回落 llama-server"),
+            }
+        }
+        #[cfg(not(apple_native))]
+        {
+            anyhow::bail!(
+                "此构建未包含 Apple CoreML 后端（仅 macOS Apple Silicon 构建支持）。请用 --provider gpu 或 cpu"
+            );
+        }
+    }
     let ngl = if cfg.provider.eq_ignore_ascii_case("cpu") {
         0
     } else {
@@ -47,6 +74,12 @@ pub async fn run(cfg: &PipelineConfig, input: AsrInput) -> Result<Vec<Transcript
     };
     let threads = cfg.threads;
     let max_speech = cfg.max_speech;
+    let llama = crate::models::ensure_llama_or_download(&cfg.model_dir).await?;
+    let input = AsrInput {
+        wav: wav.to_path_buf(),
+        model: llama.model,
+        mmproj: llama.mmproj,
+    };
     tokio::task::spawn_blocking(move || run_blocking(&input, ngl, threads, max_speech))
         .await
         .context("ASR 线程 join 失败")?
@@ -240,11 +273,22 @@ fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<(f64, f64)>> {
             }
         }
     }
-    let mut speech = invert_silence(dur, &silences);
-    speech = split_max(speech, max_speech as f64);
+    normalize_segments(invert_silence(dur, &silences), max_speech as f64, wav)
+}
+
+/// VAD 原始段的公共后处理：按 max_speech 切分、丢弃过短段、全静音时兜底整段。
+pub fn normalize_segments(
+    mut speech: Vec<(f64, f64)>,
+    max_speech: f64,
+    wav: &Path,
+) -> Result<Vec<(f64, f64)>> {
+    speech = split_max(speech, max_speech);
     speech.retain(|(a, b)| b - a >= 0.2);
-    if speech.is_empty() && dur > 0.2 {
-        speech = split_max(vec![(0.0, dur)], max_speech as f64);
+    if speech.is_empty() {
+        let dur = crate::media::probe_duration_blocking(wav).unwrap_or(0.0);
+        if dur > 0.2 {
+            speech = split_max(vec![(0.0, dur)], max_speech);
+        }
     }
     Ok(speech)
 }
@@ -279,7 +323,7 @@ fn split_max(segs: Vec<(f64, f64)>, max: f64) -> Vec<(f64, f64)> {
     out
 }
 
-fn cut_wav(src: &Path, start: f64, end: f64, dest: &Path) -> Result<()> {
+pub fn cut_wav(src: &Path, start: f64, end: f64, dest: &Path) -> Result<()> {
     let dur = (end - start).max(0.05);
     let st = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-ss"])

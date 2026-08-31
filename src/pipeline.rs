@@ -1,10 +1,9 @@
 //! 编排：元数据 → 目录 → 下载 → (截图 ∥ 音频) → 识别 → 渲染。
 
-use crate::asr::{self, AsrInput};
+use crate::asr;
 use crate::config::{self, PipelineConfig};
 use crate::fetch::{self, VideoMeta};
 use crate::media;
-use crate::models;
 use crate::render;
 use crate::scene;
 use crate::timeline;
@@ -16,7 +15,9 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     let t_total = Instant::now();
     crate::error::require_cmd("ffmpeg")?;
     crate::error::require_cmd("ffprobe")?;
-    crate::error::require_cmd("llama-server")?;
+    if !cfg.provider.eq_ignore_ascii_case("coreml") {
+        crate::error::require_cmd("llama-server")?;
+    }
 
     let local = Path::new(&cfg.url);
     let is_local = local.is_file();
@@ -94,16 +95,7 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
 
     tracing::info!(device = %cfg.provider, "transcribe");
-    let llama = models::ensure_llama_or_download(&cfg.model_dir).await?;
-    let events = asr::run(
-        &cfg,
-        AsrInput {
-            wav: cfg.audio_path(),
-            model: llama.model,
-            mmproj: llama.mmproj,
-        },
-    )
-    .await?;
+    let events = asr::run(&cfg, &cfg.audio_path()).await?;
 
     // 可选的 LLM 润色：尽早校验配置，避免跑完识别才发现配错
     let events = if cfg.llm.enabled {
@@ -210,7 +202,7 @@ fn print_summary(
     eprintln!("模型目录：{}", cfg.model_dir.display());
     eprintln!("──────────────────────────────");
     if !cfg.llm.enabled && !cfg.llm.disable_hint {
-        crate::llm::write_hint_note(&crate::llm::config_path());
+        crate::llm::write_hint_note(&crate::settings::config_path());
     }
 }
 

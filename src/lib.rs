@@ -1,3 +1,4 @@
+pub mod apple;
 pub mod asr;
 pub mod cli;
 pub mod config;
@@ -8,5 +9,6 @@ pub mod media;
 pub mod models;
 pub mod pipeline;
 pub mod render;
+pub mod settings;
 pub mod scene;
 pub mod timeline;

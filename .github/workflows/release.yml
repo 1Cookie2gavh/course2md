@@ -21,10 +21,12 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: course2md-linux-aarch64
-          - os: macos-14
+          # macOS arm64：macos-15+ 才能编译 speech-swift（CoreML/MLX，Swift 6）
+          - os: macos-15
             target: aarch64-apple-darwin
             asset: course2md-macos-arm64
-          - os: macos-14
+          # x86_64 macOS 不编译 Apple 原生模块（build.rs 按 target_arch 跳过）
+          - os: macos-15
             target: x86_64-apple-darwin
             asset: course2md-macos-x86_64
           - os: windows-latest
@@ -55,10 +57,18 @@ jobs:
         run: |
           cp "target/${{ matrix.target }}/release/course2md.exe" "${{ matrix.asset }}"
 
+      # MLX Metal kernels（CoreML 推理运行时需要，与二进制同目录）
+      - name: Collect mlx.metallib (macos arm64)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          cp "native/apple-asr/.build/out/Products/Release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib" mlx-macos-arm64.metallib
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            mlx-macos-arm64.metallib
 
   release:
     needs: build

@@ -8,7 +8,6 @@ use crate::timeline::TranscriptEvent;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const DEFAULT_PROMPT: &str = "你是字幕校对器。修正语音识别文本中明显的错误\
@@ -31,42 +30,6 @@ pub struct LlmSettings {
     pub prompt: Option<String>,
     /// 关闭「可开启 LLM」的结束提示
     pub disable_hint: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(default)]
-pub struct ConfigFile {
-    pub llm: LlmSettings,
-}
-
-pub fn config_path() -> PathBuf {
-    crate::config::config_dir().join("config.toml")
-}
-
-pub fn load_config() -> ConfigFile {
-    let p = config_path();
-    if !p.is_file() {
-        return ConfigFile::default();
-    }
-    match std::fs::read_to_string(&p) {
-        Ok(s) => toml::from_str(&s).unwrap_or_default(),
-        Err(_) => ConfigFile::default(),
-    }
-}
-
-pub fn save_config(cfg: &ConfigFile) -> Result<PathBuf> {
-    let p = config_path();
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&p, toml::to_string_pretty(cfg)?)?;
-    // 配置含 API Key，收紧权限（Windows 依赖用户目录 ACL）
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(p)
 }
 
 /// base_url -> 完整 chat/completions URL。
@@ -195,12 +158,12 @@ pub fn test_connection(s: &LlmSettings) -> Result<()> {
 
 /// `llm setup`：交互式补齐缺失项并写盘。
 pub fn setup_interactive(
-    mut cfg: ConfigFile,
+    mut cfg: crate::settings::ConfigFile,
     base_url: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
     disable_hint: bool,
-) -> Result<ConfigFile> {
+) -> Result<crate::settings::ConfigFile> {
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     let mut line = String::new();
@@ -244,9 +207,9 @@ pub fn setup_interactive(
     Ok(cfg)
 }
 
-pub fn print_status(cfg: &ConfigFile) {
+pub fn print_status(cfg: &crate::settings::ConfigFile) {
     let s = &cfg.llm;
-    println!("配置文件：{}", config_path().display());
+    println!("配置文件：{}", crate::settings::config_path().display());
     println!("  LLM 润色：{}", if s.enabled { "已开启" } else { "已关闭" });
     println!("  base_url：{}", if s.base_url.is_empty() { "-" } else { &s.base_url });
     let key_disp = if s.api_key.is_empty() {
@@ -262,7 +225,7 @@ pub fn print_status(cfg: &ConfigFile) {
     }
 }
 
-pub fn write_hint_note(path: &Path) {
+pub fn write_hint_note(path: &std::path::Path) {
     let _ = std::io::stderr().write_all(
         format!(
             "\n提示：可用 LLM 自动润色字幕（修正语气词与明显识别错误），运行 `course2md llm setup` 一键开启。\n配置文件：{}（加 --no-llm-hint 或在配置中设 disable_hint 可关闭本提示）\n",

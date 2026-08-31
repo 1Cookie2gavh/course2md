@@ -9,3 +9,5 @@ out-bv/
 out-bench/
 out-gpu/
 out-smoke/
+native/apple-asr/.build/
+mlx.metallib

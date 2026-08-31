@@ -1,0 +1,39 @@
+name: aur
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的版本（不带 v 前缀，如 0.4.0）"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  update-aur:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    steps:
+      - name: Install tools
+        run: pacman -Sy --noconfirm git openssh make
+
+      - uses: actions/checkout@v4
+
+      - name: Setup AUR SSH
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -dm700 ~/.ssh
+          printf '%s\n' "$AUR_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile ~/.ssh/aur_key\n  StrictHostKeyChecking yes\n' > ~/.ssh/config
+          ssh-keyscan -t ed25519,rsa aur.archlinux.org >> ~/.ssh/known_hosts
+
+      - name: Update AUR package
+        env:
+          VERSION: ${{ inputs.version || github.event.release.tag_name }}
+        run: |
+          packaging/aur/update-aur.sh "${VERSION#v}"

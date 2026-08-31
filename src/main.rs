@@ -1,6 +1,6 @@
 use clap::Parser;
-use course2md::cli::{Cli, Command, LlmCmd, ModelsCmd, RunOpts};
-use course2md::{config, llm, models, pipeline};
+use course2md::cli::{Cli, Command, ConfigCmd, LlmCmd, ModelsCmd, RunOpts};
+use course2md::{config, llm, models, pipeline, settings};
 use tracing_subscriber::EnvFilter;
 
 fn init_logging(verbose: u8, quiet: bool) {
@@ -19,9 +19,18 @@ fn init_logging(verbose: u8, quiet: bool) {
         .init();
 }
 
+/// 默认识别后端：带 Apple 原生模块的构建优先 CoreML，其余走 llama.cpp GPU。
+fn default_provider() -> String {
+    if cfg!(apple_native) {
+        "coreml".into()
+    } else {
+        "gpu".into()
+    }
+}
+
 /// 配置文件 + CLI 覆盖 -> 生效 LLM 设置。
-fn resolve_llm(opts: &RunOpts) -> llm::LlmSettings {
-    let mut s = llm::load_config().llm;
+fn resolve_llm(opts: &RunOpts, file: &settings::ConfigFile) -> llm::LlmSettings {
+    let mut s = file.llm.clone();
     if opts.no_llm {
         s.enabled = false;
     } else if opts.llm {
@@ -45,24 +54,51 @@ fn resolve_llm(opts: &RunOpts) -> llm::LlmSettings {
     s
 }
 
-fn run_opts_to_cfg(source: String, opts: RunOpts) -> anyhow::Result<config::PipelineConfig> {
-    let llm = resolve_llm(&opts);
+/// 优先级：CLI 显式参数 > 配置文件 [defaults] > 内置默认。
+fn run_opts_to_cfg(
+    source: String,
+    opts: &RunOpts,
+    file: &settings::ConfigFile,
+) -> anyhow::Result<config::PipelineConfig> {
+    let d = &file.defaults;
     Ok(config::PipelineConfig {
         url: source,
-        out_root: opts.out.clone(),
-        out_dir: opts.out,
-        similarity: opts.similarity,
-        sample_interval: opts.sample_interval,
-        cooldown: opts.cooldown,
-        roi: opts.roi.map(|s| config::Roi::parse(&s)).transpose()?,
-        threads: opts.threads,
-        provider: opts.provider,
-        max_speech: opts.max_speech,
-        formats: opts.formats,
-        model_dir: config::model_dir_from(opts.model_dir.as_deref()),
-        keep_video: opts.keep_video,
-        no_download: opts.no_download,
-        llm,
+        out_root: opts
+            .out
+            .clone()
+            .or_else(|| d.out.clone())
+            .unwrap_or_else(|| "out".into()),
+        out_dir: opts.out.clone().or_else(|| d.out.clone()).unwrap_or_else(|| "out".into()),
+        similarity: opts.similarity.or(d.similarity).unwrap_or(0.85),
+        sample_interval: opts.sample_interval.or(d.sample_interval).unwrap_or(1.0),
+        cooldown: opts.cooldown.or(d.cooldown).unwrap_or(10.0),
+        roi: match &opts.roi {
+            Some(s) => Some(config::Roi::parse(s)?),
+            None => match &d.roi {
+                Some(s) => Some(config::Roi::parse(s)?),
+                None => None,
+            },
+        },
+        threads: opts.threads.or(d.threads).unwrap_or(4),
+        provider: opts
+            .provider
+            .clone()
+            .or_else(|| d.provider.clone())
+            .unwrap_or_else(default_provider),
+        max_speech: opts.max_speech.or(d.max_speech).unwrap_or(20.0),
+        formats: opts
+            .formats
+            .clone()
+            .or_else(|| d.formats.clone())
+            .unwrap_or_else(|| vec!["md".into(), "html".into()]),
+        model_dir: config::model_dir_from(
+            opts.model_dir
+                .as_deref()
+                .or(d.model_dir.as_deref()),
+        ),
+        keep_video: opts.keep_video || d.keep_video.unwrap_or(false),
+        no_download: opts.no_download || d.no_download.unwrap_or(false),
+        llm: resolve_llm(opts, file),
     })
 }
 
@@ -93,26 +129,45 @@ fn main() -> anyhow::Result<()> {
                     disable_hint,
                 } => {
                     let cfg = llm::setup_interactive(
-                        llm::load_config(),
+                        settings::load(),
                         base_url,
                         api_key,
                         model,
                         disable_hint,
                     )?;
-                    let path = llm::save_config(&cfg)?;
+                    let path = settings::save(&cfg)?;
                     println!("已写入并开启：{}", path.display());
                     match llm::test_connection(&cfg.llm) {
                         Ok(()) => println!("连接测试通过。"),
                         Err(e) => eprintln!("连接测试未通过（已保存配置）：{e:#}"),
                     }
                 }
-                LlmCmd::Status => llm::print_status(&llm::load_config()),
+                LlmCmd::Status => llm::print_status(&settings::load()),
                 LlmCmd::Disable => {
-                    let mut cfg = llm::load_config();
+                    let mut cfg = settings::load();
                     cfg.llm.enabled = false;
-                    let path = llm::save_config(&cfg)?;
+                    let path = settings::save(&cfg)?;
                     println!("已关闭 LLM 润色（凭据保留）：{}", path.display());
                 }
+            }
+            Ok(())
+        }
+        Some(Command::Config { cmd }) => {
+            init_logging(0, false);
+            match cmd {
+                ConfigCmd::Init { force } => {
+                    let path = settings::config_path();
+                    if path.is_file() && !force {
+                        anyhow::bail!("配置文件已存在：{}（--force 覆盖）", path.display());
+                    }
+                    if let Some(dir) = path.parent() {
+                        std::fs::create_dir_all(dir)?;
+                    }
+                    std::fs::write(&path, settings::TEMPLATE)?;
+                    println!("已生成配置模板：{}", path.display());
+                    println!("按需取消注释并修改；命令行参数优先于此文件。");
+                }
+                ConfigCmd::Show => settings::print_effective(&settings::load()),
             }
             Ok(())
         }
@@ -127,7 +182,8 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             init_logging(cli.opts.verbose, cli.opts.quiet);
-            let cfg = run_opts_to_cfg(source, cli.opts)?;
+            let file = settings::load();
+            let cfg = run_opts_to_cfg(source, &cli.opts, &file)?;
             tracing::info!(out = %cfg.out_dir.display(), provider = %cfg.provider, "start");
             tokio::runtime::Runtime::new()?.block_on(pipeline::run(&cfg))
         }
