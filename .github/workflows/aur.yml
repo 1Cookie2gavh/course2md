@@ -32,8 +32,9 @@ jobs:
           install -dm700 ~/.ssh
           printf '%s\n' "$AUR_KEY" > ~/.ssh/aur_key
           chmod 600 ~/.ssh/aur_key
-          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile ~/.ssh/aur_key\n  StrictHostKeyChecking yes\n' > ~/.ssh/config
-          ssh-keyscan -t ed25519,rsa aur.archlinux.org >> ~/.ssh/known_hosts
+          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile ~/.ssh/aur_key\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile ~/.ssh/known_hosts\n' > ~/.ssh/config
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "known_hosts lines: $(wc -l < ~/.ssh/known_hosts)"
 
       - name: Update AUR package
         env:
