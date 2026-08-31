@@ -1,50 +1,72 @@
 # course2md
 
-把 YouTube、Bilibili 或本地网课视频转成带截图的 Markdown / HTML 文字稿。
+把 YouTube、Bilibili 或本地网课/录屏视频转换为带截图的 Markdown / HTML 笔记。
+
+[![Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装指南)
+
+---
+
+## 快速上手
+
+传入在线视频 URL 或本地视频文件路径即可开始转换：
 
 ```bash
-course2md <url或本地文件>
-```
-
-例如：
-
-```bash
+# 解析 B 站视频
 course2md https://www.bilibili.com/video/BV1pb8o6yE8f
+
+# 解析 YouTube 视频
 course2md https://youtu.be/dQw4w9WgXcQ
+
+# 解析本地课件/会议录屏
 course2md ./lecture.mp4
 ```
 
-## 安装
+> **说明**：首次运行时会自动下载语音识别模型（约 2.4GB），请保持网络连接稳定。
 
-运行需要 `ffmpeg`、`ffprobe`、`yt-dlp` 和 llama.cpp 提供的 `llama-server`。
+---
+
+## 安装指南
+
+运行 `course2md` 需要系统环境中具备以下外部依赖：
+- `ffmpeg` & `ffprobe`（音视频提取与处理）
+- `yt-dlp`（在线视频解析与下载）
+- `llama-server`（由 `llama.cpp` 提供，负责本地 ASR 推理）
+
+---
 
 ### macOS
 
+推荐使用 Homebrew 一键安装所有依赖及程序：
+
 ```bash
+# 1. 安装依赖
 brew install ffmpeg yt-dlp llama.cpp
+
+# 2. 安装 course2md
 curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | bash
 ```
 
-也可以从源码安装 course2md：
+---
+
+### Arch Linux / CachyOS
 
 ```bash
-git clone https://github.com/mizorewww/course2md.git
-cd course2md
-cargo install --path .
-```
-
-### Arch Linux 
-
-```bash
+# 1. 安装依赖
 sudo pacman -S ffmpeg yt-dlp
-# CachyOS 等仓库可能已有：
+
+# 安装 llama.cpp（官方源 / CachyOS 源 / AUR）
 sudo pacman -S llama-cpp
-# 或 AUR：
+# 或通过 AUR 安装:
 # yay -S llama.cpp
+
+# 2. 安装 course2md
 curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | bash
 ```
 
-没有 AUR helper 时，可从源码安装 llama.cpp：
+<details>
+<summary>若没有 AUR 环境，可从源码编译 llama.cpp</summary>
 
 ```bash
 sudo pacman -S --needed base-devel cmake git
@@ -53,22 +75,32 @@ cmake -S llama.cpp -B llama.cpp/build -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build --config Release -j
 sudo install -m755 llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 ```
+</details>
+
+---
 
 ### Debian / Ubuntu
 
 ```bash
+# 1. 安装基础依赖与编译工具
 sudo apt update
 sudo apt install -y ffmpeg yt-dlp git cmake build-essential
+
+# 2. 编译并安装 llama-server
 git clone https://github.com/ggml-org/llama.cpp.git
 cmake -S llama.cpp -B llama.cpp/build -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build --config Release -j
 sudo install -m755 llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+
+# 3. 安装 course2md
 curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | bash
 ```
 
+---
+
 ### Windows
 
-PowerShell 中推荐用 winget 安装依赖：
+在 **PowerShell** 中推荐使用 `winget` 安装依赖：
 
 ```powershell
 winget install --id Gyan.FFmpeg -e
@@ -76,81 +108,99 @@ winget install --id yt-dlp.yt-dlp -e
 winget install --id ggml.llamacpp -e
 ```
 
-也可以用 Chocolatey 安装 `ffmpeg`、`yt-dlp`，或用 Scoop 安装这些依赖；无论采用哪种方式，请确认 `ffmpeg`、`ffprobe`、`yt-dlp`、`llama-server.exe` 都已加入 `PATH`。
+也可以使用 Scoop 或 Chocolatey 安装依赖。无论采用何种方式，请确保 `ffmpeg`、`ffprobe`、`yt-dlp`、`llama-server.exe` 均已加入系统 `PATH` 环境变量。
 
 ```powershell
-choco install ffmpeg yt-dlp
-# 或
+# Scoop 方式
 scoop install ffmpeg yt-dlp
+
+# Chocolatey 方式
+choco install ffmpeg yt-dlp
 ```
 
-然后从 [Releases](https://github.com/mizorewww/course2md/releases) 下载 `course2md-windows-x86_64.exe`，重命名为 `course2md.exe` 并加入 `PATH`；也可安装 Rust 后从源码编译：
+**安装 course2md**：
+1. 前往 [Releases](https://github.com/mizorewww/course2md/releases) 下载 `course2md-windows-x86_64.exe`。
+2. 重命名为 `course2md.exe` 并将其所在目录加入系统 `PATH`。
 
-```powershell
-git clone https://github.com/mizorewww/course2md.git
-cd course2md
-cargo install --path .
-```
+---
 
 ### 从源码构建
 
-需要稳定版 Rust 工具链：
+需要安装 Rust 稳定版（Stable）工具链：
 
 ```bash
 git clone https://github.com/mizorewww/course2md.git
 cd course2md
 cargo install --path .
-# 或只构建二进制
+# 或仅构建 Release 二进制文件
 cargo build --release
 ```
 
-`install.sh` 提供 `macos-arm64`、`macos-x86_64`、`linux-x86_64`、`linux-aarch64` 预编译版本，默认安装到 `~/bin`。
+`install.sh` 脚本提供了 `macos-arm64`、`macos-x86_64`、`linux-x86_64`、`linux-aarch64` 架构的预编译版本，默认安装至 `~/bin`。
 
-## 首次运行与模型
+---
 
-首次转换时会自动下载 llama.cpp 使用的 Qwen3-ASR GGUF 模型（约 2.4GB），请保持网络连接并不要中途退出。也可以提前下载或查看状态：
+## 模型管理
+
+`course2md` 使用针对多语言优化的高性能 **Qwen3-ASR GGUF** 模型。
+
+模型会在首次转换任务时自动拉取，也可以通过子命令手动管理：
 
 ```bash
+# 提前下载模型
 course2md models download
+
+# 查看本地模型缓存状态
 course2md models list
 ```
 
-模型默认保存在：
+**模型默认保存路径**：
+- **macOS / Linux**：`~/.cache/course2md/models/`
+- **Windows**：`%LOCALAPPDATA%\course2md\models\`
 
-- macOS / Linux：`~/.cache/course2md/models/`
-- Windows：`%LOCALAPPDATA%/course2md/models/`
+---
 
-## 输出在哪里
+## 输出目录结构
 
-结果按 `out/<平台>/<标题>/<编号>/` 归档：
+转换产物将按 `out/<平台>/<标题>/<编号>/` 格式自动归档：
 
 ```text
 out/<平台>/<标题>/<编号>/
-├── course.md          # 默认生成
-├── course.html        # 默认生成
-├── structured.json    # 使用 --formats md,html,json 时生成
-├── frames/            # 文稿中的截图
-├── audio.wav          # 提取后的音频
-├── timeline.jsonl     # 带时间戳的中间结果
-├── meta.json          # 视频元信息
-└── media.mp4          # 默认完成后删除；--keep-video 可保留
+├── course.md          # 图文混排 Markdown 文档（默认生成）
+├── course.html        # 独立排版 HTML 页面（默认生成）
+├── structured.json    # 结构化数据（指定 --formats 包含 json 时生成）
+├── frames/            # 文稿中引用的幻灯片/关键帧截图
+│   ├── frame_001.jpg
+│   └── ...
+├── audio.wav          # 提取的音频切片
+├── timeline.jsonl     # 带时间戳对齐的原始识别序列
+├── meta.json          # 视频标题、作者、时长等元数据
+└── media.mp4          # 原始视频（默认转换完成后自动删除）
 ```
 
-任务完成后会打印文稿、截图、音频和视频路径，以及总耗时和本进程峰值内存（RSS）。
+任务完成后，终端会打印生成的文稿路径、音视频路径、总耗时以及本进程峰值内存占用（RSS）。
+
+---
 
 ## 常用参数
 
-| 参数 | 作用 |
-|---|---|
-| `-o <目录>` | 指定输出根目录，默认 `out` |
-| `--keep-video` | 保留下载或复制的 `media.mp4` |
-| `--provider cpu` | 强制 CPU 识别；默认由 llama.cpp 使用 GPU |
-| `--formats md,html,json` | 选择输出格式，默认 `md,html` |
-| `--similarity <0~1>` | SSIM 相似度阈值；**越低截图越多**，默认 0.85 |
-| `--cooldown <秒>` | 两张新截图之间的最短间隔，默认 10 秒 |
+| 参数 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| `-o <目录>` | 指定输出根目录 | `out` |
+| `--similarity <0~1>` | SSIM 画面相似度阈值；**数值越低截图越多** | `0.85` |
+| `--cooldown <秒>` | 连续两张截图之间的最短间隔时间（秒） | `10` |
+| `--formats <格式>` | 输出格式，逗号分隔，可选 `md,html,json` | `md,html` |
+| `--provider <cpu/gpu>` | 指定推理后端；默认由 llama.cpp 自动调用 GPU | `gpu` |
+| `--keep-video` | 保留下载或提取的原始 `media.mp4` 文件 | 关闭 |
 
-完整参数：
+查看完整参数与选项列表：
 
 ```bash
 course2md --help
 ```
+
+---
+
+## 开源协议
+
+本项目基于 [MIT License](LICENSE) 开源。
