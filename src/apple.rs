@@ -23,7 +23,7 @@ mod ffi {
             out_n: *mut c_int,
         ) -> c_int;
         pub fn c2m_free_doubles(p: *mut c_double);
-        pub fn c2m_asr_create(err: *mut c_char, err_len: usize) -> *mut std::ffi::c_void;
+        pub fn c2m_asr_create(model: *const c_char, err: *mut c_char, err_len: usize) -> *mut std::ffi::c_void;
         pub fn c2m_asr_transcribe(
             handle: *mut std::ffi::c_void,
             wav_path: *const c_char,
@@ -99,11 +99,70 @@ fn ensure_metallib() -> Result<()> {
     )
 }
 
+/// 解析 coreml 后端用的模型：显式指定 > 标记文件 > （交互式终端则询问并记忆）> qwen3。
+pub fn resolve_model(explicit: Option<&str>) -> String {
+    if let Some(m) = explicit {
+        return normalize(m);
+    }
+    let marker = crate::config::config_dir().join("asr_model");
+    if let Ok(s) = std::fs::read_to_string(&marker) {
+        let m = normalize(s.trim());
+        if m == "qwen3" || m == "whisper" {
+            return m;
+        }
+    }
+    let chosen = prompt_model_choice();
+    let _ = std::fs::write(&marker, &chosen);
+    chosen
+}
+
+fn normalize(s: &str) -> String {
+    let s = s.trim().to_ascii_lowercase();
+    if s.contains("whisper") {
+        "whisper".into()
+    } else {
+        "qwen3".into()
+    }
+}
+
+/// 首次使用：让用户选择下载哪个模型（非交互环境默认 qwen3）。
+fn prompt_model_choice() -> String {
+    if !atty_or_tty() {
+        tracing::info!("非交互环境，默认使用 qwen3 模型（--asr-model whisper 可切换）");
+        return "qwen3".into();
+    }
+    use std::io::{BufRead, Write};
+    let mut out = std::io::stderr();
+    let _ = writeln!(
+        out,
+        "选择 CoreML 识别模型 / Select CoreML ASR model:"
+    );
+    let _ = writeln!(out, "  1) qwen3    - Qwen3-ASR 0.6B（默认 / default，约 1-2GB）");
+    let _ = writeln!(out, "  2) whisper  - Whisper large-v3-turbo（多语言 / multilingual）");
+    let _ = write!(out, "输入序号并回车（默认 1）/ Enter choice [1]: ");
+    let _ = out.flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
+        return "qwen3".into();
+    }
+    match line.trim() {
+        "2" => "whisper".into(),
+        _ => "qwen3".into(),
+    }
+}
+
+fn atty_or_tty() -> bool {
+    // stderr 接终端才算交互（stdin 可能被重定向）
+    unsafe { libc::isatty(2) == 1 }
+}
+
 impl CoremlAsr {
     /// 加载模型（首次会自动下载，约 1-2GB）。
-    pub fn load() -> Result<Self> {
+    pub fn load(model: &str) -> Result<Self> {
+        let name = CString::new(model)?.into_raw();
         let mut err = vec![0u8; 1024];
-        let handle = unsafe { ffi::c2m_asr_create(err.as_mut_ptr() as *mut _, err.len()) };
+        let handle = unsafe { ffi::c2m_asr_create(name, err.as_mut_ptr() as *mut _, err.len()) };
+        unsafe { std::mem::drop(CString::from_raw(name)) };
         if handle.is_null() {
             let msg = CStr::from_bytes_until_nul(&err)
                 .map(|s| s.to_string_lossy().into_owned())
@@ -148,6 +207,7 @@ unsafe impl Send for CoremlAsr {}
 pub fn run_coreml(
     wav: &Path,
     max_speech: f64,
+    model: &str,
     cut: impl Fn(&Path, f64, f64, &Path) -> Result<()>,
     tmp_dir: &Path,
 ) -> Result<Vec<TranscriptEvent>> {
@@ -160,8 +220,8 @@ pub fn run_coreml(
     }
 
     ensure_metallib()?;
-    tracing::info!("loading Qwen3-ASR CoreML（首次使用会自动下载模型）");
-    let asr = CoremlAsr::load().context("CoreML 模型加载失败")?;
+    tracing::info!(model, "loading CoreML ASR（首次使用会自动下载模型）");
+    let asr = CoremlAsr::load(model).context("CoreML 模型加载失败")?;
     tracing::info!(secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "coreml ready");
 
     let pb = indicatif::ProgressBar::new(segs.len() as u64);

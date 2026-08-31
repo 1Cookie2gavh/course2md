@@ -18,6 +18,10 @@ pub struct PipelineConfig {
     pub no_download: bool,
     /// LLM 字幕润色（已合并 CLI 覆盖后的生效配置）
     pub llm: crate::llm::LlmSettings,
+    /// 云端 STT（provider=api；已合并 CLI 覆盖）
+    pub asr_api: crate::settings::AsrApi,
+    /// coreml 后端模型选择：qwen3 | whisper
+    pub asr_model: Option<String>,
     /// `-o` 根目录，实际课程目录是 `{out_root}/{platform}/{title}/{id}/`
     pub out_root: PathBuf,
 }

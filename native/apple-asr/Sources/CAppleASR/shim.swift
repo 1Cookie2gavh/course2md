@@ -3,6 +3,7 @@
 
 import Foundation
 import Qwen3ASR
+import WhisperASR
 import SpeechVAD
 import AudioCommon
 
@@ -90,27 +91,42 @@ public func c2mFreeDoubles(_ p: UnsafeMutablePointer<Double>?) {
     if let p = p { free(p) }
 }
 
-// MARK: - Qwen3-ASR (CoreML)
-
-final class AsrBox {
-    let model: CoreMLASRModel
-    init(_ m: CoreMLASRModel) { model = m }
+private func progressLog(_ p: Double, _ msg: String) {
+    fputs("  [course2md] model \(Int(p * 100))% - \(msg)\n", __stderrp)
 }
 
-private func progressLog(_ p: Double, _ msg: String) {
-    fputs("  [course2md] 模型 \(Int(p * 100))% - \(msg)\n", __stderrp)
+// MARK: - ASR (CoreML)：qwen3 | whisper 两种模型
+
+enum AsrKind {
+    case qwen(CoreMLASRModel)
+    case whisper(WhisperASRModel)
+}
+
+final class AsrBox {
+    let model: AsrKind
+    init(_ m: AsrKind) { model = m }
 }
 
 @_cdecl("c2m_asr_create")
-public func c2mAsrCreate(_ errBuf: UnsafeMutablePointer<CChar>, _ errLen: Int) -> UnsafeMutableRawPointer? {
+public func c2mAsrCreate(_ model: UnsafePointer<CChar>, _ errBuf: UnsafeMutablePointer<CChar>, _ errLen: Int) -> UnsafeMutableRawPointer? {
+    let name = String(cString: model)
     do {
-        let model = try runSync {
-            try await CoreMLASRModel.fromPretrained(progressHandler: progressLog)
+        let kind: AsrKind
+        if name == "whisper" {
+            let m = try runSync {
+                try await WhisperASRModel.fromPretrained(progressHandler: progressLog)
+            }
+            kind = .whisper(m)
+        } else {
+            let m = try runSync {
+                try await CoreMLASRModel.fromPretrained(progressHandler: progressLog)
+            }
+            try m.warmUp()
+            kind = .qwen(m)
         }
-        try model.warmUp()
-        return Unmanaged.passRetained(AsrBox(model)).toOpaque()
+        return Unmanaged.passRetained(AsrBox(kind)).toOpaque()
     } catch {
-        let msg = "Qwen3-ASR CoreML 初始化失败: \(error)"
+        let msg = "CoreML ASR init failed (\(name)): \(error)"
         msg.withCString { cStr in
             _ = strncpy(errBuf, cStr, errLen - 1)
         }
@@ -128,7 +144,15 @@ public func c2mAsrTranscribe(
     let box = Unmanaged<AsrBox>.fromOpaque(handle).takeUnretainedValue()
     do {
         let samples = try loadWav(String(cString: wavPath))
-        let text = try box.model.transcribe(audio: samples, sampleRate: 16000, language: nil, maxTokens: 448)
+        let text: String
+        switch box.model {
+        case .qwen(let m):
+            text = try m.transcribe(audio: samples, sampleRate: 16000, language: nil, maxTokens: 448)
+        case .whisper(let m):
+            text = try runSync {
+                try await m.transcribeAudio(samples, sampleRate: 16000, language: nil)
+            }
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         trimmed.withCString { cStr in
             _ = strncpy(outText, cStr, outLen - 1)

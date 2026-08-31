@@ -1,55 +1,55 @@
 # course2md
 
-把 YouTube、Bilibili 或本地网课/录屏视频转换为带截图的 Markdown / HTML 笔记。
+Turn YouTube, Bilibili, or local course/meeting recordings into slide-illustrated Markdown and HTML lecture notes.
 
 [![Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装指南)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#installation)
 [![AUR](https://img.shields.io/aur/version/course2md-bin?color=blue)](https://aur.archlinux.org/packages/course2md-bin)
 
-[English](readme.en.md) · **中文**
+**English** · [中文](readme.zh.md)
 
 ---
 
-## 快速上手
+## Quick Start
 
-传入在线视频 URL 或本地视频文件路径即可开始转换：
+Simply provide an online video URL or a path to a local video file:
 
 ```bash
-# 解析 B 站视频
+# Process a Bilibili video
 course2md https://www.bilibili.com/video/BV1pb8o6yE8f
 
-# 解析 YouTube 视频
+# Process a YouTube video
 course2md https://youtu.be/dQw4w9WgXcQ
 
-# 解析本地课件/会议录屏
+# Process a local lecture or meeting recording
 course2md ./lecture.mp4
 ```
 
-> **首次运行说明**：
-> - **macOS (Apple Silicon)**：预编译版本默认使用 CoreML 后端，首次运行时会自动从 HuggingFace 拉取模型（约 1~2GB，保存在 `~/Library/Caches/qwen3-speech/`），无需额外配置即可全自动运行。
-> - **Linux / Windows**：默认使用 GPU/CPU 后端，首次运行时会自动下载 GGUF 识别模型（约 2.4GB，保存在 `~/.cache/course2md/models/`）。
+> **First Run Note**:
+> - **macOS (Apple Silicon)**: Prebuilt binaries default to the CoreML backend. On the first run, model weights (~1–2 GB) are automatically fetched from HuggingFace to `~/Library/Caches/qwen3-speech/`. No manual setup required.
+> - **Linux / Windows**: Defaults to the GPU/CPU backend via `llama.cpp`. On the first run, the GGUF ASR model (~2.4 GB) is automatically downloaded to `~/.cache/course2md/models/`.
 
 ---
 
-## 安装指南
+## Installation
 
-运行 `course2md` 依赖以下基础多媒体工具：
-- `ffmpeg` & `ffprobe`（音视频抽取与画面采样）
-- `yt-dlp`（在线视频解析与下载；仅处理在线链接时需要）
-- `llama-server`（由 `llama.cpp` 提供；仅在 `gpu` / `cpu` 识别后端下需要，macOS CoreML 模式无需安装）
+`course2md` relies on the following multimedia tools:
+- `ffmpeg` & `ffprobe` (Audio/video extraction and slide sampling)
+- `yt-dlp` (Online video parsing and downloading; only needed for online URLs)
+- `llama-server` (Provided by `llama.cpp`; only needed for `gpu` / `cpu` backends, not required for macOS CoreML mode)
 
 ---
 
 ### macOS
 
-推荐使用 Homebrew 安装依赖：
+Recommended installation via Homebrew:
 
 ```bash
-# 1. 安装基础依赖（若仅使用默认的 CoreML 模式处理本地视频，安装 ffmpeg 即可）
+# 1. Install dependencies (ffmpeg is sufficient if using CoreML with local files)
 brew install ffmpeg yt-dlp llama.cpp
 
-# 2. 一键安装 course2md（自动安装二进制及 CoreML 所需的 mlx.metallib 到 ~/bin）
+# 2. Install course2md (automatically installs binary and required mlx.metallib to ~/bin)
 curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | bash
 ```
 
@@ -57,23 +57,23 @@ curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh
 
 ### Arch Linux / CachyOS
 
-推荐直接通过 **AUR** 安装，自动配置所有依赖与软链接：
+Available on the **AUR** with automated dependency resolution:
 
 ```bash
-# 通过 AUR 助手安装（一等公民支持）
+# Install via AUR helper (first-class citizen)
 yay -S course2md-bin
-# 或使用 paru:
+# or using paru:
 # paru -S course2md-bin
 ```
 
 <details>
-<summary>手动安装方式</summary>
+<summary>Manual installation</summary>
 
 ```bash
-# 1. 安装系统依赖
+# 1. Install dependencies
 sudo pacman -S ffmpeg yt-dlp llama-cpp
 
-# 2. 安装 course2md
+# 2. Install course2md
 curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | bash
 ```
 </details>
@@ -83,17 +83,17 @@ curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh
 ### Debian / Ubuntu
 
 ```bash
-# 1. 安装基础依赖与编译工具
+# 1. Install base dependencies and build tools
 sudo apt update
 sudo apt install -y ffmpeg yt-dlp git cmake build-essential
 
-# 2. 编译并安装 llama-server
+# 2. Build and install llama-server
 git clone https://github.com/ggml-org/llama.cpp.git
 cmake -S llama.cpp -B llama.cpp/build -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build --config Release -j
 sudo install -m755 llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 
-# 3. 安装 course2md
+# 3. Install course2md
 curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | bash
 ```
 
@@ -101,7 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh
 
 ### Windows
 
-在 **PowerShell** 中使用 `winget` 一键安装依赖：
+Install dependencies via `winget` in **PowerShell**:
 
 ```powershell
 winget install --id Gyan.FFmpeg -e
@@ -109,237 +109,236 @@ winget install --id yt-dlp.yt-dlp -e
 winget install --id ggml.llamacpp -e
 ```
 
-> 也可以通过 Scoop (`scoop install ffmpeg yt-dlp`) 或 Chocolatey 安装。请确保 `ffmpeg`、`ffprobe`、`yt-dlp`、`llama-server.exe` 均已加入系统 `PATH`。
+> Alternatively, install via Scoop (`scoop install ffmpeg yt-dlp`) or Chocolatey. Ensure `ffmpeg`, `ffprobe`, `yt-dlp`, and `llama-server.exe` are in your `PATH`.
 
-**安装 course2md**：
-1. 前往 [Releases](https://github.com/mizorewww/course2md/releases) 下载 `course2md-windows-x86_64.exe`。
-2. 重命名为 `course2md.exe` 并将其移动至已加入系统 `PATH` 的目录中。
+**Install course2md**:
+1. Download `course2md-windows-x86_64.exe` from [Releases](https://github.com/mizorewww/course2md/releases).
+2. Rename to `course2md.exe` and place it in a directory listed in your `PATH`.
 
 ---
 
-### 从源码构建
+### Building from Source
 
-需要安装 Rust 稳定版工具链：
+Requires the stable Rust toolchain:
 
 ```bash
 git clone https://github.com/mizorewww/course2md.git
 cd course2md
 
-# 标准构建与安装
+# Standard install
 cargo install --path .
 
-# 或仅编译 Release 二进制文件
+# Or build release binary only
 cargo build --release
 ```
 
-- **macOS Apple Silicon 说明**：构建原生 CoreML 支持需要系统安装 Xcode 16+（包含 Swift 6 工具链）。`build.rs` 会自动编译 Swift 模块并将 `mlx.metallib` 复制到 target 目录。如果不需要 CoreML 模块，可通过环境变量跳过：`COURSE2MD_NO_APPLE=1 cargo build --release`。
-- **其他平台**：Linux、Windows 以及 x86_64 macOS 构建时会自动跳过 Apple 原生模块。
+- **macOS Apple Silicon Note**: Building native CoreML support requires Xcode 16+ (Swift 6 toolchain). `build.rs` compiles the Swift package and copies `mlx.metallib` to the target directory. If you do not need native CoreML support, skip it via: `COURSE2MD_NO_APPLE=1 cargo build --release`.
+- **Other Platforms**: Linux, Windows, and x86_64 macOS builds automatically skip Apple-native components.
 
 ---
 
-## 识别后端（ASR Backends）
+## ASR Backends
 
-`course2md` 提供三种识别后端，可通过 `--provider <后端>` 或在配置文件中指定：
+`course2md` supports three speech recognition backends via `--provider <backend>` or configuration:
 
-| 后端 (`--provider`) | 适用平台与默认策略 | 核心架构与模型 | 外部依赖 | 首次下载与缓存路径 | 特点 |
+| Backend (`--provider`) | Target & Default Policy | Architecture & Models | External Dependencies | Model Download & Cache Path | Highlights |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`coreml`** | **macOS Apple Silicon**<br>(预编译包默认) | **Silero VAD v6.2.1 CoreML** (ANE)<br>+ **Qwen3-ASR 0.6B CoreML** ([speech-swift](https://github.com/soniqo/speech-swift)) | **零外部依赖**<br>(仅需同目录 `mlx.metallib`) | 约 1~2GB<br>`~/Library/Caches/qwen3-speech/`<br>*(支持 `HF_ENDPOINT` 镜像)* | 充分调用 Apple 神经网络引擎 (ANE) 与 GPU，内存开销小，无子进程 |
-| **`gpu`** | **Linux / Windows / Intel Mac**<br>(非 Apple Silicon 默认) | **ffmpeg silencedetect**<br>+ **Qwen3-ASR 1.7B GGUF Q8** | 需要 `llama-server`<br>(由 `llama.cpp` 提供) | 约 2.4GB<br>`~/.cache/course2md/models/` | 1.7B 高精度量化模型，支持 Metal / CUDA / Vulkan 等显卡加速 |
-| **`cpu`** | **通用兜底** | 同 `gpu`，禁用 GPU 卸载 (`-ngl 0`) | 需要 `llama-server` | 约 2.4GB<br>`~/.cache/course2md/models/` | 纯 CPU 计算，兼容性最高 |
+| **`coreml`** | **macOS Apple Silicon**<br>(Default for prebuilt arm64) | **Silero VAD v6.2.1 CoreML** (ANE)<br>+ **Qwen3-ASR 0.6B CoreML** ([speech-swift](https://github.com/soniqo/speech-swift)) | **Zero external dependencies**<br>(requires co-located `mlx.metallib`) | ~1–2 GB<br>`~/Library/Caches/qwen3-speech/`<br>*(supports `HF_ENDPOINT` mirror)* | Leverages Apple Neural Engine (ANE) and Metal; lightweight memory footprint; no daemon process |
+| **`gpu`** | **Linux / Windows / Intel Mac**<br>(Default on non-Apple-Silicon) | **ffmpeg silencedetect**<br>+ **Qwen3-ASR 1.7B GGUF Q8** | Requires `llama-server`<br>(from `llama.cpp`) | ~2.4 GB<br>`~/.cache/course2md/models/` | High-precision 1.7B Q8 quantized model; accelerates via Metal / CUDA / Vulkan |
+| **`cpu`** | **Universal Fallback** | Same as `gpu`, with `-ngl 0` | Requires `llama-server` | ~2.4 GB<br>`~/.cache/course2md/models/` | Pure CPU execution; maximum hardware compatibility |
 
-> **自动回落机制**：在 macOS 上如果 `coreml` 后端初始化或运行失败，系统会自动给出警告并无缝回退至 `gpu` / `llama-server` 模式，确保转换任务顺利完成。
+> **Automatic Fallback**: On macOS, if the `coreml` backend fails during initialization or runtime, `course2md` automatically logs a warning and falls back to the `gpu` / `llama-server` pipeline to ensure task completion.
 
 ---
 
-## 配置文件（Configuration）
+## Configuration
 
-为了避免每次输入冗长的命令行参数，`course2md` 提供了完善的全局配置文件支持。
+To avoid passing repetitive command-line arguments, `course2md` provides a global TOML configuration file.
 
-### 文件路径
-- **macOS / Linux**：`~/.config/course2md/config.toml`（遵循 `$XDG_CONFIG_HOME` 规范）
-- **Windows**：`%APPDATA%\course2md\config.toml`
+### Configuration Path
+- **macOS / Linux**: `~/.config/course2md/config.toml` (follows `$XDG_CONFIG_HOME`)
+- **Windows**: `%APPDATA%\course2md\config.toml`
 
-### 优先级规则
-**命令行参数 (CLI Flags) > 配置文件 (config.toml) > 内置默认值 (Built-in Defaults)**
+### Priority Hierarchy
+**CLI Flags > Configuration File (config.toml) > Built-in Defaults**
 
-### 便捷配置命令
+### Configuration Management Commands
 
 ```bash
-# 1. 初始化生成带完整注释的配置模板（文件已存在时加 --force 可覆盖）
+# 1. Generate an annotated configuration template (use --force to overwrite existing)
 course2md config init
 
-# 2. 查看当前配置文件路径及生效的默认设置
+# 2. Display the configuration path and effective default settings
 course2md config show
 ```
 
-### 配置项参考
+### Configuration File Structure
 
 ```toml
 # ~/.config/course2md/config.toml
 
 [defaults]
-# 输出根目录（其下按 平台/标题/编号 自动归类）
+# Output root directory (structured as <out>/<platform>/<title>/<id>/)
 out = "out"
 
-# 画面变化 SSIM 相似度阈值（0.0 ~ 1.0），数值越低截图越多
+# Frame similarity SSIM threshold (0.0 to 1.0; lower value = more slides captured)
 similarity = 0.85
 
-# 画面采样检查间隔（秒）
+# Frame sampling check interval in seconds
 sample_interval = 1.0
 
-# 新截图触发后的冷却防抖间隔（秒）
+# Cooldown time (seconds) after a new slide is captured before capturing again
 cooldown = 10.0
 
-# 感兴趣区域（ROI），格式如 "40%,0%-100%,100%"，留空则比较全屏
+# Region of Interest (ROI), e.g. "40%,0%-100%,100%"; empty compares full frame
 # roi = "40%,0%-100%,100%"
 
-# ASR 识别线程数
+# ASR transcription thread count
 threads = 4
 
-# 识别后端：coreml（macOS Apple Silicon 推荐）| gpu | cpu
+# Inference backend: coreml (macOS Apple Silicon) | gpu | cpu
 # provider = "coreml"
 
-# 单段语音最长切分秒数
+# Maximum speech segment duration in seconds before splitting
 max_speech = 20.0
 
-# 默认生成的文稿格式，支持 md, html, json
+# Output document formats: md, html, json
 formats = ["md", "html"]
 
-# llama.cpp GGUF 模型目录（留空使用默认缓存）
+# llama.cpp GGUF model directory (leave commented for default cache)
 # model_dir = "~/.cache/course2md/models"
 
-# 是否保留下载的原始 media.mp4 文件
+# Keep downloaded media.mp4 video file after processing
 keep_video = false
 
 [llm]
-# 是否默认开启 LLM 字幕润色（默认 false，运行 course2md llm setup 可交互式开启）
+# Enable LLM subtitle polishing by default (default: false; run `course2md llm setup` to configure)
 enabled = false
 
-# OpenAI 兼容 API 地址（如未包含协议头会自动补全 https://）
+# OpenAI-compatible API endpoint (auto-prefixes https:// if omitted)
 base_url = "https://api.deepseek.com/v1"
 
-# API 密钥（文件权限自动设置为 0600）
+# API Key (file permissions automatically restricted to 0600 on Unix)
 api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# 使用的模型名称
+# Model identifier
 model = "deepseek-chat"
 
-# 自定义校对提示词（留空则使用内置的高质量校对 Prompt）
+# Custom prompt (leave empty to use high-quality built-in proofreading prompt)
 prompt = ""
 
-# 是否永久关闭任务结束时的 LLM 开启提示（默认 false）
+# Permanently suppress the post-run LLM suggestion hint (default: false)
 disable_hint = false
 ```
 
 ---
 
-## LLM 字幕润色（可选）
+## LLM Subtitle Polishing (Optional)
 
-`course2md` 支持在 ASR 转写完成后，调用大语言模型（LLM）对字幕文本进行自动化校对与润色。
+`course2md` can automatically invoke a Large Language Model (LLM) after ASR transcription to proofread and refine the generated transcript.
 
-- **润色目标**：修正语气词/口头禅（如「呃」、「嗯」、「这个那个」等）、重复字词、明显的同音错别字与专有名词拼写；**不增删实质内容、不翻译、不改变原意**。
-  - *示例*：`我我干了什么呢？我在，我这是我的Neo Vim` → `我干了什么呢？我在，这是我的Neo Vim`
-- **兼容接口**：支持任意 OpenAI 兼容的 `/chat/completions` 端点（如 DeepSeek、GLM、OpenAI、Ollama、vLLM 等）。
-- **容错保证**：按 20 段语音合并批次并发起请求（`temperature=0`）。若某批次请求失败或响应解析异常，将自动回退保留 ASR 原始文本并给出警告，**绝不阻断整体转换流程**。
+- **Polishing Scope**: Corrects verbal tics and filler words (e.g., "um", "uh", "you know"), stuttering/repetitions, homophone typos, and technical terminology spelling. **Preserves original meaning, does not summarize, add, or translate content**.
+- **Compatible Endpoints**: Any OpenAI-compatible `/chat/completions` API (e.g., DeepSeek, GLM, OpenAI, Ollama, vLLM).
+- **Fault Tolerance**: Batches requests in 20-segment chunks (`temperature=0`). If a batch fails or returns invalid JSON, it automatically falls back to raw ASR text and logs a warning without halting the conversion.
 
-### 快捷管理命令
+### Management Commands
 
 ```bash
-# 交互式配置并开启（提示输入，按回车保留已配置项，保存后自动测试连通性）
+# Interactive setup and enablement (press Enter to keep existing values; tests connectivity upon save)
 course2md llm setup
 
-# 也可以直接通过命令行参数配置
+# Non-interactive configuration via flags
 course2md llm setup --base-url https://api.deepseek.com/v1 --api-key sk-xxxx --model deepseek-chat
 
-# 查看当前 LLM 配置状态（API Key 自动脱敏打码）
+# View current LLM status (API Key masked)
 course2md llm status
 
-# 暂时关闭 LLM 润色功能（保留已配置的凭据与端点）
+# Disable LLM polishing while preserving configured credentials
 course2md llm disable
 ```
 
-### 运行时命令行覆盖
+### CLI Overrides at Runtime
 
 ```bash
-# 单次运行强制开启 / 关闭 LLM 润色
+# Force enable / disable LLM polishing for a single run
 course2md https://... --llm
 course2md https://... --no-llm
 
-# 临时指定其他模型或端点
+# Temporarily override endpoint, key, or model
 course2md https://... --llm --llm-base-url https://api.deepseek.com/v1 --llm-api-key sk-xxxx --llm-model deepseek-chat
 
-# 单次运行关闭结束时的 LLM 开启提示
+# Suppress post-run LLM suggestion hint for a single run
 course2md https://... --no-llm-hint
 ```
 
 ---
 
-## 输出目录结构
+## Output Structure
 
-转换产物按 `out/<平台>/<标题>/<编号>/` 格式自动归档：
+Generated assets are organized into `out/<platform>/<title>/<id>/`:
 
 ```text
-out/<平台>/<标题>/<编号>/
-├── course.md          # 图文混排 Markdown 文档（默认生成）
-├── course.html        # 独立排版 HTML 页面（默认生成）
-├── structured.json    # 结构化数据（指定 --formats 包含 json 时生成）
-├── frames/            # 文稿中引用的幻灯片/关键帧截图
+out/<platform>/<title>/<id>/
+├── course.md          # Illustrated Markdown document (default)
+├── course.html        # Self-contained styled HTML document (default)
+├── structured.json    # Full structured data (when formats includes json)
+├── frames/            # Extracted slide keyframe images
 │   ├── slide_0001.jpg
 │   └── ...
-├── audio.wav          # 提取的音频（16kHz 单声道 WAV）
-├── timeline.jsonl     # 带时间戳对齐的原始识别序列
-├── meta.json          # 视频标题、作者、时长等元数据
-└── media.mp4          # 下载的视频（本地文件输入时不重复复制；默认转换完成后自动清理）
+├── audio.wav          # Extracted audio (16kHz mono WAV)
+├── timeline.jsonl     # Timestamp-aligned event stream
+├── meta.json          # Video title, author, duration metadata
+└── media.mp4          # Downloaded video (local input is read in-place; cleaned up by default)
 ```
 
-### 完成摘要输出示例
+### Completion Summary Example
 
-任务完成后，终端会详细打印生成文稿、截图、音频、视频及时间线路径，汇总统计数据、总耗时以及进程常驻内存（RSS），清晰透明：
+Upon completion, `course2md` outputs a comprehensive summary detailing paths, metrics, elapsed time, and resident memory usage (RSS):
 
 ```text
-──────── course2md 完成 ────────
-标题：计算机科学导论-第01讲
-输出目录：out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f
+──────── course2md Complete ────────
+Title: Introduction to Computer Science - Lecture 01
+Output Directory: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f
 
-文稿：
-  out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/course.md
-  out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/course.html
-截图：out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/frames/  （24 张）
-音频：out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/audio.wav
-视频：已删除（需要时加 --keep-video）
-时间线：out/bilibili/计算机科学导论-第01讲/BV1pb8o6yE8f/timeline.jsonl
+Documents:
+  out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/course.md
+  out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/course.html
+Frames: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/frames/ (24 images)
+Audio: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/audio.wav
+Video: Cleaned up (pass --keep-video to preserve)
+Timeline: out/bilibili/Introduction to Computer Science - Lecture 01/BV1pb8o6yE8f/timeline.jsonl
 
-统计：24 张截图 / 142 段语音 / 8930 字
-耗时：47s
-峰值内存：1406 MB（course2md） + 最大子进程 59 MB（llama-server/ffmpeg 等）
-模型目录：/Users/username/.cache/course2md/models
-──────────────────────────────
+Statistics: 24 slides / 142 speech segments / 8930 characters
+Elapsed: 47s
+Peak Memory: 1406 MB (course2md) + max child process 59 MB (llama-server/ffmpeg)
+Model Directory: /Users/username/.cache/course2md/models
+───────────────────────────────────
 ```
 
 ---
 
-## 常用参数
+## CLI Options
 
-| 参数 | 说明 | 默认值 |
+| Option | Description | Default |
 | :--- | :--- | :--- |
-| `-o, --out <目录>` | 指定输出根目录 | `out` |
-| `--provider <coreml/gpu/cpu>` | 识别后端：`coreml`（macOS 默认）、`gpu`（非 Mac 默认）、`cpu` | 视平台而定 |
-| `--similarity <0~1>` | SSIM 画面相似度阈值；**数值越低截图越多** | `0.85` |
-| `--sample-interval <秒>` | 画面采样检查间隔（秒） | `1.0` |
-| `--cooldown <秒>` | 连续两张截图之间的最短间隔时间（秒） | `10.0` |
-| `--roi <x1,y1-x2,y2>` | 只比较画面指定区域（如 `40%,0%-100%,100%`） | 全屏 |
-| `--formats <格式>` | 输出格式，逗号分隔，可选 `md,html,json` | `md,html` |
-| `--threads <数量>` | ASR 识别线程数 | `4` |
-| `--max-speech <秒>` | 单段语音最长切分秒数 | `20.0` |
-| `--keep-video` | 保留下载或提取的原始 `media.mp4` 文件 | 关闭 |
-| `--no-download` | 跳过下载（目录中已有 `media.mp4` 时） | 关闭 |
-| `--llm` | 本次运行强制启用 LLM 字幕润色 | 关闭 |
-| `--no-llm` | 本次运行强制禁用 LLM 字幕润色 | 关闭 |
-| `--no-llm-hint` | 本次运行关闭任务结束时的 LLM 开启提示 | 关闭 |
-| `-v, --verbose` | 输出更详细的执行日志（可叠加 `-vv` 进入 debug） | 默认 info |
-| `-q, --quiet` | 静默模式，只显示错误 | 关闭 |
+| `-o, --out <DIR>` | Output root directory | `out` |
+| `--provider <coreml/gpu/cpu>` | ASR backend: `coreml` (macOS arm64), `gpu` (non-Mac), `cpu` | Platform default |
+| `--similarity <0~1>` | SSIM similarity threshold; **lower = more slides captured** | `0.85` |
+| `--sample-interval <SEC>` | Frame sampling check interval in seconds | `1.0` |
+| `--cooldown <SEC>` | Minimum seconds between two consecutive slide captures | `10.0` |
+| `--roi <x1,y1-x2,y2>` | Region of interest for slide comparison (e.g. `40%,0%-100%,100%`) | Full frame |
+| `--formats <FORMATS>` | Comma-separated output formats: `md,html,json` | `md,html` |
+| `--threads <N>` | Number of ASR worker threads | `4` |
+| `--max-speech <SEC>` | Maximum speech segment duration in seconds | `20.0` |
+| `--keep-video` | Preserve downloaded/extracted `media.mp4` | Disabled |
+| `--no-download` | Skip downloading (when `media.mp4` exists in directory) | Disabled |
+| `--llm` | Force enable LLM subtitle polishing for this run | Disabled |
+| `--no-llm` | Force disable LLM subtitle polishing for this run | Disabled |
+| `--no-llm-hint` | Suppress post-run LLM suggestion hint | Disabled |
+| `-v, --verbose` | Increase logging verbosity (use `-vv` for debug) | `info` |
+| `-q, --quiet` | Quiet mode (errors only) | Disabled |
 
-查看完整参数与子命令列表：
+Display full help:
 
 ```bash
 course2md --help
@@ -347,18 +346,18 @@ course2md --help
 
 ---
 
-## 性能实测（Benchmarks）
+## Benchmarks
 
-测试素材：时长 **3 分钟** 的标准 1080p 教学课件录屏视频：
+Measured on a **3-minute** 1080p recorded lecture video:
 
-| 运行平台与硬件 | 识别后端 (`--provider`) | 端到端总耗时 | 峰值内存占用 | 依赖与资源特征 |
+| Platform & Hardware | ASR Backend (`--provider`) | End-to-End Elapsed | Peak Memory (RSS) | Characteristics |
 | :--- | :--- | :--- | :--- | :--- |
-| **macOS arm64**<br>(Apple Silicon M系列) | `coreml`<br>*(默认)* | **47s** | 本进程 ~1.4 GB | **零外部依赖**，使用 Neural Engine + Metal 原生推理，缓存后模型加载仅需 ~5s |
-| **macOS arm64**<br>(Apple Silicon M系列) | `gpu`<br>*(llama.cpp Metal)* | **15s** | 本进程 ~20 MB<br>+ llama-server ~3.3 GB | 推理吞吐极高，需外部安装 `llama.cpp` 并加载 1.7B Q8 模型 |
-| **Arch Linux**<br>(x86_64, 16核) | `cpu` | **1m45s** | 本进程 ~13 MB<br>+ llama-server ~3.5 GB | 纯 CPU 计算，通用性强，无任何专有硬件依赖 |
+| **macOS arm64**<br>(Apple Silicon M-series) | `coreml`<br>*(Default)* | **47s** | Course2md ~1.4 GB | **Zero external dependencies**; utilizes Neural Engine + Metal; warm model load takes only ~5s |
+| **macOS arm64**<br>(Apple Silicon M-series) | `gpu`<br>*(llama.cpp Metal)* | **15s** | Course2md ~20 MB<br>+ llama-server ~3.3 GB | Highest throughput; requires `llama.cpp` and 1.7B Q8 GGUF model |
+| **Arch Linux**<br>(x86_64, 16-core) | `cpu` | **1m45s** | Course2md ~13 MB<br>+ llama-server ~3.5 GB | Pure CPU computation; runs on any standard x86_64 Linux environment |
 
 ---
 
-## 开源协议
+## License
 
-本项目基于 [MIT License](LICENSE) 开源。
+This project is licensed under the [MIT License](LICENSE).

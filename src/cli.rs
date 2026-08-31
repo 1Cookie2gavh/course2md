@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "course2md",
     version,
-    about = "把网课视频转成带截图的文字稿",
+    about = "Turn course videos into illustrated notes (markdown/HTML)",
     arg_required_else_help = true,
     args_conflicts_with_subcommands = true,
     after_help = "\
@@ -19,7 +19,7 @@ Examples:
 "
 )]
 pub struct Cli {
-    /// 视频链接或本地文件
+    /// Video URL or local file
     pub source: Option<String>,
 
     #[command(flatten)]
@@ -29,107 +29,122 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-/// 命令行参数：None = 未指定（回落配置文件 [defaults]，再回落内置默认）。
 #[derive(Args, Clone, Debug)]
 pub struct RunOpts {
-    /// 输出根目录（其下按 平台/标题/编号 归类）
+    /// Output root dir (files go to <platform>/<title>/<id>/)
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
-    /// 画面变化阈值，越低截图越多
+    /// Frame-similarity threshold; lower = more screenshots
     #[arg(long)]
     pub similarity: Option<f64>,
 
-    /// 每隔几秒检查一次画面
+    /// Check the frame every N seconds
     #[arg(long)]
     pub sample_interval: Option<f64>,
 
-    /// 新截图之后至少间隔多少秒
+    /// Minimum seconds between two screenshots
     #[arg(long)]
     pub cooldown: Option<f64>,
 
-    /// 只比较画面中的区域，如 40%,0%-100%,100%
+    /// Compare only a region, e.g. 40%,0%-100%,100%
     #[arg(long)]
     pub roi: Option<String>,
 
-    /// 识别线程数
+    /// ASR threads
     #[arg(long)]
     pub threads: Option<i32>,
 
-    /// 识别后端：coreml（仅 macOS Apple Silicon）/ gpu（Metal/CUDA）/ cpu
+    /// ASR backend: coreml (Apple Silicon only) / gpu (Metal/CUDA) / cpu / api (cloud STT)
     #[arg(long)]
     pub provider: Option<String>,
 
-    /// 单段语音最长秒数（过长会切分）
+    /// coreml backend model: qwen3 | whisper (large-v3-turbo)
+    #[arg(long)]
+    pub asr_model: Option<String>,
+
+    /// Cloud STT base URL (OpenAI-compatible, e.g. https://openrouter.ai/api/v1)
+    #[arg(long)]
+    pub asr_api_base_url: Option<String>,
+
+    /// Cloud STT API key (OPENROUTER_API_KEY env is also honored)
+    #[arg(long)]
+    pub asr_api_key: Option<String>,
+
+    /// Cloud STT model (e.g. qwen/qwen3-asr-flash-2026-02-10)
+    #[arg(long)]
+    pub asr_api_model: Option<String>,
+
+    /// Max seconds per speech segment (longer segments are split)
     #[arg(long)]
     pub max_speech: Option<f32>,
 
-    /// 输出格式
+    /// Output formats
     #[arg(long, value_delimiter = ',')]
     pub formats: Option<Vec<String>>,
 
-    /// 模型目录（默认 ~/.cache/course2md/models）
+    /// Model directory (default ~/.cache/course2md/models)
     #[arg(long)]
     pub model_dir: Option<PathBuf>,
 
-    /// 保留下载的视频文件（media.mp4）
+    /// Keep the downloaded media.mp4
     #[arg(long)]
     pub keep_video: bool,
 
-    /// 跳过下载（目录里已有视频）
+    /// Skip download (video already exists)
     #[arg(long)]
     pub no_download: bool,
 
-    /// 本次运行启用 LLM 字幕润色（覆盖配置文件）
+    /// Enable LLM transcript polish for this run (overrides config)
     #[arg(long)]
     pub llm: bool,
 
-    /// 本次运行禁用 LLM 字幕润色
+    /// Disable LLM transcript polish for this run
     #[arg(long, conflicts_with = "llm")]
     pub no_llm: bool,
 
-    /// 覆盖 LLM base URL（OpenAI 兼容）
+    /// Override LLM base URL (OpenAI-compatible)
     #[arg(long)]
     pub llm_base_url: Option<String>,
 
-    /// 覆盖 LLM API Key
+    /// Override LLM API key
     #[arg(long)]
     pub llm_api_key: Option<String>,
 
-    /// 覆盖 LLM 模型名
+    /// Override LLM model name
     #[arg(long)]
     pub llm_model: Option<String>,
 
-    /// 覆盖 LLM 校对提示词
+    /// Override LLM proofreading prompt
     #[arg(long)]
     pub llm_prompt: Option<String>,
 
-    /// 关闭结束时「可开启 LLM」提示（本次运行）
+    /// Suppress the end-of-run LLM hint (this run)
     #[arg(long)]
     pub no_llm_hint: bool,
 
-    /// 更详细日志
+    /// More verbose logging
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// 只显示错误
+    /// Errors only
     #[arg(short, long)]
     pub quiet: bool,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// 模型管理
+    /// Manage local models
     Models {
         #[command(subcommand)]
         cmd: ModelsCmd,
     },
-    /// LLM 字幕润色配置
+    /// Configure LLM transcript polish
     Llm {
         #[command(subcommand)]
         cmd: LlmCmd,
     },
-    /// 配置文件管理
+    /// Manage the config file
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
@@ -138,12 +153,12 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum ModelsCmd {
-    /// 下载离线识别模型（约 2.4GB）
+    /// Download the offline ASR model (~2.4GB)
     Download {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// 查看已下载的模型
+    /// List downloaded models
     List {
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -152,7 +167,7 @@ pub enum ModelsCmd {
 
 #[derive(Subcommand)]
 pub enum LlmCmd {
-    /// 交互式配置并开启（缺省项会提示输入；也可全部用参数传入）
+    /// Interactive setup and enable (missing fields are prompted)
     Setup {
         #[arg(long)]
         base_url: Option<String>,
@@ -164,19 +179,19 @@ pub enum LlmCmd {
         #[arg(long)]
         disable_hint: bool,
     },
-    /// 查看当前配置（密钥打码）
+    /// Show current settings (key masked)
     Status,
-    /// 关闭 LLM 润色（保留凭据）
+    /// Disable LLM polish (keep credentials)
     Disable,
 }
 
 #[derive(Subcommand)]
 pub enum ConfigCmd {
-    /// 生成带注释的配置文件模板（已存在则拒绝，--force 覆盖）
+    /// Write a commented config template (refuses to overwrite unless --force)
     Init {
         #[arg(long)]
         force: bool,
     },
-    /// 查看配置文件路径与文件中的设置
+    /// Show config path and settings read from the file
     Show,
 }

@@ -51,8 +51,12 @@ pub fn ensure_llama(root: &Path) -> Result<LlamaAsr> {
 /// 没有模型就下载；下载过程请保持进程运行。
 pub async fn ensure_llama_or_download(root: &Path) -> Result<LlamaAsr> {
     if !llama_ready(root) {
-        tracing::warn!("第一次运行，正在下载识别模型（约 2.4GB），请不要退出");
-        eprintln!("第一次运行，正在下载识别模型（约 2.4GB），请不要退出。");
+        let (zh, en) = (
+            "第一次运行，正在下载识别模型（约 2.4GB），请不要退出。",
+            "First run: downloading the ASR model (~2.4GB), please keep this process running.",
+        );
+        tracing::warn!("{}", crate::i18n::tr(en, zh));
+        eprintln!("{}", crate::i18n::tr(en, zh));
         download_models(root).await?;
     }
     Ok(llama_paths(root))

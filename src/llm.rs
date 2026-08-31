@@ -226,13 +226,18 @@ pub fn print_status(cfg: &crate::settings::ConfigFile) {
 }
 
 pub fn write_hint_note(path: &std::path::Path) {
-    let _ = std::io::stderr().write_all(
+    let msg = if crate::i18n::is_zh() {
         format!(
             "\n提示：可用 LLM 自动润色字幕（修正语气词与明显识别错误），运行 `course2md llm setup` 一键开启。\n配置文件：{}（加 --no-llm-hint 或在配置中设 disable_hint 可关闭本提示）\n",
             path.display()
         )
-        .as_bytes(),
-    );
+    } else {
+        format!(
+            "\nTip: enable LLM transcript polishing to fix filler words and obvious ASR errors — run `course2md llm setup`.\nConfig: {} (suppress this tip with --no-llm-hint or disable_hint in the config)\n",
+            path.display()
+        )
+    };
+    let _ = std::io::stderr().write_all(msg.as_bytes());
 }
 
 #[cfg(test)]

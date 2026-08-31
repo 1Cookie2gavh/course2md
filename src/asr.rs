@@ -40,15 +40,25 @@ pub fn sanitize_qwen_text(s: &str) -> String {
 }
 
 pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<TranscriptEvent>> {
+    if cfg.provider.eq_ignore_ascii_case("api") {
+        let api = cfg.asr_api.clone();
+        let max_speech = cfg.max_speech as f64;
+        let wav = wav.to_path_buf();
+        let joined = tokio::task::spawn_blocking(move || run_api(&api, &wav, max_speech))
+            .await
+            .context("ASR 线程 join 失败")?;
+        return joined;
+    }
     if cfg.provider.eq_ignore_ascii_case("coreml") {
         #[cfg(apple_native)]
         {
             let wav = wav.to_path_buf();
             let max_speech = cfg.max_speech as f64;
+            let model = crate::apple::resolve_model(cfg.asr_model.as_deref().filter(|s| !s.trim().is_empty()));
             let joined = tokio::task::spawn_blocking(move || {
                 let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
                 let _ = std::fs::create_dir_all(&tmp);
-                let res = crate::apple::run_coreml(&wav, max_speech, cut_wav, &tmp);
+                let res = crate::apple::run_coreml(&wav, max_speech, &model, cut_wav, &tmp);
                 let _ = std::fs::remove_dir_all(&tmp);
                 res
             })
@@ -146,6 +156,90 @@ fn run_blocking(
     pb.finish_and_clear();
     let _ = child.kill();
     let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&tmp);
+    if let Some(e) = err {
+        return Err(e);
+    }
+    tracing::info!(n = events.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
+    Ok(events)
+}
+
+/// 云端 STT：ffmpeg VAD 分段 + 逐段 POST /audio/transcriptions（OpenAI 兼容 / OpenRouter）。
+fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result<Vec<TranscriptEvent>> {
+    use base64::Engine as _;
+    let t0 = Instant::now();
+    if api.api_key.trim().is_empty() {
+        // 约定俗成的环境变量兜底
+        if let Ok(k) = std::env::var("OPENROUTER_API_KEY") {
+            let mut api = api.clone();
+            api.api_key = k;
+            return run_api(&api, wav, max_speech);
+        }
+        anyhow::bail!("云端 STT 未配置 API Key：在配置文件 [asr_api] 设置 api_key，或用 --asr-api-key / OPENROUTER_API_KEY");
+    }
+    let segs = ffmpeg_vad(wav, max_speech as f32)?;
+    tracing::info!(segs = segs.len(), endpoint = %api.base_url, model = %api.model, "api vad");
+    if segs.is_empty() {
+        anyhow::bail!("没有检测到语音");
+    }
+
+    let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let url = format!(
+        "{}/audio/transcriptions",
+        api.base_url.trim().trim_end_matches('/')
+    );
+    let pb = indicatif::ProgressBar::new(segs.len() as u64);
+    pb.set_style(
+        indicatif::ProgressStyle::with_template(
+            "{spinner:.green} asr {pos}/{len} [{bar:32.cyan/blue}] {elapsed} {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
+
+    let client = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(120))
+        .build();
+    let mut events = vec![];
+    let mut err: Option<anyhow::Error> = None;
+    for (i, (start, end)) in segs.iter().copied().enumerate() {
+        let chunk = tmp.join(format!("c{i:04}.wav"));
+        if let Err(e) = cut_wav(wav, start, end, &chunk) {
+            err = Some(e);
+            break;
+        }
+        let bytes = std::fs::read(&chunk)?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let body = serde_json::json!({
+            "model": api.model,
+            "input_audio": {"data": b64, "format": "wav"},
+        });
+        let resp = client
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", api.api_key))
+            .send_json(body);
+        match resp {
+            Ok(r) => {
+                let v: serde_json::Value = r.into_json().context("云端 STT 响应解析失败")?;
+                if let Some(e) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                    err = Some(anyhow::anyhow!("云端 STT 报错：{e}"));
+                    break;
+                }
+                let text = v["text"].as_str().unwrap_or("").trim().to_string();
+                if !text.is_empty() {
+                    events.push(TranscriptEvent { start, end, text });
+                }
+            }
+            Err(e) => {
+                err = Some(anyhow::anyhow!("云端 STT 请求失败：{e}"));
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&chunk);
+        pb.inc(1);
+    }
+    pb.finish_and_clear();
     let _ = std::fs::remove_dir_all(&tmp);
     if let Some(e) = err {
         return Err(e);

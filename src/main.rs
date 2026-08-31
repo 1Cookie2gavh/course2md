@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::FromArgMatches;
 use course2md::cli::{Cli, Command, ConfigCmd, LlmCmd, ModelsCmd, RunOpts};
 use course2md::{config, llm, models, pipeline, settings};
 use tracing_subscriber::EnvFilter;
@@ -99,11 +99,40 @@ fn run_opts_to_cfg(
         keep_video: opts.keep_video || d.keep_video.unwrap_or(false),
         no_download: opts.no_download || d.no_download.unwrap_or(false),
         llm: resolve_llm(opts, file),
+        asr_api: resolve_asr_api(opts, file),
+        asr_model: opts
+            .asr_model
+            .clone()
+            .or_else(|| d.asr_model.clone())
+            .map(|s| if s.to_ascii_lowercase().contains("whisper") { "whisper".into() } else { "qwen3".into() }),
     })
 }
 
+/// 云端 STT 配置合并：CLI > 配置文件 > 默认（OpenRouter）。
+fn resolve_asr_api(opts: &RunOpts, file: &settings::ConfigFile) -> crate::settings::AsrApi {
+    let mut a = file.asr_api.clone();
+    if let Some(v) = &opts.asr_api_base_url {
+        a.base_url = v.clone();
+    }
+    if let Some(v) = &opts.asr_api_key {
+        a.api_key = v.clone();
+    }
+    if let Some(v) = &opts.asr_api_model {
+        a.model = v.clone();
+    }
+    a
+}
+
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    course2md::i18n::init();
+    // 帮助文本按 locale 改写后再解析
+    let cli = {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        course2md::i18n::apply_cli(&mut cmd);
+        let matches = cmd.get_matches();
+        Cli::from_arg_matches(&matches)?
+    };
     match cli.command {
         Some(Command::Models { cmd }) => {
             init_logging(0, false);

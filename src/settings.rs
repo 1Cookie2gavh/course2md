@@ -16,6 +16,8 @@ pub struct Defaults {
     pub roi: Option<String>,
     pub threads: Option<i32>,
     pub provider: Option<String>,
+    /// coreml 后端的模型：qwen3 | whisper（首次使用可交互选择）
+    pub asr_model: Option<String>,
     pub max_speech: Option<f32>,
     pub formats: Option<Vec<String>>,
     pub model_dir: Option<PathBuf>,
@@ -23,11 +25,31 @@ pub struct Defaults {
     pub no_download: Option<bool>,
 }
 
+/// 云端 STT（provider = "api"，OpenAI 兼容 /audio/transcriptions，如 OpenRouter）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AsrApi {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl Default for AsrApi {
+    fn default() -> Self {
+        Self {
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: String::new(),
+            model: "qwen/qwen3-asr-flash-2026-02-10".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct ConfigFile {
     pub defaults: Defaults,
     pub llm: crate::llm::LlmSettings,
+    pub asr_api: AsrApi,
 }
 
 pub fn config_path() -> PathBuf {
@@ -89,6 +111,16 @@ pub const TEMPLATE: &str = r#"# course2md 配置文件
 # 保留下载的视频 media.mp4
 #keep_video = false
 
+# CoreML 后端的识别模型：qwen3（默认）| whisper（large-v3-turbo）
+#asr_model = "qwen3"
+
+[asr_api]
+# 云端 STT（--provider api，OpenAI 兼容 /audio/transcriptions；OpenRouter 聚合多模型）
+#base_url = "https://openrouter.ai/api/v1"
+#api_key = "sk-or-..."
+#model = "qwen/qwen3-asr-flash-2026-02-10"
+# 其他常用模型：openai/whisper-large-v3-turbo、qwen/qwen3-asr-1.7b
+
 [llm]
 # LLM 字幕润色（默认关闭）。运行 `course2md llm setup` 可交互式配置。
 enabled = false
@@ -104,7 +136,7 @@ enabled = false
 /// 打印生效配置（CLI 覆盖合并前，来自文件的值）。
 pub fn print_effective(cfg: &ConfigFile) {
     let d = &cfg.defaults;
-    println!("配置文件：{}", config_path().display());
+    println!("{}: {}", crate::i18n::tr("Config file", "配置文件"), config_path().display());
     println!("[defaults]");
     let s = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
     println!("  out            : {}", d.out.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "out".into()));
@@ -114,10 +146,15 @@ pub fn print_effective(cfg: &ConfigFile) {
     println!("  roi            : {}", s(&d.roi));
     println!("  threads        : {}", d.threads.map(|v| v.to_string()).unwrap_or_else(|| "4".into()));
     println!("  provider       : {}", s(&d.provider));
+    println!("  asr_model      : {}", s(&d.asr_model));
     println!("  max_speech     : {}", d.max_speech.map(|v| v.to_string()).unwrap_or_else(|| "20.0".into()));
     println!("  formats        : {}", d.formats.clone().map(|f| f.join(",")).unwrap_or_else(|| "md,html".into()));
     println!("  model_dir      : {}", d.model_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(内置缓存目录)".into()));
     println!("  keep_video     : {}", d.keep_video.unwrap_or(false));
+    println!("[asr_api]");
+    println!("  base_url       : {}", cfg.asr_api.base_url);
+    println!("  model          : {}", cfg.asr_api.model);
+    println!("  api_key        : {}", if cfg.asr_api.api_key.is_empty() { "-" } else { "(已配置)" });
     println!("[llm]");
     println!("  enabled        : {}", cfg.llm.enabled);
     println!("  model          : {}", if cfg.llm.model.is_empty() { "-" } else { &cfg.llm.model });

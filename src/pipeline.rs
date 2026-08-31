@@ -15,7 +15,7 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     let t_total = Instant::now();
     crate::error::require_cmd("ffmpeg")?;
     crate::error::require_cmd("ffprobe")?;
-    if !cfg.provider.eq_ignore_ascii_case("coreml") {
+    if !cfg.provider.eq_ignore_ascii_case("coreml") && !cfg.provider.eq_ignore_ascii_case("api") {
         crate::error::require_cmd("llama-server")?;
     }
 
@@ -157,11 +157,11 @@ fn print_summary(
         .sum();
 
     eprintln!();
-    eprintln!("──────── course2md 完成 ────────");
-    eprintln!("标题：{}", meta.title);
-    eprintln!("输出目录：{}", out.display());
+    eprintln!("{}", crate::i18n::tr("──────── course2md done ────────", "──────── course2md 完成 ────────"));
+    eprintln!("{}: {}", crate::i18n::tr("Title", "标题"), meta.title);
+    eprintln!("{}: {}", crate::i18n::tr("Output dir", "输出目录"), out.display());
     eprintln!();
-    eprintln!("文稿：");
+    eprintln!("{}:", crate::i18n::tr("Documents", "文稿"));
     for f in &cfg.formats {
         let name = match f.as_str() {
             "md" => "course.md",
@@ -174,32 +174,33 @@ fn print_summary(
             eprintln!("  {}", p.display());
         }
     }
-    eprintln!("截图：{}/frames/  （{} 张）", out.display(), sections.len());
+    eprintln!("{}: {}/frames/  ({} {})", crate::i18n::tr("Screenshots", "截图"), out.display(), sections.len(), crate::i18n::tr("images", "张"));
     eprintln!("音频：{}", cfg.audio_path().display());
     if is_local {
-        eprintln!("视频：{}  （本地输入，未改动）", media.display());
+        eprintln!("{}: {}  ({})", crate::i18n::tr("Video", "视频"), media.display(), crate::i18n::tr("local input, untouched", "本地输入，未改动"));
     } else if cfg.keep_video {
-        eprintln!("视频：{}  （已保留）", media.display());
+        eprintln!("{}: {}  ({})", crate::i18n::tr("Video", "视频"), media.display(), crate::i18n::tr("kept", "已保留"));
     } else {
-        eprintln!("视频：已删除（需要时加 --keep-video）");
+        eprintln!("{}: {} (--keep-video)", crate::i18n::tr("Video", "视频"), crate::i18n::tr("deleted", "已删除"));
     }
-    eprintln!("时间线：{}", cfg.timeline_path().display());
+    eprintln!("{}: {}", crate::i18n::tr("Timeline", "时间线"), cfg.timeline_path().display());
     eprintln!();
     eprintln!(
-        "统计：{} 张截图 / {} 段语音 / {} 字",
-        sections.len(),
-        speech_n,
-        chars
+        "{}: {} {} / {} {} / {} {}",
+        crate::i18n::tr("Stats", "统计"),
+        sections.len(), crate::i18n::tr("screenshots", "张截图"),
+        speech_n, crate::i18n::tr("speech segments", "段语音"),
+        chars, crate::i18n::tr("chars", "字")
     );
-    eprintln!("耗时：{}", fmt_duration(stats.elapsed_secs));
+    eprintln!("{}: {}", crate::i18n::tr("Elapsed", "耗时"), fmt_duration(stats.elapsed_secs));
     match (stats.peak_mb, stats.child_peak_mb) {
         (Some(mb), Some(c)) => eprintln!(
-            "峰值内存：{mb:.0} MB（course2md）+ 最大子进程 {c:.0} MB（llama-server/ffmpeg 等）"
+            "{}: {mb:.0} MB (course2md) + {} {c:.0} MB (llama-server/ffmpeg)", crate::i18n::tr("Peak memory", "峰值内存"), crate::i18n::tr("largest child", "最大子进程")
         ),
-        (Some(mb), None) => eprintln!("峰值内存（本进程 RSS）：{mb:.0} MB"),
-        _ => eprintln!("峰值内存：不可用"),
+        (Some(mb), None) => eprintln!("{}: {mb:.0} MB", crate::i18n::tr("Peak memory (process RSS)", "峰值内存（本进程 RSS）")),
+        _ => eprintln!("{}: {}", crate::i18n::tr("Peak memory", "峰值内存"), crate::i18n::tr("unavailable", "不可用")),
     }
-    eprintln!("模型目录：{}", cfg.model_dir.display());
+    eprintln!("{}: {}", crate::i18n::tr("Model dir", "模型目录"), cfg.model_dir.display());
     eprintln!("──────────────────────────────");
     if !cfg.llm.enabled && !cfg.llm.disable_hint {
         crate::llm::write_hint_note(&crate::settings::config_path());

@@ -15,6 +15,7 @@ let package = Package(
             name: "CAppleASR",
             dependencies: [
                 .product(name: "Qwen3ASR", package: "speech-swift"),
+                .product(name: "WhisperASR", package: "speech-swift"),
                 .product(name: "SpeechVAD", package: "speech-swift"),
                 .product(name: "AudioCommon", package: "speech-swift"),
             ]
