@@ -13,7 +13,9 @@
 
 ## 快速上手
 
-传入在线视频 URL 或本地视频文件路径即可开始转换：
+> 请先完成[安装指南](#安装指南)。
+
+传入在线视频 URL 或本地视频文件路径即可开始转换。完成后，图文笔记（`course.md` / `course.html`）保存在 `./out/<平台>/<标题>/<编号>/` 目录：
 
 ```bash
 # 解析 B 站视频
@@ -27,9 +29,11 @@ course2md ./lecture.mp4
 ```
 
 > **首次运行说明**：
-> - **macOS (Apple Silicon, `coreml`)**：首次交互式运行时，终端会提示选择下载的 ASR 模型：**Qwen3-ASR 0.6B**（默认，约 1~2GB）或 **Whisper large-v3-turbo**（约 1.5GB）。模型保存在 `~/Library/Caches/qwen3-speech/`。
+> - **macOS (Apple Silicon, `coreml`)**：首次交互式运行时，会提示选择识别模型：**Qwen3-ASR 0.6B**（推荐——中英文效果最好、体积最小、功耗最低）或 **Whisper large-v3-turbo**（多语言更合适）。模型保存在 `~/Library/Caches/qwen3-speech/`。
 > - **Linux / Windows (`gpu` / `cpu`)**：默认下载 GGUF 识别模型（约 2.4GB，保存在 `~/.cache/course2md/models/`）。
 > - **云端 STT (`api`)**：无需下载任何本地模型，直接通过 OpenAI 兼容端点（如 OpenRouter）在线转写。
+> - **网络受限？** 先设 HuggingFace 镜像：`export HF_ENDPOINT=https://hf-mirror.com`；或直接 `course2md <URL> --provider api` 免本地模型试用。
+> - 提示：随时可用 `course2md models download` 预先下载离线识别模型。
 
 ---
 
@@ -44,15 +48,20 @@ course2md ./lecture.mp4
 
 ### macOS
 
-推荐使用 Homebrew 安装依赖：
+**Homebrew（推荐）**——依赖、Developer ID 签名的二进制和 CoreML 所需的 `mlx.metallib` 一次装齐：
 
 ```bash
-# 1. 安装基础依赖（若仅使用默认的 CoreML 模式处理本地视频，安装 ffmpeg 即可）
-brew install ffmpeg yt-dlp llama.cpp
+brew install mizorewww/tap/course2md
+```
 
-# 2. 一键安装 course2md（自动安装二进制及 CoreML 所需的 mlx.metallib 到 ~/bin）
+<details>
+<summary>备选：install.sh 脚本</summary>
+
+```bash
+brew install ffmpeg yt-dlp   # llama.cpp 仅在 gpu/cpu 兜底后端时需要
 curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | bash
 ```
+</details>
 
 ---
 
@@ -400,13 +409,13 @@ course2md --help
 
 在 Apple Silicon (arm64) 上运行 **3 分钟** 1080p 教学课件视频实测，通过 `powermetrics` 采集硬件功率（整机空闲基线 ≈ 1.9 W）：
 
-| 识别后端 (`--provider`) | 端到端耗时 | ASR 耗时 | 平均功率 (CPU / GPU / ANE) | 总消耗能量 | 峰值内存 (RSS) | 效率与特征 |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`coreml` (qwen3 0.6B)**<br>*(macOS 默认)* | **48s** | 45.9s | 4.0 W / 0.2 W / **3.6 W** | **≈ 375 J** *(最省电)* | 1.41 GB（进程内） | **能效最高**；神经网络引擎 (ANE) 承担主要负载；适合笔记本电池运行；零外部依赖 |
-| **`coreml` (whisper-turbo)** | **86s** | 85.2s | 13.2 W / 0.2 W / 0.4 W | ≈ 1194 J | 1.51 GB（进程内） | 原生 Whisper large-v3-turbo CoreML；适合多语言及英文语音场景 |
-| **`gpu` (llama.cpp Metal)** | **12s** *(最快)* | 10.5s | 4.2 W / **17.6 W** / — | ≈ 263 J | 26 MB + 3.3 GB 子进程 | **吞吐最高**；Qwen3-ASR 1.7B Q8 跑满 GPU；需安装 `llama.cpp` |
-| **`cpu` (llama.cpp CPU)** | **27s** | 25.6s | 20.6 W / 0.9 W / — | ≈ 581 J | 26 MB + 4.8 GB 子进程 | 纯 CPU 计算，能耗较高；通用兜底方案 |
-| **`api` (云端 OpenRouter)** | **~10s** | — | < 1 W / — / — | 极小 | 极小 | 运算完全卸载至云端；低配硬件最佳方案 |
+| 识别后端 (`--provider`) | 总耗时 | 平均功率 (CPU / GPU / ANE) | 峰值内存 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **`coreml` + qwen3**（macOS 默认） | 48 s | 4.0 W / 0.2 W / **3.6 W** | 1.41 GB 进程内 | **功耗最低**：神经网络引擎扛主力，电池场景首选；零外部依赖 |
+| **`coreml` + whisper-turbo** | 86 s | 13.2 W / 0.2 W / 0.4 W | 1.51 GB 进程内 | Whisper large-v3-turbo CoreML；短分段下解码器主要在 CPU |
+| **`gpu`**（llama.cpp Metal） | **12 s** | 4.2 W / **17.6 W** / — | 26 MB + 3.3 GB 子进程 | **最快**：GPU 峰值高；需 `llama-server`（Qwen3-ASR 1.7B Q8） |
+| **`cpu`**（llama.cpp） | 27 s | **20.6 W** / 0.9 W / — | 26 MB + 4.8 GB 子进程 | 通用兜底；CPU 功耗高 |
+| **`api`**（云端 STT） | ~10 s | < 1 W | 可忽略 | 音频会上传；速度取决于网络 |
 
 👉 详见完整的 [macOS 性能与功耗基准报告](docs/BENCHMARKS.md)（含测试方法论、详细能耗拆解与复现脚本）。
 

@@ -13,7 +13,9 @@ Turn YouTube, Bilibili, or local course/meeting recordings into slide-illustrate
 
 ## Quick Start
 
-Simply provide an online video URL or a path to a local video file:
+> Make sure you completed the [Installation](#installation) section first.
+
+Simply provide an online video URL or a path to a local video file. When the run finishes, the illustrated notes (`course.md` / `course.html`) appear under `./out/<platform>/<title>/<id>/`:
 
 ```bash
 # Process a Bilibili video
@@ -27,9 +29,11 @@ course2md ./lecture.mp4
 ```
 
 > **First Run Note**:
-> - **macOS (Apple Silicon, `coreml`)**: On first interactive run, `course2md` will prompt you to choose an ASR model to download: **Qwen3-ASR 0.6B** (~1–2 GB, default) or **Whisper large-v3-turbo** (~1.5 GB). Weights are cached under `~/Library/Caches/qwen3-speech/`.
+> - **macOS (Apple Silicon, `coreml`)**: On first interactive run, `course2md` asks which ASR model to download: **Qwen3-ASR 0.6B** (recommended — best for Chinese/English, smallest, most efficient) or **Whisper large-v3-turbo** (better for multilingual). Weights are cached under `~/Library/Caches/qwen3-speech/`.
 > - **Linux / Windows (`gpu` / `cpu`)**: Downloads the GGUF ASR model (~2.4 GB) to `~/.cache/course2md/models/`.
 > - **Cloud STT (`api`)**: No local model download needed; transcribes via an OpenAI-compatible endpoint (e.g. OpenRouter).
+> - **Slow / blocked network?** Set a HuggingFace mirror first: `export HF_ENDPOINT=https://hf-mirror.com` — or skip local models entirely with `course2md <URL> --provider api`.
+> - Tip: pre-download the offline model any time with `course2md models download`.
 
 ---
 
@@ -44,15 +48,20 @@ course2md ./lecture.mp4
 
 ### macOS
 
-Recommended installation via Homebrew:
+**Homebrew (recommended)** — dependencies, the Developer-ID-signed binary and the CoreML `mlx.metallib` are all handled for you:
 
 ```bash
-# 1. Install dependencies (ffmpeg is sufficient if using CoreML with local files)
-brew install ffmpeg yt-dlp llama.cpp
+brew install mizorewww/tap/course2md
+```
 
-# 2. Install course2md (automatically installs binary and required mlx.metallib to ~/bin)
+<details>
+<summary>Alternative: install.sh</summary>
+
+```bash
+brew install ffmpeg yt-dlp   # llama.cpp only needed for the gpu/cpu fallback backend
 curl -fsSL https://raw.githubusercontent.com/mizorewww/course2md/main/install.sh | bash
 ```
+</details>
 
 ---
 
@@ -110,7 +119,7 @@ winget install --id yt-dlp.yt-dlp -e
 winget install --id ggml.llamacpp -e
 ```
 
-> Alternatively, install via Scoop (`scoop install ffmpeg yt-dlp`) or Chocolatey. Ensure `ffmpeg`, `ffprobe`, `yt-dlp`, and `llama-server.exe` are in your `PATH`.
+> Alternatively, install via Scoop: `scoop install ffmpeg yt-dlp` (for local `gpu`/`cpu` ASR you additionally need `llama-server.exe` from llama.cpp releases on your `PATH`).
 
 **Install course2md**:
 1. Download `course2md-windows-x86_64.exe` from [Releases](https://github.com/mizorewww/course2md/releases).
@@ -399,13 +408,13 @@ course2md --help
 
 Measured on Apple Silicon (arm64) running a **3-minute** 1080p recorded lecture clip with `powermetrics` hardware sampling (idle baseline ≈ 1.9 W):
 
-| Backend (`--provider`) | End-to-End Wall Time | ASR-Only Time | Avg Power (CPU / GPU / ANE) | Total Energy | Peak Memory (RSS) | Efficiency & Characteristics |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`coreml` (qwen3 0.6B)**<br>*(macOS Default)* | **48s** | 45.9s | 4.0 W / 0.2 W / **3.6 W** | **≈ 375 J** *(Lowest)* | 1.41 GB (in-process) | **Most energy-efficient**; Neural Engine handles heavy lifting; ideal for battery life; zero external dependencies |
-| **`coreml` (whisper-turbo)** | **86s** | 85.2s | 13.2 W / 0.2 W / 0.4 W | ≈ 1194 J | 1.51 GB (in-process) | Native Whisper large-v3-turbo CoreML; optimized for multilingual & English audio |
-| **`gpu` (llama.cpp Metal)** | **12s** *(Fastest)* | 10.5s | 4.2 W / **17.6 W** / — | ≈ 263 J | 26 MB + 3.3 GB child | **Highest throughput**; GPU bursts with Qwen3-ASR 1.7B Q8; requires `llama-server` |
-| **`cpu` (llama.cpp CPU)** | **27s** | 25.6s | 20.6 W / 0.9 W / — | ≈ 581 J | 26 MB + 4.8 GB child | Pure CPU execution; high power draw; universal fallback |
-| **`api` (Cloud OpenRouter)** | **~10s** | — | < 1 W / — / — | Negligible | Minimal | Offloaded to cloud; fastest on low-spec hardware |
+| Backend (`--provider`) | Wall Time | Avg Power (CPU / GPU / ANE) | Peak Memory | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **`coreml` + qwen3** *(macOS default)* | 48 s | 4.0 W / 0.2 W / **3.6 W** | 1.41 GB in-proc | **Lowest power** — Neural Engine does the heavy lifting; best on battery; zero external dependencies |
+| **`coreml` + whisper-turbo** | 86 s | 13.2 W / 0.2 W / 0.4 W | 1.51 GB in-proc | Whisper large-v3-turbo on CoreML; decoder mostly on CPU for short segments |
+| **`gpu` (llama.cpp Metal)** | **12 s** | 4.2 W / **17.6 W** / — | 26 MB + 3.3 GB child | **Fastest**; GPU bursts; needs `llama-server` (Qwen3-ASR 1.7B Q8) |
+| **`cpu` (llama.cpp)** | 27 s | **20.6 W** / 0.9 W / — | 26 MB + 4.8 GB child | Universal fallback; high CPU power |
+| **`api` (cloud STT)** | ~10 s | < 1 W | negligible | Audio uploaded to provider; speed depends on network |
 
 👉 See the comprehensive [macOS Benchmark Report](docs/BENCHMARKS.md) for full methodology, energy breakdowns, and reproduction scripts.
 
