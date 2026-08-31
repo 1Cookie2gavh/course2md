@@ -67,9 +67,14 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 
     // MLX 运行时需要 metallib 与可执行文件同目录（mlx.metallib）
-    // 注意 .build/release 是指向 out/Products/Release 的符号链接
+    // 优先用仓库内置副本（避免 runner 差异），否则取 SPM 产物
+    let vendored = pkg.join("mlx.metallib");
     let products = build_dir.canonicalize().unwrap_or(build_dir);
-    let bundle = products.join("mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib");
+    let bundle = if vendored.is_file() {
+        vendored
+    } else {
+        products.join("mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib")
+    };
     if bundle.is_file() {
         if let Ok(out_dir) = std::env::var("OUT_DIR") {
             // OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out

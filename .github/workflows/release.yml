@@ -58,13 +58,16 @@ jobs:
           cp "target/${{ matrix.target }}/release/course2md.exe" "${{ matrix.asset }}"
 
       # MLX Metal kernels（CoreML 推理运行时需要，与二进制同目录）
-      # 兼容新旧两种 SPM 布局（.build/out/Products 与 .build/release）
       - name: Collect mlx.metallib (macos arm64)
         if: matrix.target == 'aarch64-apple-darwin'
         run: |
-          src="$(find native/apple-asr/.build -name default.metallib | head -1)"
-          test -n "$src"
-          cp "$src" mlx-macos-arm64.metallib
+          if [ -f native/apple-asr/mlx.metallib ]; then
+            cp native/apple-asr/mlx.metallib mlx-macos-arm64.metallib
+          else
+            src="$(find native/apple-asr/.build -name default.metallib | head -1)"
+            test -n "$src"
+            cp "$src" mlx-macos-arm64.metallib
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
