@@ -43,11 +43,20 @@ fn parse_candidates(stdout: &str) -> Vec<Candidate> {
 
 /// Pass 1：场景检测（缩小解码提速）。
 async fn detect_scenes(media: &Path, threshold: f64) -> Result<Vec<Candidate>> {
+    // fps=1：只抽 1 帧/秒（课件翻页粒度足够）；videotoolbox 走 GPU 硬解。
     let vf = format!(
-        "scale=640:-2,select='gt(scene,{threshold})',metadata=print:file=-"
+        "fps=1,scale=640:-2,select='gt(scene,{threshold})',metadata=print:file=-"
     );
     let out = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-nostats", "-an"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-hwaccel",
+            "videotoolbox",
+            "-an",
+        ])
         .arg("-i")
         .arg(media)
         .args(["-vf", &vf, "-f", "null", "-"])

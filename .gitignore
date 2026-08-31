@@ -4,3 +4,7 @@ models/
 *.wav
 *.mp4
 .DS_Store
+.venv/
+out-bv/
+out-bench/
+out-gpu/

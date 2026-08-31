@@ -58,12 +58,31 @@ pub fn vad_path(root: &Path) -> PathBuf {
 }
 
 pub fn qwen3_paths(root: &Path, size: ModelSize) -> Qwen3Paths {
-    let d = root.join(size.subdir());
-    Qwen3Paths {
-        conv_frontend: d.join("conv_frontend.onnx"),
-        encoder: d.join("encoder.int8.onnx"),
-        decoder: d.join("decoder.int8.onnx"),
-        tokenizer: d.join("tokenizer"),
+    qwen3_paths_prec(root, size, "int8")
+}
+
+/// `precision`: "int8" | "fp32"。fp32 仅 1.7B（CoreML/GPU 需要浮点图，int8 会回落到 CPU 且更慢）。
+pub fn qwen3_paths_prec(root: &Path, size: ModelSize, precision: &str) -> Qwen3Paths {
+    let fp32 = precision.eq_ignore_ascii_case("fp32");
+    let d = if fp32 {
+        root.join(format!("{}-fp32", size.subdir()))
+    } else {
+        root.join(size.subdir())
+    };
+    if fp32 {
+        Qwen3Paths {
+            conv_frontend: d.join("conv_frontend.onnx"),
+            encoder: d.join("encoder.onnx"),
+            decoder: d.join("decoder.onnx"),
+            tokenizer: d.join("tokenizer"),
+        }
+    } else {
+        Qwen3Paths {
+            conv_frontend: d.join("conv_frontend.onnx"),
+            encoder: d.join("encoder.int8.onnx"),
+            decoder: d.join("decoder.int8.onnx"),
+            tokenizer: d.join("tokenizer"),
+        }
     }
 }
 
@@ -84,11 +103,15 @@ impl Qwen3Paths {
 }
 
 pub fn ensure_models(root: &Path, size: ModelSize) -> Result<(PathBuf, Qwen3Paths)> {
+    ensure_models_prec(root, size, "int8")
+}
+
+pub fn ensure_models_prec(root: &Path, size: ModelSize, precision: &str) -> Result<(PathBuf, Qwen3Paths)> {
     let vad = vad_path(root);
     if !vad.is_file() {
         anyhow::bail!("缺少 Silero VAD 模型 {}，请先运行 `course2md models download`", vad.display());
     }
-    let q = qwen3_paths(root, size);
+    let q = qwen3_paths_prec(root, size, precision);
     let missing = q.missing();
     if !missing.is_empty() {
         let list: Vec<_> = missing.iter().map(|p| p.display().to_string()).collect();

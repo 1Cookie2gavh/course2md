@@ -12,7 +12,7 @@ pub struct Cli {
 pub enum Command {
     /// 完整管线：下载 → 场景截图 → ASR → 合并 → 渲染
     Run {
-        /// 视频 URL（YouTube / Bilibili 等 yt-dlp 支持的站点）
+        /// 视频 URL，或本地视频文件路径
         url: String,
 
         /// 输出目录
@@ -35,9 +35,21 @@ pub enum Command {
         #[arg(long, default_value_t = 6)]
         hamming: u32,
 
-        /// ASR 推理线程数
+        /// ASR 推理线程数（每 worker 分 threads/workers）
         #[arg(long, default_value_t = 4)]
         threads: i32,
+
+        /// 并行 ASR worker 数（每实例约占 2.6GB；CoreML 建议 1–2）
+        #[arg(long, default_value_t = 2)]
+        workers: usize,
+
+        /// ASR 后端：mps（Apple GPU，默认）| cpu | coreml
+        #[arg(long, default_value = "mps")]
+        provider: String,
+
+        /// 权重精度：int8（CPU）| fp32（CoreML/GPU）
+        #[arg(long, default_value = "int8")]
+        precision: String,
 
         /// Silero VAD 语音概率阈值
         #[arg(long, default_value_t = 0.5)]

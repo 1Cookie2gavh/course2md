@@ -28,9 +28,13 @@ struct Seg {
 /// ASR 阶段入口（阻塞任务）。返回按时间升序的 TranscriptEvent 列表。
 pub async fn run(cfg: &PipelineConfig, input: AsrInput) -> Result<Vec<TranscriptEvent>> {
     let threads = cfg.threads;
+    let workers = cfg.workers.max(1);
     let vad_threshold = cfg.vad_threshold;
     let max_speech = cfg.max_speech;
-    tokio::task::spawn_blocking(move || run_blocking(&input, threads, vad_threshold, max_speech))
+    let provider = cfg.provider.clone();
+    tokio::task::spawn_blocking(move || {
+        run_blocking(&input, threads, vad_threshold, max_speech, workers, provider)
+    })
         .await
         .context("ASR 线程 join 失败")?
 }
@@ -49,11 +53,128 @@ pub fn sanitize_qwen_text(s: &str) -> String {
     t.to_string()
 }
 
+fn find_mps_python() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("COURSE2MD_PYTHON") {
+        return Ok(PathBuf::from(p));
+    }
+    let cwd = std::env::current_dir()?;
+    for c in [
+        cwd.join(".venv/bin/python"),
+        cwd.join(".venv/bin/python3"),
+    ] {
+        if c.is_file() {
+            return Ok(c);
+        }
+    }
+    anyhow::bail!("GPU 路径需要项目根 .venv（uv venv && uv pip install qwen-asr torch）")
+}
+
+fn find_mps_script() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let c = cwd.join("scripts/qwen3_mps.py");
+    if c.is_file() {
+        return Ok(c);
+    }
+    anyhow::bail!("找不到 scripts/qwen3_mps.py（请在仓库根目录运行）")
+}
+
+fn find_qwen3_hf_dir() -> Result<String> {
+    if let Ok(p) = std::env::var("COURSE2MD_QWEN3") {
+        return Ok(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let roots = [
+        format!("{home}/.cache/course2md/models/Qwen/Qwen3-ASR-1.7B"),
+        format!("{home}/.cache/course2md/models/Qwen3-ASR-1.7B"),
+    ];
+    for r in &roots {
+        if Path::new(r).join("config.json").is_file() {
+            return Ok(r.clone());
+        }
+        // modelscope 可能套一层 snapshot hash
+        if let Ok(rd) = std::fs::read_dir(r) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.join("config.json").is_file() {
+                    return Ok(p.display().to_string());
+                }
+            }
+        }
+    }
+    Ok("Qwen/Qwen3-ASR-1.7B".into())
+}
+
+fn run_mps(
+    wav: &Path,
+    segs: &[Seg],
+    sr: usize,
+    speech_secs: f64,
+) -> Result<Vec<TranscriptEvent>> {
+    let py = find_mps_python()?;
+    let script = find_mps_script()?;
+    let model = find_qwen3_hf_dir()?;
+    let dir = wav.parent().unwrap_or(Path::new("."));
+    let seg_path = dir.join("vad_segments.jsonl");
+    let out_path = dir.join("asr_mps.jsonl");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&seg_path)?;
+        for s in segs {
+            let start = s.start_sample as f64 / sr as f64;
+            let end = start + s.samples.len() as f64 / sr as f64;
+            writeln!(f, "{}", serde_json::json!({"start": start, "end": end}))?;
+        }
+    }
+    println!(
+        "  [asr] provider=mps (Metal GPU)  model={model}  {} 段 / {:.0}s 语音",
+        segs.len(),
+        speech_secs
+    );
+    let status = std::process::Command::new(&py)
+        .arg(&script)
+        .arg("--model")
+        .arg(&model)
+        .arg("--wav")
+        .arg(wav)
+        .arg("--segments")
+        .arg(&seg_path)
+        .arg("--out")
+        .arg(&out_path)
+        .arg("--batch")
+        .arg("8")
+        .status()
+        .context("启动 qwen3_mps.py 失败")?;
+    if !status.success() {
+        anyhow::bail!("qwen3_mps.py 失败 code={:?}（确认 MPS 可用且已下载 Qwen3-ASR-1.7B）", status.code());
+    }
+    let mut events = vec![];
+    for line in std::fs::read_to_string(&out_path)?.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        let text = sanitize_qwen_text(v["text"].as_str().unwrap_or(""));
+        if text.is_empty() {
+            continue;
+        }
+        events.push(TranscriptEvent {
+            start: v["start"].as_f64().unwrap_or(0.0),
+            end: v["end"].as_f64().unwrap_or(0.0),
+            text,
+        });
+    }
+    events.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+    println!("  [asr] MPS 完成：{} 条转写", events.len());
+    Ok(events)
+}
+
 fn run_blocking(
     input: &AsrInput,
     threads: i32,
     vad_threshold: f32,
     max_speech: f32,
+    workers: usize,
+    provider: String,
 ) -> Result<Vec<TranscriptEvent>> {
     let t0 = std::time::Instant::now();
 
@@ -128,61 +249,122 @@ fn run_blocking(
         vad_secs
     );
 
-    // ---- Qwen3-ASR ----
-    let q = &input.qwen;
-    let mut rc = OfflineRecognizerConfig::default();
-    rc.model_config.qwen3_asr = OfflineQwen3ASRModelConfig {
-        conv_frontend: Some(q.conv_frontend.display().to_string()),
-        encoder: Some(q.encoder.display().to_string()),
-        decoder: Some(q.decoder.display().to_string()),
-        tokenizer: Some(q.tokenizer.display().to_string()),
-        max_total_len: 1024,
-        max_new_tokens: 1024,
-        ..Default::default()
-    };
-    rc.model_config.tokens = Some(String::new());
-    rc.model_config.num_threads = threads;
-    let recognizer =
-        OfflineRecognizer::create(&rc).context("创建 Qwen3-ASR recognizer 失败（检查模型文件）")?;
-    println!(
-        "  [asr] recognizer 就绪（{:.1}s），开始解码…",
-        t0.elapsed().as_secs_f64()
-    );
-
-    let mut events: Vec<TranscriptEvent> = vec![];
-    let decode_t0 = std::time::Instant::now();
-    for (n, seg) in segs.iter().enumerate() {
-        let stream = recognizer.create_stream();
-        stream.accept_waveform(16000, &seg.samples);
-        recognizer.decode(&stream);
-        let start = seg.start_sample as f64 / sr as f64;
-        let end = start + seg.samples.len() as f64 / sr as f64;
-        if let Some(result) = stream.get_result() {
-            let text = sanitize_qwen_text(&result.text);
-            if !text.is_empty() {
-                events.push(TranscriptEvent { start, end, text });
-            }
-        }
-        if (n + 1) % 20 == 0 || n + 1 == segs.len() {
-            let el = decode_t0.elapsed().as_secs_f64();
-            let done_secs: f64 = segs[..=n].iter().map(|s| s.samples.len()).sum::<usize>() as f64
-                / sr as f64;
-            let rtf = if done_secs > 0.0 { el / done_secs } else { 0.0 };
-            println!(
-                "  [asr] {}/{} 段，已解码 {:.0}s 音频，RTF={rtf:.2}",
-                n + 1,
-                segs.len(),
-                done_secs
-            );
-        }
+    let p = provider.to_ascii_lowercase();
+    if p == "mps" || p == "gpu" || p == "metal" {
+        return run_mps(&input.wav, &segs, sr, speech_secs);
     }
-    let chars: usize = events.iter().map(|e| e.text.chars().count()).sum();
+
+    // ---- Qwen3-ASR ONNX（CPU / CoreML）：N 个 worker ----
+    // LLM 自回归解码 batch=1，intra-op 并行扩展性差；段间独立，进程内并行收益近线性。
+    let q = &input.qwen;
+    let make_config = |num_threads: i32| {
+        let mut rc = OfflineRecognizerConfig::default();
+        rc.model_config.qwen3_asr = OfflineQwen3ASRModelConfig {
+            conv_frontend: Some(q.conv_frontend.display().to_string()),
+            encoder: Some(q.encoder.display().to_string()),
+            decoder: Some(q.decoder.display().to_string()),
+            tokenizer: Some(q.tokenizer.display().to_string()),
+            max_total_len: 1024,
+            max_new_tokens: 1024,
+            ..Default::default()
+        };
+        rc.model_config.tokens = Some(String::new());
+        rc.model_config.num_threads = num_threads;
+        rc.model_config.provider = Some(provider.clone());
+        rc
+    };
+
+    let per_worker_threads = (threads / workers as i32).max(1);
     println!(
-        "  [asr] 完成：{} 条转写 / {} 段，{} 字符，总耗时 {:.1}s",
+        "  [asr] provider={provider}，{workers} worker × {per_worker_threads} 线程（约 {:.1}GB 权重）",
+        workers as f64 * 2.6
+    );
+    let t_load = std::time::Instant::now();
+
+    struct SegOut {
+        start: f64,
+        end: f64,
+        text: String,
+    }
+    let results: std::sync::Mutex<Vec<SegOut>> = Default::default();
+    let queue: std::sync::Mutex<std::collections::VecDeque<usize>> =
+        std::sync::Mutex::new((0..segs.len()).collect());
+    let done = std::sync::atomic::AtomicUsize::new(0);
+
+    let decode_t0 = std::time::Instant::now();
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut handles = vec![];
+        for w in 0..workers {
+            let queue = &queue;
+            let results = &results;
+            let done = &done;
+            let segs = &segs;
+            let rc = make_config(per_worker_threads);
+            handles.push(scope.spawn(move || -> anyhow::Result<()> {
+                let recognizer = OfflineRecognizer::create(&rc)
+                    .context("创建 Qwen3-ASR recognizer 失败（检查模型文件/内存）")?;
+                if w == 0 {
+                    println!(
+                        "  [asr] recognizer 就绪（{:.1}s），开始解码…",
+                        t_load.elapsed().as_secs_f64()
+                    );
+                }
+                loop {
+                    let Some(i) = queue.lock().unwrap().pop_front() else {
+                        break;
+                    };
+                    let seg = &segs[i];
+                    let stream = recognizer.create_stream();
+                    stream.accept_waveform(16000, &seg.samples);
+                    recognizer.decode(&stream);
+                    let start = seg.start_sample as f64 / sr as f64;
+                    let end = start + seg.samples.len() as f64 / sr as f64;
+                    if let Some(result) = stream.get_result() {
+                        let text = sanitize_qwen_text(&result.text);
+                        if !text.is_empty() {
+                            results.lock().unwrap().push(SegOut { start, end, text });
+                        }
+                    }
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n % 50 == 0 || n == segs.len() {
+                        let el = decode_t0.elapsed().as_secs_f64();
+                        let decoded_secs = speech_secs * n as f64 / segs.len() as f64;
+                        let rtf = if decoded_secs > 0.0 { el / decoded_secs } else { 0.0 };
+                        println!(
+                            "  [asr] {n}/{} 段，≈{:.0}s 语音，RTF={rtf:.2}",
+                            segs.len(),
+                            decoded_secs
+                        );
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| anyhow::anyhow!("ASR worker 线程 panic"))??;
+        }
+        Ok(())
+    })?;
+
+    let mut events: Vec<TranscriptEvent> = results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|o| TranscriptEvent {
+            start: o.start,
+            end: o.end,
+            text: o.text,
+        })
+        .collect();
+    events.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+    let chars: usize = events.iter().map(|e| e.text.chars().count()).sum();
+    let el = decode_t0.elapsed().as_secs_f64();
+    let rtf = if speech_secs > 0.0 { el / speech_secs } else { 0.0 };
+    println!(
+        "  [asr] 完成：{} 条转写 / {} 段，{} 字符，{workers} worker 解码 {el:.1}s，RTF={rtf:.2}",
         events.len(),
         segs.len(),
-        chars,
-        t0.elapsed().as_secs_f64()
+        chars
     );
     Ok(events)
 }
