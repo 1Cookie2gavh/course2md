@@ -1,6 +1,8 @@
 mod cli;
 mod config;
 mod error;
+mod fetch;
+mod media;
 mod models;
 
 use clap::Parser;
