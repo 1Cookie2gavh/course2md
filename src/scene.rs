@@ -16,6 +16,7 @@ use tokio::process::Command;
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
     t: f64,
+    #[allow(dead_code)]
     score: f64,
 }
 

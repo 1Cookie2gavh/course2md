@@ -65,9 +65,15 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         None => {
-            let source = cli.source.ok_or_else(|| {
-                anyhow::anyhow!("请提供 YouTube/Bilibili 链接，或本地视频文件。参见 --help")
-            })?;
+            let source = match cli.source {
+                Some(s) if config::looks_like_source(&s) => s,
+                _ => {
+                    use clap::CommandFactory;
+                    let mut cmd = Cli::command();
+                    cmd.print_help()?;
+                    std::process::exit(2);
+                }
+            };
             init_logging(cli.opts.verbose, cli.opts.quiet);
             let cfg = run_opts_to_cfg(source, cli.opts)?;
             tracing::info!(out = %cfg.out_dir.display(), provider = %cfg.provider, "start");

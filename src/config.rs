@@ -120,6 +120,20 @@ pub fn model_dir_from(opt: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| cache_dir().join("models"))
 }
 
+/// 像 URL 或已存在的本地文件才当作输入；否则视为没传参数。
+pub fn looks_like_source(s: &str) -> bool {
+    let p = Path::new(s);
+    if p.is_file() {
+        return true;
+    }
+    let t = s.trim();
+    t.starts_with("http://")
+        || t.starts_with("https://")
+        || t.contains("bilibili.com/")
+        || t.contains("youtube.com/")
+        || t.contains("youtu.be/")
+}
+
 /// 未指定 -o 时：`out/<bvid|yt-id|文件名>/`
 pub fn infer_out_dir(source: &str) -> PathBuf {
     PathBuf::from("out").join(infer_slug(source))
@@ -188,6 +202,14 @@ fn sanitize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_gate() {
+        assert!(!looks_like_source("course2md"));
+        assert!(!looks_like_source("run"));
+        assert!(looks_like_source("https://www.bilibili.com/video/BV1pb8o6yE8f"));
+        assert!(looks_like_source("https://youtu.be/dQw4w9WgXcQ"));
+    }
 
     #[test]
     fn slug_bilibili() {

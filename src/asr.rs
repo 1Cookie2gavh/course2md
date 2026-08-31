@@ -217,7 +217,7 @@ fn run_blocking(
 
     let window = vad_cfg.silero_vad.window_size as usize;
     let mut segs: Vec<Seg> = vec![];
-    let mut drain = |vad: &VoiceActivityDetector, segs: &mut Vec<Seg>| loop {
+    let drain = |vad: &VoiceActivityDetector, segs: &mut Vec<Seg>| loop {
         if vad.is_empty() {
             break;
         }
@@ -386,7 +386,7 @@ pub fn vad_only(vad_model: &Path, wav: &Path, threshold: f32) -> Result<Vec<(f64
     let vad = VoiceActivityDetector::create(&vad_cfg, 60.0).context("create vad")?;
     let window = 512usize;
     let mut out = vec![];
-    let mut collect = |vad: &VoiceActivityDetector, out: &mut Vec<(f64, f64)>| loop {
+    let collect = |vad: &VoiceActivityDetector, out: &mut Vec<(f64, f64)>| loop {
         if vad.is_empty() {
             break;
         }
