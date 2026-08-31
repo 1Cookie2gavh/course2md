@@ -35,6 +35,20 @@ pub async fn run(cfg: &PipelineConfig, input: AsrInput) -> Result<Vec<Transcript
         .context("ASR 线程 join 失败")?
 }
 
+/// 清洗 Qwen3 转写中的提示词残留（如 `**language Chinese<asr_text>` 前缀与 `</asr_text>` 后缀）。
+pub fn sanitize_qwen_text(s: &str) -> String {
+    let mut t = s.trim();
+    // 去掉闭合标记后缀
+    if let Some(p) = t.find("</asr_text>") {
+        t = t[..p].trim();
+    }
+    // 去掉最后一个 <asr_text> 及其之前的内容（含 **language 等提示）
+    if let Some(p) = t.rfind("<asr_text>") {
+        t = t[p + "<asr_text>".len()..].trim();
+    }
+    t.to_string()
+}
+
 fn run_blocking(
     input: &AsrInput,
     threads: i32,
@@ -144,7 +158,7 @@ fn run_blocking(
         let start = seg.start_sample as f64 / sr as f64;
         let end = start + seg.samples.len() as f64 / sr as f64;
         if let Some(result) = stream.get_result() {
-            let text = result.text.trim().to_string();
+            let text = sanitize_qwen_text(&result.text);
             if !text.is_empty() {
                 events.push(TranscriptEvent { start, end, text });
             }
@@ -218,4 +232,21 @@ pub fn vad_only(vad_model: &Path, wav: &Path, threshold: f32) -> Result<Vec<(f64
     vad.flush();
     collect(&vad, &mut out);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_prompt_artifacts() {
+        assert_eq!(
+            sanitize_qwen_text("**language Chinese<asr_text>你好世界。"),
+            "你好世界。"
+        );
+        assert_eq!(sanitize_qwen_text("正常文本"), "正常文本");
+        assert_eq!(sanitize_qwen_text("内容</asr_text>尾巴"), "内容");
+        assert_eq!(sanitize_qwen_text("**language Chinese<asr_text>你好</asr_text>"), "你好");
+        assert_eq!(sanitize_qwen_text("  空白  "), "空白");
+    }
 }
