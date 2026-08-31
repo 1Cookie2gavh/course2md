@@ -38,6 +38,10 @@ jobs:
           ssh-keyscan -t ed25519 aur.archlinux.org > /home/builder/.ssh/known_hosts 2>/dev/null || true
           chown builder:builder /home/builder/.ssh/known_hosts
           chmod +x packaging/aur/update-aur.sh
+          su builder -s /bin/bash -c "
+            git config --global user.name 'mizorewww (ci)'
+            git config --global user.email 'mizorewww@users.noreply.github.com'
+          "
 
       - name: Update AUR package (as builder)
         env:
