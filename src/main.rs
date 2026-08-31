@@ -1,18 +1,5 @@
-mod asr;
-mod cli;
-mod config;
-mod error;
-mod fetch;
-mod img_hash;
-mod media;
-mod models;
-mod pipeline;
-mod render;
-mod scene;
-mod timeline;
-
 use clap::Parser;
-use config::PipelineConfig;
+use course2md::{cli, config, models, pipeline};
 
 fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
@@ -32,7 +19,7 @@ fn main() -> anyhow::Result<()> {
             keep_video,
             no_download,
         } => {
-            let cfg = PipelineConfig {
+            let cfg = config::PipelineConfig {
                 url,
                 out_dir: out,
                 scene_threshold,
