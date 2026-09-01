@@ -3,6 +3,15 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 改进
+
+- **LLM 请求重试**：网络/TLS 错误、429、5xx 按指数退避重试（1s→2s，含抖动），
+  最多 3 次尝试；4xx（鉴权/参数）快速失败并附服务端返回体
+- **润色真并发**：波次式改为 worker 池抢占取活，消除队头阻塞；
+  并发数可配置（`[llm] concurrency`，默认 4→8，范围 1~16）
+
 ## [1.2.0] — 2026-09-01
 
 ### 新增：视频总结与凭据清理（来自 #7，感谢 @1Cookie2gavh）

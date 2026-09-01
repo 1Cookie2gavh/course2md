@@ -24,7 +24,7 @@ pub const DEFAULT_PROMPT: &str = "你是视频逐字稿校对器。输入的每�
 /// 每次请求合并的语音段数。
 const BATCH: usize = 20;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmSettings {
     pub enabled: bool,
@@ -40,6 +40,24 @@ pub struct LlmSettings {
     pub vision: bool,
     /// 转换完成后自动生成视频总结并写入 md/html（需 enabled）
     pub summarize: bool,
+    /// 润色并发数（Section 间相互独立；自建网关/代理可调高）
+    pub concurrency: usize,
+}
+
+impl Default for LlmSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            prompt: None,
+            disable_hint: false,
+            vision: false,
+            summarize: false,
+            concurrency: DEFAULT_CONCURRENCY,
+        }
+    }
 }
 
 /// base_url -> 完整 chat/completions URL。
@@ -63,14 +81,17 @@ pub fn validate(s: &LlmSettings) -> Result<()> {
     Ok(())
 }
 
-/// LLM 润色并发数（Section 间相互独立；过高易触发上游限流）。
-const CONCURRENCY: usize = 4;
+/// LLM 润色默认并发数（Section 间相互独立；可经 [llm] concurrency 调整）。
+const DEFAULT_CONCURRENCY: usize = 8;
+/// LLM 请求最大尝试次数（1 次原始 + 重试）。
+const MAX_ATTEMPTS: usize = 3;
 
 /// 对已合并的 Section 做润色（在 merge 之后调用）。
 /// - 失败批次保留原文（润色失败不阻断转换）
 /// - vision=true 且截图存在时，请求附该节幻灯片；带图失败自动降级纯文本重试一次
 /// - 模型对纯语气词条目返回空 text → 该条被删除（issue #5）
-/// - Section 间并发（波次式）；批次失败拆半递归重试，推理模型下更稳更快
+/// - Section 间真并发（worker 池抢占式取活，无波次队头阻塞）；
+///   批次失败拆半递归重试 + 请求级指数退避，推理模型下更稳更快
 pub fn polish_sections(sections: &mut [Section], frames_root: &Path, s: &LlmSettings) {
     let total: usize = sections
         .iter()
@@ -86,20 +107,26 @@ pub fn polish_sections(sections: &mut [Section], frames_root: &Path, s: &LlmSett
     );
     let warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let vision_warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for wave in sections.chunks_mut(CONCURRENCY) {
-        std::thread::scope(|scope| {
-            for sec in wave {
-                let s = s.clone();
-                let pb = pb.clone();
-                let frames_root = frames_root.to_path_buf();
-                let warned = std::sync::Arc::clone(&warned);
-                let vision_warned = std::sync::Arc::clone(&vision_warned);
-                scope.spawn(move || {
-                    polish_section(&s, &frames_root, sec, &pb, &warned, &vision_warned);
-                });
-            }
-        });
-    }
+    let workers = s.concurrency.clamp(1, 16);
+    // worker 池：共享迭代器抢占式取 Section，谁先完成谁取下一个
+    // （旧波次实现里最慢的 Section 会挡住整队）
+    let queue = std::sync::Mutex::new(sections.iter_mut());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let next = queue.lock().map(|mut it| it.next());
+                    match next {
+                        Ok(Some(sec)) => {
+                            polish_section(s, frames_root, sec, &pb, &warned, &vision_warned);
+                        }
+                        Ok(None) => break,
+                        Err(_) => break, // 中毒锁：其余 worker 会同样退出
+                    }
+                }
+            });
+        }
+    });
     pb.finish_and_clear();
 }
 
@@ -422,13 +449,68 @@ pub(crate) fn send_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<Str
         .to_string())
 }
 
+/// 网络层错误 / 429 / 5xx 可重试；其余 4xx（鉴权、参数）重试无意义。
+fn is_retryable(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Status(code, _) => *code == 429 || *code >= 500,
+        ureq::Error::Transport(_) => true,
+    }
+}
+
+/// 第 attempt 次失败后的退避时长：1s、2s 指数增长 + 亚秒级抖动。
+fn backoff_duration(attempt: usize) -> Duration {
+    let base = 1_u64 << (attempt.saturating_sub(1).min(6)); // 1, 2, 4, ...
+    let jitter_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        % 500_000_000; // 0~500ms 抖动，避免并发请求同步重试
+    Duration::from_nanos(base * 1_000_000_000 + u64::from(jitter_ns))
+}
+
+/// 发请求：可重试错误按指数退避重试，总共最多 [`MAX_ATTEMPTS`] 次尝试。
 fn request_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<ureq::Response> {
-    ureq::post(&endpoint(&s.base_url))
-        .timeout(Duration::from_secs(300))
-        .set("Content-Type", "application/json")
-        .set("Authorization", &format!("Bearer {}", s.api_key))
-        .send_json(body.clone())
-        .context("LLM 请求失败")
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        if attempt > 1 {
+            let wait = backoff_duration(attempt - 1);
+            tracing::warn!(
+                attempt,
+                of = MAX_ATTEMPTS,
+                ?wait,
+                "LLM 请求失败，指数退避后重试"
+            );
+            std::thread::sleep(wait);
+        }
+        match ureq::post(&endpoint(&s.base_url))
+            .timeout(Duration::from_secs(300))
+            .set("Content-Type", "application/json")
+            .set("Authorization", &format!("Bearer {}", s.api_key))
+            .send_json(body.clone())
+        {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                // 状态错误带上服务端返回体（鉴权/限流/参数问题一目了然）
+                let retryable = is_retryable(&e);
+                let wrapped = match e {
+                    ureq::Error::Status(code, resp) => {
+                        let tail = resp.into_string().unwrap_or_default();
+                        anyhow::anyhow!(
+                            "LLM 端点返回 {code}：{}",
+                            tail.chars().take(300).collect::<String>()
+                        )
+                    }
+                    other => anyhow::anyhow!("LLM 请求失败: {other}"),
+                };
+                if retryable {
+                    last_err = Some(wrapped);
+                } else {
+                    return Err(wrapped);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("LLM 请求失败")))
 }
 
 /// 从模型输出中提取 JSON 字符串数组（容忍 ```json 围栏与前后杂文）。
@@ -628,6 +710,7 @@ mod tests {
             disable_hint: false,
             vision: false,
             summarize: false,
+            concurrency: 8,
         }
     }
 
@@ -691,6 +774,37 @@ mod tests {
             vec![(0, "a".into()), (2, "c".into())],
             "坏项应被跳过（随后的拆半重试会覆盖 id=1）"
         );
+    }
+
+    #[test]
+    fn retry_classification_and_backoff() {
+        use ureq::Error;
+        // Transport 无公共构造器：经由真实失败请求构造（127.0.0.1:1 必连接拒绝）
+        let transport = ureq::get("http://127.0.0.1:1/health")
+            .timeout(Duration::from_millis(500))
+            .call()
+            .unwrap_err();
+        assert!(
+            matches!(transport, Error::Transport(_)),
+            "closed port should be transport error"
+        );
+        assert!(is_retryable(&transport), "网络/TLS 错误可重试");
+        let mk_status = |code: u16| {
+            let resp = ureq::Response::new(code, "x", "").unwrap();
+            Error::Status(code, resp)
+        };
+        assert!(is_retryable(&mk_status(429)), "限流可重试");
+        assert!(is_retryable(&mk_status(500)));
+        assert!(is_retryable(&mk_status(503)));
+        assert!(!is_retryable(&mk_status(400)), "参数错误重试无意义");
+        assert!(!is_retryable(&mk_status(401)), "鉴权错误重试无意义");
+        // 指数退避：1s、2s、4s…（含 0~500ms 抖动）
+        let b1 = backoff_duration(1).as_secs_f64();
+        let b2 = backoff_duration(2).as_secs_f64();
+        let b3 = backoff_duration(3).as_secs_f64();
+        assert!((1.0..1.5).contains(&b1));
+        assert!((2.0..2.5).contains(&b2));
+        assert!((4.0..4.5).contains(&b3));
     }
 
     #[test]
