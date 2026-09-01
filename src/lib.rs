@@ -17,4 +17,5 @@ pub mod runtime;
 pub mod scene;
 pub mod settings;
 pub mod subtitle;
+pub mod summarize;
 pub mod timeline;

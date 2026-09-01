@@ -38,6 +38,8 @@ pub struct LlmSettings {
     pub disable_hint: bool,
     /// 视觉润色：每个请求附对应幻灯片截图，辅助纠正技术词汇（模型须支持图片输入）
     pub vision: bool,
+    /// 转换完成后自动生成视频总结并写入 md/html（需 enabled）
+    pub summarize: bool,
 }
 
 /// base_url -> 完整 chat/completions URL。
@@ -61,10 +63,14 @@ pub fn validate(s: &LlmSettings) -> Result<()> {
     Ok(())
 }
 
+/// LLM 润色并发数（Section 间相互独立；过高易触发上游限流）。
+const CONCURRENCY: usize = 4;
+
 /// 对已合并的 Section 做润色（在 merge 之后调用）。
 /// - 失败批次保留原文（润色失败不阻断转换）
 /// - vision=true 且截图存在时，请求附该节幻灯片；带图失败自动降级纯文本重试一次
 /// - 模型对纯语气词条目返回空 text → 该条被删除（issue #5）
+/// - Section 间并发（波次式）；批次失败拆半递归重试，推理模型下更稳更快
 pub fn polish_sections(sections: &mut [Section], frames_root: &Path, s: &LlmSettings) {
     let total: usize = sections
         .iter()
@@ -78,49 +84,110 @@ pub fn polish_sections(sections: &mut [Section], frames_root: &Path, s: &LlmSett
         .unwrap()
         .progress_chars("##-"),
     );
-    let mut warned = false;
-    let mut vision_warned = false;
-    for sec in sections.iter_mut() {
-        if sec.speech.is_empty() {
-            continue;
-        }
-        let image = if s.vision {
-            let p = frames_root.join(&sec.image);
-            p.is_file().then_some(p)
-        } else {
-            None
-        };
-        for chunk in sec.speech.chunks_mut(BATCH) {
-            pb.inc(1);
-            let items: Vec<(usize, &str)> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, e)| (i, e.text.as_str()))
-                .collect();
-            let r = match (chat(s, &items, image.as_deref()), image.as_deref()) {
-                (Ok(v), _) => Ok(v),
-                (Err(e), Some(_)) => {
-                    warn_once(
-                        &mut vision_warned,
-                        &format!("带图润色失败（{e:#}），该批降级为纯文本重试"),
-                    );
-                    chat(s, &items, None)
-                }
-                (Err(e), None) => Err(e),
-            };
-            match r {
-                Ok(polished) => {
-                    if apply_polish(chunk, &polished) {
-                        warn_once(&mut warned, "LLM 返回 id 集与输入不符，该批保留原文");
-                    }
-                }
-                Err(e) => warn_once(&mut warned, &format!("LLM 润色失败（{e:#}），保留原文")),
+    let warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let vision_warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for wave in sections.chunks_mut(CONCURRENCY) {
+        std::thread::scope(|scope| {
+            for sec in wave {
+                let s = s.clone();
+                let pb = pb.clone();
+                let frames_root = frames_root.to_path_buf();
+                let warned = std::sync::Arc::clone(&warned);
+                let vision_warned = std::sync::Arc::clone(&vision_warned);
+                scope.spawn(move || {
+                    polish_section(&s, &frames_root, sec, &pb, &warned, &vision_warned);
+                });
             }
-        }
-        // 删除「成功润色为空串」的纯语气词条目
-        sec.speech.retain(|e| !e.text.trim().is_empty());
+        });
     }
     pb.finish_and_clear();
+}
+
+/// 润色单个 Section（含视觉图片解析与纯语气词条目删除）。
+fn polish_section(
+    s: &LlmSettings,
+    frames_root: &Path,
+    sec: &mut Section,
+    pb: &indicatif::ProgressBar,
+    warned: &std::sync::atomic::AtomicBool,
+    vision_warned: &std::sync::atomic::AtomicBool,
+) {
+    if sec.speech.is_empty() {
+        return;
+    }
+    let image = if s.vision {
+        let p = frames_root.join(&sec.image);
+        p.is_file().then_some(p)
+    } else {
+        None
+    };
+    for chunk in sec.speech.chunks_mut(BATCH) {
+        pb.inc(1);
+        polish_chunk(s, chunk, image.as_deref(), warned, vision_warned);
+    }
+    // 删除「成功润色为空串」的纯语气词条目
+    sec.speech.retain(|e| !e.text.trim().is_empty());
+}
+
+/// 递归润色一个分块；失败（含 id 集不匹配）时拆半重试，保证尽力而为。
+fn polish_chunk(
+    s: &LlmSettings,
+    chunk: &mut [TranscriptEvent],
+    image: Option<&Path>,
+    warned: &std::sync::atomic::AtomicBool,
+    vision_warned: &std::sync::atomic::AtomicBool,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    let items: Vec<(usize, &str)> = chunk
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i, e.text.as_str()))
+        .collect();
+    let r = match (chat(s, &items, image), image) {
+        (Ok(v), _) => Ok(v),
+        (Err(e), Some(_)) => {
+            warn_once(
+                vision_warned,
+                &format!("带图润色失败（{e:#}），该批降级为纯文本重试"),
+            );
+            chat(s, &items, None)
+        }
+        (Err(e), None) => Err(e),
+    };
+    match r {
+        Ok(polished) => {
+            let mismatched = apply_polish(chunk, &polished);
+            if mismatched {
+                if chunk.len() > 1 {
+                    split_and_retry(s, chunk, image, warned, vision_warned);
+                } else {
+                    warn_once(warned, "LLM 返回 id 集与输入不符，该批保留原文");
+                }
+            }
+        }
+        Err(e) => {
+            if chunk.len() > 1 {
+                split_and_retry(s, chunk, image, warned, vision_warned);
+            } else {
+                warn_once(warned, &format!("LLM 润色失败（{e:#}），保留原文"));
+            }
+        }
+    }
+}
+
+/// 把批次一分为二递归重试（更小批次更易成功，如推理模型 token 耗尽）。
+fn split_and_retry(
+    s: &LlmSettings,
+    chunk: &mut [TranscriptEvent],
+    image: Option<&Path>,
+    warned: &std::sync::atomic::AtomicBool,
+    vision_warned: &std::sync::atomic::AtomicBool,
+) {
+    let mid = chunk.len() / 2;
+    polish_chunk(s, &mut chunk[..mid], image, warned, vision_warned);
+    polish_chunk(s, &mut chunk[mid..], image, warned, vision_warned);
 }
 
 /// 把 (id, 新文本) 应用到一批事件上；空字符串 = 删除该条（由调用方 retain）。
@@ -146,10 +213,10 @@ fn apply_polish(chunk: &mut [TranscriptEvent], polished: &[(usize, String)]) -> 
     false
 }
 
-fn warn_once(warned: &mut bool, msg: &str) {
-    if !*warned {
+fn warn_once(warned: &std::sync::atomic::AtomicBool, msg: &str) {
+    use std::sync::atomic::Ordering;
+    if !warned.swap(true, Ordering::Relaxed) {
         tracing::warn!("{msg}（后续同类问题不再重复提示）");
-        *warned = true;
     } else {
         tracing::debug!("{msg}");
     }
@@ -174,7 +241,7 @@ fn chat(
     };
     let body = build_chat_body(s, items, image_b64.as_deref())?;
     let resp = ureq::post(&endpoint(&s.base_url))
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(300))
         .set("Content-Type", "application/json")
         .set("Authorization", &format!("Bearer {}", s.api_key))
         .send_json(body)
@@ -216,7 +283,8 @@ fn build_chat_body(
     Ok(serde_json::json!({
         "model": s.model,
         "temperature": 0.0,
-        "max_tokens": 4096,
+        "max_tokens": 16384,
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": format!("{} 输出为 JSON 数组，每项形如 {{\"id\":序号,\"text\":润色后的文本}}，id 必须与输入一一对应；纯语气词条目的 text 为空字符串。{vision_note}", effective_prompt(s))},
             {"role": "user", "content": content},
@@ -224,21 +292,127 @@ fn build_chat_body(
     }))
 }
 
-/// 从模型输出提取 [{"id":n,"text":"..."}]（容忍代码围栏与前后杂文）。
+/// 从模型输出提取 [{"id":n,"text":"..."}]（容忍代码围栏、前后杂文、尾逗号与个别坏项）。
 pub fn parse_id_text_pairs(content: &str) -> Option<Vec<(usize, String)>> {
     let start = content.find('[')?;
     let end = content.rfind(']')?;
     if end <= start {
         return None;
     }
-    let v: Vec<serde_json::Value> = serde_json::from_str(&content[start..=end]).ok()?;
+    let slice = &content[start..=end];
+    // 1) 严格解析
+    if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(slice) {
+        return parse_items(&v);
+    }
+    // 2) 清除尾逗号后重试
+    let cleaned = clean_trailing_commas(slice);
+    if cleaned != slice {
+        if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned) {
+            return parse_items(&v);
+        }
+    }
+    // 3) 宽容扫描：跳过坏项，收集合法 {"id":..,"text":".."}
+    lenient_scan(slice)
+}
+
+fn parse_items(v: &[serde_json::Value]) -> Option<Vec<(usize, String)>> {
     let mut out = vec![];
     for item in v {
         let id = item.get("id")?.as_u64()? as usize;
         let text = item.get("text")?.as_str()?.to_string();
         out.push((id, text));
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn clean_trailing_commas(s: &str) -> String {
+    let mut out = s.to_string();
+    loop {
+        let prev = out.clone();
+        out = out.replace(",}", "}").replace(",]", "]");
+        if out == prev {
+            break;
+        }
+    }
+    out
+}
+
+/// 逐个扫描 {"id":N,"text":"..."}，坏项跳过；能取到至少一项即返回。
+fn lenient_scan(s: &str) -> Option<Vec<(usize, String)>> {
+    let mut out: Vec<(usize, String)> = vec![];
+    let mut rest = s;
+    let mut guard = 0;
+    while let Some(rel) = rest.find("\"id\"") {
+        guard += 1;
+        if guard > 10_000 {
+            break;
+        }
+        let tail = &rest[rel..];
+        let obj_start = tail.find('{')?;
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut end = None;
+        let bytes = tail[obj_start..].as_bytes();
+        for (k, &b) in bytes.iter().enumerate() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(obj_start + k + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tail[obj_start..end]) {
+            if let (Some(id), Some(text)) = (
+                v.get("id").and_then(|x| x.as_u64()).map(|x| x as usize),
+                v.get("text").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            ) {
+                out.push((id, text));
+            }
+        }
+        rest = &tail[end.min(tail.len())..];
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 发原始 chat/completions 请求并返回 message.content（供 summarize 等复用）。
+pub(crate) fn send_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<String> {
+    let resp = ureq::post(&endpoint(&s.base_url))
+        .timeout(Duration::from_secs(300))
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", s.api_key))
+        .send_json(body.clone())
+        .context("LLM 请求失败")?;
+    let v: serde_json::Value = resp.into_json().context("LLM 响应解析失败")?;
+    Ok(v["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string())
 }
 
 /// 从模型输出中提取 JSON 字符串数组（容忍 ```json 围栏与前后杂文）。

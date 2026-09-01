@@ -63,7 +63,7 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
     }
     *cmd = std::mem::take(cmd).about("把网课视频转成带截图的文字稿");
     let after = Some(
-        "示例：\n  course2md https://www.bilibili.com/video/BV1pb8o6yE8f\n  course2md https://youtu.be/dQw4w9WgXcQ\n  course2md ./lecture.mp4\n  course2md models download\n  course2md config init   # 生成配置文件模板\n  course2md llm setup     # 配置 LLM 字幕润色",
+        "示例：\n  course2md https://www.bilibili.com/video/BV1pb8o6yE8f\n  course2md https://youtu.be/dQw4w9WgXcQ\n  course2md ./lecture.mp4\n  course2md models download\n  course2md config init   # 生成配置文件模板\n  course2md llm setup     # 配置 LLM 字幕润色\n  course2md summarize <输出目录|输出根>  # 为已有输出生成视频总结（支持批量）\n  course2md remove                    # 清除 LLM/STT 的 API 配置（提交代码前执行）",
     );
     *cmd = std::mem::take(cmd).after_help(after);
 
@@ -141,4 +141,6 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
         "生成带注释的配置文件模板（已存在则拒绝，--force 覆盖）",
     );
     sub_about(cmd, &["config", "show"], "查看配置文件路径与文件中的设置");
+    sub_about(cmd, &["summarize"], "用 LLM 为已有输出目录生成视频总结（写入 course.md/html）");
+    sub_about(cmd, &["remove"], "清除 LLM/STT 的 API 配置（凭据清除，提交代码前可执行）");
 }

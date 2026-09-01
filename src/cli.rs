@@ -16,6 +16,8 @@ Examples:
   course2md models download
   course2md config init   # 生成配置文件模板
   course2md llm setup     # 配置 LLM 字幕润色
+  course2md summarize <输出目录|输出根>  # 为已有输出生成视频总结（支持批量）
+  course2md remove                    # 清除 LLM/STT 的 API 配置（提交代码前执行）
 "
 )]
 pub struct Cli {
@@ -183,6 +185,30 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Summarize existing outputs with LLM (writes summary into course.md/html)
+    Summarize(SummarizeArgs),
+    /// Clear LLM/STT API credentials from the config file
+    Remove(RemoveArgs),
+}
+
+#[derive(Args)]
+pub struct RemoveArgs {
+    /// 同时清除云端 STT（[asr_api]）的 API Key
+    #[arg(long)]
+    pub asr: bool,
+}
+
+#[derive(Args)]
+pub struct SummarizeArgs {
+    /// Output directories (each containing timeline.jsonl / course.md / course.html)
+    #[arg(required = true)]
+    pub dirs: Vec<PathBuf>,
+    /// Overwrite an existing summary block
+    #[arg(long)]
+    pub force: bool,
+    /// 额外导出独立总结文件到指定目录（每个视频一个 <标题>.summary.md）
+    #[arg(short = 'o', long)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]

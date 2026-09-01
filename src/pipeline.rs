@@ -200,9 +200,30 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         .await;
         sections = joined.context("LLM 线程 join 失败")?;
     }
+
+    // 可选的 LLM 视频总结（自动写入 md/html 开头）
+    let summary = if cfg.llm.enabled && cfg.llm.summarize {
+        tracing::info!(model = %cfg.llm.model, "llm summary");
+        let speech: Vec<crate::timeline::TranscriptEvent> = sections
+            .iter()
+            .flat_map(|s| s.speech.iter().cloned())
+            .collect();
+        match crate::summarize::summarize(&cfg.llm, &speech, &meta).await {
+            Ok(sm) => {
+                tracing::info!(points = sm.key_points.len(), chapters = sm.outline.len(), "summary done");
+                Some(sm)
+            }
+            Err(e) => {
+                tracing::warn!("LLM 总结失败（{e:#}），跳过总结");
+                None
+            }
+        }
+    } else {
+        None
+    };
     tracing::info!(sections = sections.len(), "merged");
 
-    render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats).await?;
+    render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats, summary.as_ref()).await?;
     // 只删自己下载的视频；本地输入与既有工作区文件不动。
     let media_deleted =
         should_delete_media(is_local, cfg.no_download, media_existed, cfg.keep_video);
