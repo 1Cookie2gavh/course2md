@@ -181,20 +181,34 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
     // 转写可能合法返回空（静音课件）；由后续正常渲染成"无语音"讲义
 
-    // 可选的 LLM 润色（配置已在管线开头校验）
-    let events = if cfg.llm.enabled {
-        tracing::info!(model = %cfg.llm.model, "llm polish");
+    // timeline.jsonl 始终保存 ASR/字幕的原始细粒度事件（段落组织之前），
+    // 供追溯、调试或二次处理。
+    timeline::write_jsonl(&cfg.timeline_path(), &frames, &events)?;
+
+    // 合并 → 段落组织：同一截图内短停顿间的连续片段合并为自然段；
+    // LLM 校对与渲染都作用于组织好的段落（issue #6 的可读性改进）
+    let mut sections = timeline::merge(frames.clone(), events, meta.duration);
+    timeline::coalesce_sections(&mut sections);
+    if cfg.llm.enabled {
+        tracing::info!(model = %cfg.llm.model, vision = cfg.llm.vision, "llm polish");
         let ev = cfg.llm.clone();
-        let joined = tokio::task::spawn_blocking(move || crate::llm::polish(events, &ev)).await;
-        joined.context("LLM 线程 join 失败")?
-    } else {
-        events
-    };
+        let root = cfg.out_dir.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            crate::llm::polish_sections(&mut sections, &root, &ev);
+            sections
+        })
+        .await;
+        sections = joined.context("LLM 线程 join 失败")?;
+    }
 
     // 可选的 LLM 视频总结（自动写入 md/html 开头）
     let summary = if cfg.llm.enabled && cfg.llm.summarize {
         tracing::info!(model = %cfg.llm.model, "llm summary");
-        match crate::summarize::summarize(&cfg.llm, &events, &meta).await {
+        let speech: Vec<crate::timeline::TranscriptEvent> = sections
+            .iter()
+            .flat_map(|s| s.speech.iter().cloned())
+            .collect();
+        match crate::summarize::summarize(&cfg.llm, &speech, &meta).await {
             Ok(sm) => {
                 tracing::info!(points = sm.key_points.len(), chapters = sm.outline.len(), "summary done");
                 Some(sm)
@@ -207,9 +221,6 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     } else {
         None
     };
-
-    let sections = timeline::merge(frames.clone(), events.clone(), meta.duration);
-    timeline::write_jsonl(&cfg.timeline_path(), &frames, &events)?;
     tracing::info!(sections = sections.len(), "merged");
 
     render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats, summary.as_ref()).await?;
@@ -264,6 +275,7 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         "resume": cfg.resume,
         "formats": cfg.formats.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
         "llm_polish": cfg.llm.enabled,
+        "llm_vision": cfg.llm.enabled && cfg.llm.vision,
         "sections": sections.len(),
         "speech_segments": speech_n,
         "chars": chars,

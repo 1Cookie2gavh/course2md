@@ -27,6 +27,11 @@ fn resolve_llm(opts: &RunOpts, file: &settings::ConfigFile) -> llm::LlmSettings 
     } else if opts.llm {
         s.enabled = true;
     }
+    if opts.no_llm_vision {
+        s.vision = false;
+    } else if opts.llm_vision {
+        s.vision = true;
+    }
     if let Some(v) = &opts.llm_base_url {
         s.base_url = v.clone();
     }

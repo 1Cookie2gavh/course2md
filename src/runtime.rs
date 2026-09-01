@@ -27,6 +27,11 @@ impl ManagedChild {
         self.child.id()
     }
 
+    /// 取出 piped 的 stderr 句柄（配合 [`drain_stderr`] 使用）。
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
     pub fn name(&self) -> &'static str {
         self.name
     }
@@ -51,6 +56,60 @@ impl Drop for ManagedChild {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// 后台读取子进程 stderr：避免 pipe 写满阻塞子进程；保留尾部若干行
+/// 供失败诊断；verbose(debug) 时逐行转发到 tracing。
+/// 返回的尾部缓存与会话同寿命，随时可读取。
+pub struct StderrTail {
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+const STDERR_TAIL_MAX: usize = 100;
+
+impl StderrTail {
+    pub fn tail(&self) -> String {
+        self.lines.lock().map(|v| v.join("\n")).unwrap_or_default()
+    }
+}
+
+impl Clone for StderrTail {
+    fn clone(&self) -> Self {
+        Self {
+            lines: self.lines.clone(),
+        }
+    }
+}
+
+impl Default for StderrTail {
+    fn default() -> Self {
+        Self {
+            lines: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+/// 为一个已 spawn 的 stderr pipe 启动 drain 线程。
+pub fn drain_stderr(stderr: std::process::ChildStderr) -> StderrTail {
+    use std::io::BufRead;
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let shared = lines.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            tracing::debug!(target: "llama_server", "{line}");
+            if let Ok(mut v) = shared.lock()
+                && !line.trim().is_empty()
+            {
+                v.push(line);
+                let overflow = v.len().saturating_sub(STDERR_TAIL_MAX);
+                if overflow > 0 {
+                    v.drain(..overflow);
+                }
+            }
+        }
+    });
+    StderrTail { lines }
 }
 
 /// 轮询 `{base}/health` 直到成功；子进程中途退出立即失败（不等满超时）。

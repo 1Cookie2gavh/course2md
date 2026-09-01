@@ -137,6 +137,14 @@ pub struct RunOpts {
     #[arg(long)]
     pub llm_prompt: Option<String>,
 
+    /// Enable vision-assisted polish (attach the section slide; model must support image input)
+    #[arg(long, conflicts_with = "no_llm_vision")]
+    pub llm_vision: bool,
+
+    /// Disable vision-assisted polish for this run
+    #[arg(long, conflicts_with = "llm_vision")]
+    pub no_llm_vision: bool,
+
     /// Suppress the end-of-run LLM hint (this run)
     #[arg(long)]
     pub no_llm_hint: bool,

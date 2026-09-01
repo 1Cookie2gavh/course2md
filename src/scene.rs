@@ -86,6 +86,15 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<(f6
         .spawn()
         .context("启动 ffmpeg 采样失败")?;
     let mut stdout = child.stdout.take().context("ffmpeg stdout")?;
+    // stderr 必须全程 drain：piped 而不读的话，写满 64KB 管道缓冲会死锁。
+    // 缓存尾部供失败诊断，debug 时逐行转发。
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    let mut stderr = child.stderr.take().context("ffmpeg stderr")?;
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let _ = stderr.read_to_end(&mut stderr_buf).await;
+        stderr_buf
+    });
     let frame_len = (tw as usize) * (th as usize);
     let mut buf = vec![0u8; frame_len];
     let pb = ProgressBar::new(total);
@@ -176,8 +185,18 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<(f6
     }
     pb.finish_and_clear();
     let status = child.wait().await?;
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
     if !status.success() {
-        anyhow::bail!("ffmpeg 采样进程异常退出（{status}）");
+        let tail = String::from_utf8_lossy(&stderr_bytes)
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!("ffmpeg 采样进程异常退出（{status}）：{tail}");
     }
     tracing::info!(slides = times.len(), frames = i, mode = %cfg.slide_mode, "ssim scan done");
     Ok(times)

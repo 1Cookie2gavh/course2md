@@ -35,6 +35,11 @@ pub struct Section {
     pub speech: Vec<TranscriptEvent>,
 }
 
+/// 段落组织：同一截图内相邻片段间隔超过此值则分段。
+const PARAGRAPH_GAP_SECS: f64 = 3.5;
+/// 段落组织：单段最大字符数（超过则强制分段）。
+const MAX_PARAGRAPH_CHARS: usize = 420;
+
 /// timeline.jsonl 的一行。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -45,8 +50,8 @@ pub enum TimelineEvent {
 
 /// 合并算法（见 docs/DESIGN.md §3.2）：
 /// 每条语音按中点归属「时间 ≤ 中点的最后一张截图」；首张之前的归首张。
-/// 跨越截图边界的语音段先按边界拆开（文本按时间比例近似分割），
-/// 避免整段被错误塞进后一张截图（图文错页）。
+/// 跨截图边界的语音只在边界附近找到句读/空格时才拆分（保持图文对应）；
+/// 找不到自然断点则整段保留——宁可晚一页，也不按字符比例从词中间截断。
 pub fn merge(
     frames: Vec<FrameEvent>,
     speech: Vec<TranscriptEvent>,
@@ -71,7 +76,7 @@ pub fn merge(
     }
     let boundaries: Vec<f64> = sections.iter().map(|s| s.t).collect();
     for ev in speech {
-        for piece in split_at_boundaries(ev, &boundaries) {
+        for piece in split_at_natural_boundaries(ev, &boundaries) {
             let mid = (piece.start + piece.end) / 2.0;
             let idx = match sections[..].binary_search_by(|s| s.t.partial_cmp(&mid).unwrap()) {
                 Ok(i) => i,
@@ -84,67 +89,152 @@ pub fn merge(
     sections
 }
 
-/// 把一条语音事件在截图边界处拆成多段；文本按时间比例在字符维度近似分割。
-fn split_at_boundaries(ev: TranscriptEvent, boundaries: &[f64]) -> Vec<TranscriptEvent> {
+/// 仅在边界附近找到句读或空格时才拆分文字。
+///
+/// 时间与字符位置没有可靠的一一映射：找不到自然断点时，宁可让整段留在
+/// 一张截图下，也不按比例从词中间截断；多边界事件只要有任一边界无法安全
+/// 切分，就完整保留，避免产生半自然的混合结果。
+fn split_at_natural_boundaries(event: TranscriptEvent, boundaries: &[f64]) -> Vec<TranscriptEvent> {
     let inner: Vec<f64> = boundaries
         .iter()
         .copied()
-        .filter(|&b| b > ev.start + 0.3 && b < ev.end - 0.3)
+        .filter(|&b| b > event.start + 0.3 && b < event.end - 0.3)
         .collect();
     if inner.is_empty() {
-        return vec![ev];
+        return vec![event];
     }
-    let mut points = vec![ev.start];
-    points.extend(inner);
-    points.push(ev.end);
-    let total = ev.end - ev.start;
-    let chars: Vec<char> = ev.text.chars().collect();
-    let total_chars = chars.len();
-    // 累计端点法：每段末字符位置 = 按时间比例的累计进度（最后一段固定取到末尾），
-    // 数学上保证拆分后字符总数守恒（不丢字、不重复）。
+
+    let points = std::iter::once(event.start)
+        .chain(inner)
+        .chain(std::iter::once(event.end))
+        .collect::<Vec<_>>();
+    let chars: Vec<char> = event.text.chars().collect();
+    let total = event.end - event.start;
     let mut char_pos = 0usize;
+    let mut cut_positions = Vec::with_capacity(points.len() - 1);
+
+    for (index, window) in points.windows(2).enumerate() {
+        let end_char = if index + 2 == points.len() {
+            chars.len()
+        } else {
+            let ideal = (chars.len() as f64 * ((window[1] - event.start) / total)).round() as usize;
+            match snap_to_natural_break(&chars, ideal, char_pos + 1, chars.len()) {
+                Some(p) => p,
+                // 任一边界找不到自然断点：整段保留
+                None => return vec![event],
+            }
+        };
+        cut_positions.push(end_char);
+        char_pos = end_char;
+    }
+
+    let mut start_char = 0usize;
     points
         .windows(2)
-        .enumerate()
-        .map(|(i, w)| {
-            let (s, e) = (w[0], w[1]);
-            let end_char = if i + 2 == points.len() {
-                total_chars
-            } else {
-                let cumulative = ((e - ev.start) / total).clamp(0.0, 1.0);
-                let ideal = (total_chars as f64 * cumulative).round() as usize;
-                // 比例切点吸附到最近的标点/空格，避免词中切断（如「绝无句|尾吞字」）
-                snap_to_punct(&chars, ideal, char_pos + 1, total_chars)
-            };
-            let text: String = chars[char_pos..end_char].iter().collect();
-            char_pos = end_char;
+        .zip(cut_positions)
+        .map(|(window, end_char)| {
+            let text: String = chars[start_char..end_char].iter().collect();
+            start_char = end_char;
             TranscriptEvent {
-                start: s,
-                end: e,
+                start: window[0],
+                end: window[1],
                 text,
-                raw: ev.raw.clone(),
+                raw: event.raw.clone(),
             }
         })
         .collect()
 }
 
-/// 在 ideal 附近（±WINDOW 字符）找最近的句读/空格作为切点，切点落在标点之后；
-/// 找不到回落 ideal（受 lo/hi 约束保持单调与字符守恒）。
-fn snap_to_punct(chars: &[char], ideal: usize, lo: usize, hi: usize) -> usize {
+/// 在理想切点附近（±WINDOW 字符）找最近的句读或空格，切点落在标点之后。
+fn snap_to_natural_break(chars: &[char], ideal: usize, lo: usize, hi: usize) -> Option<usize> {
     const WINDOW: i32 = 6;
-    const PUNCT: &str = "。！？；：，、,.!?;: ";
-    for off in 0..=WINDOW {
-        for cand in [ideal as i32 - off, ideal as i32 + off] {
-            if cand < lo as i32 || cand > hi as i32 {
+    const BREAKS: &str = "。！？；：，、,.!?;: ";
+    for offset in 0..=WINDOW {
+        for candidate in [ideal as i32 - offset, ideal as i32 + offset] {
+            if candidate < lo as i32 || candidate > hi as i32 {
                 continue;
             }
-            let idx = cand as usize;
-            if idx >= 1 && idx <= chars.len() && PUNCT.contains(chars[idx - 1]) {
-                return idx;
+            let index = candidate as usize;
+            if index >= 1 && index <= chars.len() && BREAKS.contains(chars[index - 1]) {
+                return Some(index);
             }
         }
     }
-    ideal.clamp(lo, hi)
+    None
+}
+
+/// 将同一截图下连续的 ASR 片段组织为可阅读的段落。
+///
+/// 只作用于供渲染与可选 LLM 校对使用的 Section；调用方应在此之前把细粒度
+/// ASR 事件写入 timeline.jsonl，保留原始时间线与可追溯性。
+/// 独立的无语义填充词不单独成段；嵌在有效语句中的文本不会被删除。
+pub fn coalesce_sections(sections: &mut [Section]) {
+    for section in sections {
+        let mut paragraphs: Vec<TranscriptEvent> = Vec::new();
+        let mut current: Option<TranscriptEvent> = None;
+
+        for event in std::mem::take(&mut section.speech) {
+            let text = event.text.trim();
+            if text.is_empty() || is_standalone_filler(text) {
+                continue;
+            }
+
+            let should_break = current.as_ref().is_some_and(|paragraph| {
+                event.start - paragraph.end > PARAGRAPH_GAP_SECS
+                    || paragraph.text.chars().count() + text.chars().count() > MAX_PARAGRAPH_CHARS
+            });
+            if should_break {
+                paragraphs.push(current.take().expect("paragraph exists when breaking"));
+            }
+
+            match current.as_mut() {
+                Some(paragraph) => {
+                    append_text(&mut paragraph.text, text);
+                    paragraph.end = event.end;
+                }
+                None => {
+                    current = Some(TranscriptEvent {
+                        start: event.start,
+                        end: event.end,
+                        text: text.to_string(),
+                        raw: None,
+                    });
+                }
+            }
+        }
+        if let Some(paragraph) = current {
+            paragraphs.push(paragraph);
+        }
+        section.speech = paragraphs;
+    }
+}
+
+/// 拼接两段文本：双方都以字母/数字结尾/开头时补一个空格（英文词边界），
+/// 中文等直接相连。
+fn append_text(paragraph: &mut String, next: &str) {
+    let previous_is_word = paragraph
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    let next_is_word = next
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    if previous_is_word && next_is_word {
+        paragraph.push(' ');
+    }
+    paragraph.push_str(next);
+}
+
+/// 独立成条的纯语气词（剥掉标点后整条只剩这些字）。
+fn is_standalone_filler(text: &str) -> bool {
+    let normalized = text.trim_matches(|c: char| {
+        c.is_whitespace() || "，。！？、,.!?：:；;“”‘’'\"（）()【】[]".contains(c)
+    });
+    matches!(
+        normalized,
+        "嗯" | "呃" | "额" | "啊" | "哦" | "唔" | "唉" | "诶" | "噢"
+    )
 }
 
 pub fn write_jsonl(path: &Path, frames: &[FrameEvent], speech: &[TranscriptEvent]) -> Result<()> {
@@ -208,45 +298,61 @@ mod tests {
     }
 
     #[test]
-    fn merge_assigns_by_midpoint() {
+    fn merge_uses_natural_breaks_or_keeps_complete_speech() {
         let frames = vec![frame(0.0), frame(60.0), frame(120.0)];
         let speech = vec![sp(10.0, 20.0), sp(50.0, 70.0), sp(5.0, 8.0)];
         let s = merge(frames, speech, 120.0);
-        // sp(50,70) 跨越 60s 边界：拆成 (50,60)->slide0 与 (60,70)->slide1
-        assert_eq!(s[0].speech.len(), 3); // mid=15 + mid=6.5 + 拆分前半
-        assert_eq!(s[1].speech.len(), 1); // 拆分后半
-        // 拆分后的时间正确
-        assert!((s[0].speech[1].end - 60.0).abs() < 1e-6);
-        assert!((s[1].speech[0].start - 60.0).abs() < 1e-6);
+        // sp(50,70) 文本无句读：整段保留，按中点归属 slide1（不从词中间截断）
+        assert_eq!(s[0].speech.len(), 2);
+        assert_eq!(s[1].speech.len(), 1);
+        assert_eq!(s[1].speech[0].text, "50-70");
+        assert_eq!(s[1].speech[0].start, 50.0);
+        assert_eq!(s[1].speech[0].end, 70.0);
         assert!(merge(vec![], vec![sp(1.0, 2.0)], 10.0).is_empty());
     }
 
     #[test]
-    fn boundary_split_proportional_text() {
+    fn merge_splits_at_punctuation_near_boundary() {
+        let frames = vec![frame(0.0), frame(5.0)];
+        let speech = vec![TranscriptEvent {
+            start: 0.0,
+            end: 10.0,
+            text: "前半句，后半句。".into(),
+            raw: None,
+        }];
+        let s = merge(frames, speech, 10.0);
+        // 边界 5s 附近有句读「，」：安全拆分，图文对应
+        assert_eq!(s[0].speech.len(), 1);
+        assert_eq!(s[1].speech.len(), 1);
+        assert_eq!(s[0].speech[0].text, "前半句，");
+        assert_eq!(s[1].speech[0].text, "后半句。");
+    }
+
+    #[test]
+    fn no_punctuation_means_keep_whole() {
+        // 无句读文本：无论多少边界，整段保留（不按比例词中截断）
         let ev = TranscriptEvent {
             start: 0.0,
             end: 10.0,
-            text: "一二三四五六七八九十".into(), // 10 chars
+            text: "一二三四五六七八九十".into(),
             raw: None,
         };
-        let parts = split_at_boundaries(ev, &[5.0]);
-        assert_eq!(parts.len(), 2);
-        let c0 = parts[0].text.chars().count();
-        let c1 = parts[1].text.chars().count();
-        assert_eq!(c0 + c1, 10);
-        assert_eq!(c0, 5); // 50/50 时长 → 一半字符
-        // 边界太靠近端点（<0.3s）不拆
+        let parts = split_at_natural_boundaries(ev.clone(), &[5.0]);
+        assert_eq!(parts.len(), 1, "无句读不切分");
+        assert_eq!(parts[0].text, ev.text);
+
+        // 边界太靠近端点（<0.3s）也不拆
         let ev2 = TranscriptEvent {
             start: 0.0,
             end: 1.0,
             text: "abc".into(),
             raw: None,
         };
-        assert_eq!(split_at_boundaries(ev2, &[0.1]).len(), 1);
+        assert_eq!(split_at_natural_boundaries(ev2, &[0.1]).len(), 1);
     }
 
     #[test]
-    fn split_snaps_to_punctuation_near_proportional_point() {
+    fn split_snaps_to_nearest_punctuation() {
         // 比例切点 idx=5（「很」），最近的句读是 idx=3 的「，」→ 切在其后
         let ev = TranscriptEvent {
             start: 0.0,
@@ -254,23 +360,150 @@ mod tests {
             text: "你好，世界很好。再见".into(),
             raw: None,
         };
-        let parts = split_at_boundaries(ev.clone(), &[5.0]);
+        let parts = split_at_natural_boundaries(ev.clone(), &[5.0]);
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].text, "你好，");
         assert_eq!(parts[1].text, "世界很好。再见");
-        let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
-        assert_eq!(joined, ev.text);
 
-        // 英文：吸附到最近的空格，不再切在单词中间
+        // 英文：吸附到最近的空格，不切在单词中间
         let ev2 = TranscriptEvent {
             start: 0.0,
             end: 10.0,
             text: "compiler optimization lecture".into(),
             raw: None,
         };
-        let parts2 = split_at_boundaries(ev2, &[5.0]);
+        let parts2 = split_at_natural_boundaries(ev2, &[5.0]);
         assert_eq!(parts2[0].text, "compiler ");
         assert_eq!(parts2[1].text, "optimization lecture");
+    }
+
+    #[test]
+    fn multi_boundary_all_or_nothing() {
+        // 两个边界：一个有句读一个没有 → 整段保留
+        let ev = TranscriptEvent {
+            start: 0.0,
+            end: 30.0,
+            text: "零一，二三四五六七八九十".into(),
+            raw: None,
+        };
+        let parts = split_at_natural_boundaries(ev.clone(), &[10.0, 20.0]);
+        assert_eq!(parts.len(), 1, "任一边界无自然断点则整段保留：{parts:?}");
+        assert_eq!(parts[0].text, ev.text);
+    }
+
+    #[test]
+    fn coalesce_merges_fragments_into_paragraphs() {
+        let sections = vec![Section {
+            t: 0.0,
+            end: 30.0,
+            image: "f.jpg".into(),
+            speech: vec![
+                sp(0.0, 2.0),
+                sp(2.5, 4.0),   // 与上段间隔 0.5s：合并
+                sp(10.0, 12.0), // 间隔 6s > 3.5s：分段
+                sp(12.1, 14.0), // 合并
+            ],
+        }];
+        let mut sections = sections;
+        coalesce_sections(&mut sections);
+        assert_eq!(sections[0].speech.len(), 2, "两段");
+        assert_eq!(sections[0].speech[0].text, "0-2 2.5-4");
+        assert_eq!(sections[0].speech[1].text, "10-12 12.1-14");
+        assert!((sections[0].speech[0].start - 0.0).abs() < 1e-9);
+        assert!(
+            (sections[0].speech[0].end - 4.0).abs() < 1e-9,
+            "段落时间覆盖成员区间"
+        );
+    }
+
+    #[test]
+    fn coalesce_breaks_on_length_limit() {
+        let long_text = "字".repeat(300);
+        let speech = vec![
+            TranscriptEvent {
+                start: 0.0,
+                end: 2.0,
+                text: long_text.clone(),
+                raw: None,
+            },
+            TranscriptEvent {
+                start: 2.1,
+                end: 4.0,
+                text: long_text.clone(),
+                raw: None,
+            },
+        ];
+        let mut sections = vec![Section {
+            t: 0.0,
+            end: 10.0,
+            image: "f.jpg".into(),
+            speech,
+        }];
+        coalesce_sections(&mut sections);
+        assert_eq!(sections[0].speech.len(), 2, "600 字 > 420 上限：分两段");
+    }
+
+    #[test]
+    fn coalesce_drops_standalone_fillers_but_keeps_embedded() {
+        let speech = vec![
+            TranscriptEvent {
+                start: 0.0,
+                end: 1.0,
+                text: "嗯，".into(),
+                raw: None,
+            },
+            TranscriptEvent {
+                start: 1.1,
+                end: 2.0,
+                text: "啊".into(),
+                raw: None,
+            },
+            TranscriptEvent {
+                start: 2.1,
+                end: 4.0,
+                text: "我们今天讲啊这个问题".into(),
+                raw: None,
+            },
+        ];
+        let mut sections = vec![Section {
+            t: 0.0,
+            end: 10.0,
+            image: "f.jpg".into(),
+            speech,
+        }];
+        coalesce_sections(&mut sections);
+        assert_eq!(sections[0].speech.len(), 1, "独立语气词被过滤");
+        assert_eq!(
+            sections[0].speech[0].text, "我们今天讲啊这个问题",
+            "嵌在句中的「啊」保留"
+        );
+    }
+
+    #[test]
+    fn coalesce_joins_english_with_space() {
+        let speech = vec![
+            TranscriptEvent {
+                start: 0.0,
+                end: 2.0,
+                text: "hello world".into(),
+                raw: None,
+            },
+            TranscriptEvent {
+                start: 2.2,
+                end: 4.0,
+                text: "next sentence".into(),
+                raw: None,
+            },
+        ];
+        let mut sections = vec![Section {
+            t: 0.0,
+            end: 10.0,
+            image: "f.jpg".into(),
+            speech,
+        }];
+        coalesce_sections(&mut sections);
+        assert_eq!(sections[0].speech.len(), 1);
+        assert_eq!(sections[0].speech[0].text, "hello world next sentence");
     }
 
     #[test]
@@ -282,40 +515,5 @@ mod tests {
         // 时长未知（0）时退化为自身起点，不 panic 不产生负区间
         let s2 = merge(vec![frame(5.0)], vec![], 0.0);
         assert_eq!(s2[0].end, 5.0);
-    }
-
-    #[test]
-    fn split_never_loses_or_duplicates_chars() {
-        // 10 字符、3 等分：逐段 round 会得 3+3+3=9（丢字），累计端点法必须守恒
-        let ev = TranscriptEvent {
-            start: 0.0,
-            end: 30.0,
-            text: "零一二三四五六七八九".into(),
-            raw: None,
-        };
-        let parts = split_at_boundaries(ev.clone(), &[10.0, 20.0]);
-        assert_eq!(parts.len(), 3);
-        let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
-        assert_eq!(joined, ev.text, "拆分必须字符守恒");
-
-        // 不等分 + 非整比例
-        let ev2 = TranscriptEvent {
-            start: 0.0,
-            end: 10.0,
-            text: "零一二三四五六七八九".into(),
-            raw: None,
-        };
-        let cases: [&[f64]; 5] = [
-            &[3.0, 4.0],
-            &[1.7],
-            &[9.9],
-            &[0.1, 0.2, 9.8, 9.9],
-            &[5.0, 5.5, 6.0, 9.0],
-        ];
-        for bounds in cases {
-            let parts = split_at_boundaries(ev2.clone(), bounds);
-            let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
-            assert_eq!(joined, ev2.text, "bounds={bounds:?} 必须字符守恒");
-        }
     }
 }
