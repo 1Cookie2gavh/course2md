@@ -29,15 +29,11 @@ impl VideoMeta {
 
 /// 抓取元数据（不下载）。
 pub async fn fetch_meta(url: &str) -> Result<VideoMeta> {
-    let out = run(Command::new("yt-dlp").args([
-        "-J",
-        "--no-warnings",
-        "--no-playlist",
-    ])
-    .arg(url))
+    let out = run(Command::new("yt-dlp")
+        .args(["-J", "--no-warnings", "--no-playlist"])
+        .arg(url))
     .await?;
-    let meta: VideoMeta =
-        serde_json::from_str(&out).context("解析 yt-dlp 元数据 JSON 失败")?;
+    let meta: VideoMeta = serde_json::from_str(&out).context("解析 yt-dlp 元数据 JSON 失败")?;
     Ok(meta)
 }
 
@@ -124,4 +120,3 @@ async fn run_status(cmd: &mut Command) -> Result<()> {
     }
     Ok(())
 }
-

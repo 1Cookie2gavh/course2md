@@ -23,7 +23,11 @@ mod ffi {
             out_n: *mut c_int,
         ) -> c_int;
         pub fn c2m_free_doubles(p: *mut c_double);
-        pub fn c2m_asr_create(model: *const c_char, err: *mut c_char, err_len: usize) -> *mut std::ffi::c_void;
+        pub fn c2m_asr_create(
+            model: *const c_char,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> *mut std::ffi::c_void;
         pub fn c2m_asr_transcribe(
             handle: *mut std::ffi::c_void,
             wav_path: *const c_char,
@@ -133,21 +137,51 @@ fn prompt_model_choice() -> String {
     }
     use std::io::{BufRead, Write};
     let mut out = std::io::stderr();
-    let _ = writeln!(out, "
-=======================================================");
-    let _ = writeln!(out, "选择识别模型 / Select ASR Model (首次运行指引):
-");
-    let _ = writeln!(out, "  1) qwen3 (Qwen3-ASR) [★ 强烈推荐 / Strongly Recommended]");
-    let _ = writeln!(out, "     - 优势: 中文及中英文混合技术课程识别准确率最高，专有名词（如 NeoVim、");
-    let _ = writeln!(out, "             ChatGPT、Web Coding、Codex）识别极准，标点规范，绝无句尾漏字截断。");
-    let _ = writeln!(out, "     - 提示: macOS 上追求 1.7B 满血版请使用 --provider gpu (Metal 硬件加速，");
+    let _ = writeln!(
+        out,
+        "
+======================================================="
+    );
+    let _ = writeln!(
+        out,
+        "选择识别模型 / Select ASR Model (首次运行指引):
+"
+    );
+    let _ = writeln!(
+        out,
+        "  1) qwen3 (Qwen3-ASR) [★ 强烈推荐 / Strongly Recommended]"
+    );
+    let _ = writeln!(
+        out,
+        "     - 优势: 中文及中英文混合技术课程识别准确率最高，专有名词（如 NeoVim、"
+    );
+    let _ = writeln!(
+        out,
+        "             ChatGPT、Web Coding、Codex）识别极准，标点规范，绝无句尾漏字截断。"
+    );
+    let _ = writeln!(
+        out,
+        "     - 提示: macOS 上追求 1.7B 满血版请使用 --provider gpu (Metal 硬件加速，"
+    );
     let _ = writeln!(out, "             实测 3 分钟音频仅 13 秒完成，零漏句)。");
-    let _ = writeln!(out, "
-  2) whisper (Whisper Large-v3 Turbo)");
+    let _ = writeln!(
+        out,
+        "
+  2) whisper (Whisper Large-v3 Turbo)"
+    );
     let _ = writeln!(out, "     - 优势: 纯英文或非中文多语种识别能力优秀。");
-    let _ = writeln!(out, "     - 劣势: 中文课程标点缺失较多，语速快或长句末尾偶发吞句漏字，");
-    let _ = writeln!(out, "             技术术语易发生音近识别错误（如 Web Coding 识别为 vipcoding）。");
-    let _ = writeln!(out, "=======================================================");
+    let _ = writeln!(
+        out,
+        "     - 劣势: 中文课程标点缺失较多，语速快或长句末尾偶发吞句漏字，"
+    );
+    let _ = writeln!(
+        out,
+        "             技术术语易发生音近识别错误（如 Web Coding 识别为 vipcoding）。"
+    );
+    let _ = writeln!(
+        out,
+        "======================================================="
+    );
     let _ = write!(out, "输入序号并回车（默认 1）/ Enter choice [1]: ");
     let _ = out.flush();
     let mut line = String::new();
@@ -186,7 +220,12 @@ impl CoremlAsr {
         let path = CString::new(wav.to_string_lossy().as_bytes())?;
         let mut out = vec![0u8; 16 * 1024];
         let rc = unsafe {
-            ffi::c2m_asr_transcribe(self.handle, path.as_ptr(), out.as_mut_ptr() as *mut _, out.len())
+            ffi::c2m_asr_transcribe(
+                self.handle,
+                path.as_ptr(),
+                out.as_mut_ptr() as *mut _,
+                out.len(),
+            )
         };
         match rc {
             0 => {
@@ -233,7 +272,10 @@ pub fn run_coreml(
     ensure_metallib()?;
     tracing::info!(model, "loading CoreML ASR（首次使用会自动下载模型）");
     let asr = CoremlAsr::load(model).context("CoreML 模型加载失败")?;
-    tracing::info!(secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "coreml ready");
+    tracing::info!(
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "coreml ready"
+    );
 
     let pb = indicatif::ProgressBar::new(segs.len() as u64);
     pb.set_style(
@@ -274,6 +316,10 @@ pub fn run_coreml(
     // 事件统一来自 checkpoint（历史 + 本次），按时间排序
     let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
     all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    tracing::info!(n = all.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
+    tracing::info!(
+        n = all.len(),
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "asr done"
+    );
     Ok(all)
 }

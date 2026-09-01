@@ -105,7 +105,10 @@ async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
     }
     if dest.is_file() {
         // 校验不过的残留文件（截断/损坏）直接移除，避免"发现坏了却重下不了"
-        tracing::warn!(label, "existing file failed integrity check, re-downloading");
+        tracing::warn!(
+            label,
+            "existing file failed integrity check, re-downloading"
+        );
         let _ = fs::remove_file(dest);
         let _ = fs::remove_file(dest.with_extension("manifest.json"));
     }
@@ -150,9 +153,7 @@ async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
         // 完整性：以服务器 Content-Length 为准（而非"实际收到多少"——截断响应会伪装成功）
         if total > 0 && done != total {
             let _ = fs::remove_file(&tmp);
-            anyhow::bail!(
-                "下载不完整：期望 {total} 字节，实际收到 {done}（请重试）"
-            );
+            anyhow::bail!("下载不完整：期望 {total} 字节，实际收到 {done}（请重试）");
         }
         fs::rename(&tmp, &dest)?;
         // manifest 记录 authoritative Content-Length，供后续启动校验

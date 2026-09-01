@@ -5,7 +5,7 @@
 //! 关闭时每次任务结束打印开启提示（可用配置项或 `--no-llm-hint` 关闭）。
 
 use crate::timeline::TranscriptEvent;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::time::Duration;
@@ -156,11 +156,7 @@ pub fn parse_id_text_pairs(content: &str) -> Option<Vec<(usize, String)>> {
         let text = item.get("text")?.as_str()?.to_string();
         out.push((id, text));
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// 从模型输出中提取 JSON 字符串数组（容忍 ```json 围栏与前后杂文）。
@@ -239,9 +235,19 @@ pub fn setup_interactive(
             &cfg.llm.base_url,
         )
     });
-    cfg.llm.api_key = api_key
-        .unwrap_or_else(|| ask("API Key", &cfg.llm.api_key, if cfg.llm.api_key.is_empty() { "" } else { "已配置的 Key" }));
-    cfg.llm.model = model.unwrap_or_else(|| ask("模型名（如 deepseek-chat）", &cfg.llm.model, &cfg.llm.model));
+    cfg.llm.api_key = api_key.unwrap_or_else(|| {
+        ask(
+            "API Key",
+            &cfg.llm.api_key,
+            if cfg.llm.api_key.is_empty() {
+                ""
+            } else {
+                "已配置的 Key"
+            },
+        )
+    });
+    cfg.llm.model =
+        model.unwrap_or_else(|| ask("模型名（如 deepseek-chat）", &cfg.llm.model, &cfg.llm.model));
     // 容错：没写 scheme 时补 https://
     if !cfg.llm.base_url.is_empty() && !cfg.llm.base_url.contains("://") {
         cfg.llm.base_url = format!("https://{}", cfg.llm.base_url.trim());
@@ -254,16 +260,36 @@ pub fn setup_interactive(
 pub fn print_status(cfg: &crate::settings::ConfigFile) {
     let s = &cfg.llm;
     println!("配置文件：{}", crate::settings::config_path().display());
-    println!("  LLM 润色：{}", if s.enabled { "已开启" } else { "已关闭" });
-    println!("  base_url：{}", if s.base_url.is_empty() { "-" } else { &s.base_url });
+    println!(
+        "  LLM 润色：{}",
+        if s.enabled { "已开启" } else { "已关闭" }
+    );
+    println!(
+        "  base_url：{}",
+        if s.base_url.is_empty() {
+            "-"
+        } else {
+            &s.base_url
+        }
+    );
     let key_disp = if s.api_key.is_empty() {
         "-".to_string()
     } else {
         format!("{}...（已隐藏）", &s.api_key[..s.api_key.len().min(6)])
     };
     println!("  api_key ：{key_disp}");
-    println!("  model   ：{}", if s.model.is_empty() { "-" } else { &s.model });
-    println!("  结束提示：{}", if s.disable_hint { "已关闭" } else { "开启" });
+    println!(
+        "  model   ：{}",
+        if s.model.is_empty() { "-" } else { &s.model }
+    );
+    println!(
+        "  结束提示：{}",
+        if s.disable_hint {
+            "已关闭"
+        } else {
+            "开启"
+        }
+    );
     if !s.enabled && !s.disable_hint {
         println!("（运行 course2md llm setup 可开启）");
     }

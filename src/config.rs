@@ -75,8 +75,14 @@ impl Roi {
                 (v.round() as u32).min(h)
             }
         };
-        let (x1, x2) = (sx(self.x1).min(w.saturating_sub(1)), sx(self.x2).clamp(1, w));
-        let (y1, y2) = (sy(self.y1).min(h.saturating_sub(1)), sy(self.y2).clamp(1, h));
+        let (x1, x2) = (
+            sx(self.x1).min(w.saturating_sub(1)),
+            sx(self.x2).clamp(1, w),
+        );
+        let (y1, y2) = (
+            sy(self.y1).min(h.saturating_sub(1)),
+            sy(self.y2).clamp(1, h),
+        );
         (x1, y1, x2.max(x1 + 1), y2.max(y1 + 1))
     }
 }
@@ -155,6 +161,18 @@ pub fn cache_dir() -> PathBuf {
 pub fn model_dir_from(opt: Option<&Path>) -> PathBuf {
     opt.map(|p| p.to_path_buf())
         .unwrap_or_else(|| cache_dir().join("models"))
+}
+
+/// resume 三态解析：`--no-resume` > `--resume` > 配置文件 > 默认关闭。
+/// 两级 CLI flag 互斥（clap conflicts_with），不会同时为 true。
+pub fn resolve_resume(cli_resume: bool, cli_no_resume: bool, file_resume: Option<bool>) -> bool {
+    if cli_no_resume {
+        return false;
+    }
+    if cli_resume {
+        return true;
+    }
+    file_resume.unwrap_or(false)
 }
 
 /// 像 URL 或已存在的本地文件才当作输入；否则视为没传参数。
@@ -239,7 +257,8 @@ pub fn sanitize_component(s: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for c in s.chars() {
-        let bad = c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
+        let bad =
+            c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
         if bad || c.is_whitespace() {
             if !prev_dash && !out.is_empty() {
                 out.push('-');
@@ -266,7 +285,9 @@ mod tests {
     #[test]
     fn source_gate() {
         assert!(!looks_like_source("course2md"));
-        assert!(looks_like_source("https://www.bilibili.com/video/BV1pb8o6yE8f"));
+        assert!(looks_like_source(
+            "https://www.bilibili.com/video/BV1pb8o6yE8f"
+        ));
         assert!(looks_like_source("https://youtu.be/dQw4w9WgXcQ"));
     }
 
@@ -279,6 +300,19 @@ mod tests {
         assert_eq!(infer_slug("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
         let p = course_dir(Path::new("out"), "bilibili", "欢迎来到未来", "BV1pb8o6yE8f");
         assert_eq!(p, PathBuf::from("out/bilibili/欢迎来到未来/BV1pb8o6yE8f"));
+    }
+
+    #[test]
+    fn resume_priority() {
+        // --no-resume 压倒一切
+        assert!(!resolve_resume(true, true, Some(true)));
+        assert!(!resolve_resume(false, true, Some(true)));
+        // --resume 次之
+        assert!(resolve_resume(true, false, Some(false)));
+        // 都没传：回落配置文件
+        assert!(resolve_resume(false, false, Some(true)));
+        assert!(!resolve_resume(false, false, Some(false)));
+        assert!(!resolve_resume(false, false, None));
     }
 
     #[test]

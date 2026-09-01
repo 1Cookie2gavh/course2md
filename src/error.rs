@@ -39,4 +39,3 @@ fn which_sync(cmd: &str) -> Option<std::path::PathBuf> {
     }
     None
 }
-

@@ -144,7 +144,7 @@ pub struct RunOpts {
     pub resume: bool,
 
     /// Ignore existing checkpoints and redo everything
-    #[arg(long)]
+    #[arg(long, conflicts_with = "resume")]
     pub no_resume: bool,
 
     /// Errors only

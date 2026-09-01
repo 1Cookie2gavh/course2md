@@ -88,11 +88,19 @@ fn run_opts_to_cfg(
             .clone()
             .or_else(|| d.out.clone())
             .unwrap_or_else(|| "out".into()),
-        out_dir: opts.out.clone().or_else(|| d.out.clone()).unwrap_or_else(|| "out".into()),
+        out_dir: opts
+            .out
+            .clone()
+            .or_else(|| d.out.clone())
+            .unwrap_or_else(|| "out".into()),
         similarity: opts.similarity.or(d.similarity).unwrap_or(0.85),
         sample_interval: opts.sample_interval.or(d.sample_interval).unwrap_or(1.0),
         cooldown: opts.cooldown.or(d.cooldown).unwrap_or(10.0),
-        max_height: opts.max_height.or(d.max_height).unwrap_or(1080).clamp(240, 2160),
+        max_height: opts
+            .max_height
+            .or(d.max_height)
+            .unwrap_or(1080)
+            .clamp(240, 2160),
         slide_mode: match opts.slide_mode.clone() {
             Some(course2md::cli::SlideModeArg::First) => "first".into(),
             Some(course2md::cli::SlideModeArg::Stable) => "stable".into(),
@@ -102,7 +110,11 @@ fn run_opts_to_cfg(
                 .unwrap_or_else(|| "stable".into())
                 .to_ascii_lowercase(),
         },
-        stable_secs: opts.stable_secs.or(d.stable_secs).unwrap_or(0.8).clamp(0.0, 10.0),
+        stable_secs: opts
+            .stable_secs
+            .or(d.stable_secs)
+            .unwrap_or(0.8)
+            .clamp(0.0, 10.0),
         roi: match &opts.roi {
             Some(s) => Some(config::Roi::parse(s)?),
             None => match &d.roi {
@@ -128,14 +140,10 @@ fn run_opts_to_cfg(
             .clone()
             .or_else(|| d.formats.clone())
             .unwrap_or_else(|| vec!["md".into(), "html".into()]),
-        model_dir: config::model_dir_from(
-            opts.model_dir
-                .as_deref()
-                .or(d.model_dir.as_deref()),
-        ),
+        model_dir: config::model_dir_from(opts.model_dir.as_deref().or(d.model_dir.as_deref())),
         keep_video: opts.keep_video || d.keep_video.unwrap_or(false),
         no_download: opts.no_download || d.no_download.unwrap_or(false),
-        resume: opts.resume || d.resume.unwrap_or(false),
+        resume: config::resolve_resume(opts.resume, opts.no_resume, d.resume),
         llm: resolve_llm(opts, file),
         asr_api: resolve_asr_api(opts, file),
         asr_model: opts.asr_model.clone().or_else(|| d.asr_model.clone()),

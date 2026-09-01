@@ -77,11 +77,15 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
         {
             let wav = wav.to_path_buf();
             let max_speech = cfg.max_speech as f64;
-            let model = crate::apple::resolve_model(cfg.asr_model.as_deref().filter(|s| !s.trim().is_empty()));
+            let model = crate::apple::resolve_model(
+                cfg.asr_model.as_deref().filter(|s| !s.trim().is_empty()),
+            );
             let joined = tokio::task::spawn_blocking(move || {
-                let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
+                let tmp =
+                    std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
                 let _ = std::fs::create_dir_all(&tmp);
-                let res = crate::apple::run_coreml(&wav, max_speech, &model, cut_wav, &tmp, &mut cp);
+                let res =
+                    crate::apple::run_coreml(&wav, max_speech, &model, cut_wav, &tmp, &mut cp);
                 if res.is_ok() {
                     cp.finish();
                 }
@@ -152,7 +156,10 @@ fn run_blocking(
         let _ = child.kill();
         return Err(e);
     }
-    tracing::info!(secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "server ready");
+    tracing::info!(
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "server ready"
+    );
 
     let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
@@ -203,7 +210,11 @@ fn run_blocking(
     // 事件统一来自 checkpoint（历史 + 本次），按时间排序
     let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
     all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    tracing::info!(n = all.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
+    tracing::info!(
+        n = all.len(),
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "asr done"
+    );
     Ok(all)
 }
 
@@ -224,7 +235,10 @@ fn run_api(
             .filter(|k| !k.trim().is_empty())
             .context("云端 STT 未配置 API Key：在配置文件 [asr_api] 设置 api_key，或用 --asr-api-key / OPENROUTER_API_KEY")?
     };
-    let api = crate::settings::AsrApi { api_key, ..api.clone() };
+    let api = crate::settings::AsrApi {
+        api_key,
+        ..api.clone()
+    };
     let api = &api;
     let segs = ffmpeg_vad(wav, max_speech as f32)?;
     tracing::info!(segs = segs.len(), endpoint = %api.base_url, model = %api.model, "api vad");
@@ -260,7 +274,11 @@ fn run_api(
     // 断点续跑：预计算每个 chunk 是否已完成（worker 线程不能借用 cp）
     let skip: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> = segs
         .iter()
-        .map(|s| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cp.is_done(s.start, s.end))))
+        .map(|s| {
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                cp.is_done(s.start, s.end),
+            ))
+        })
         .collect();
 
     // 有界并发（默认 4）：网络往返是主要瓶颈；结果按下标保序
@@ -283,21 +301,31 @@ fn run_api(
                 wav_path.clone(),
                 skip.clone(),
             );
-            std::thread::spawn(move || loop {
-                if abort.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if i >= segs.len() {
-                    break;
-                }
-                let seg = segs[i];
-                if skip[i].load(std::sync::atomic::Ordering::Relaxed) {
-                    continue; // 断点续跑（主线程预计算）
-                }
-                let r = transcribe_api(&client, &url, &model, &key, &tmp.join(format!("c{i:04}.wav")), seg, &wav_path);
-                if tx.send((i, r)).is_err() {
-                    break;
+            std::thread::spawn(move || {
+                loop {
+                    if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if i >= segs.len() {
+                        break;
+                    }
+                    let seg = segs[i];
+                    if skip[i].load(std::sync::atomic::Ordering::Relaxed) {
+                        continue; // 断点续跑（主线程预计算）
+                    }
+                    let r = transcribe_api(
+                        &client,
+                        &url,
+                        &model,
+                        &key,
+                        &tmp.join(format!("c{i:04}.wav")),
+                        seg,
+                        &wav_path,
+                    );
+                    if tx.send((i, r)).is_err() {
+                        break;
+                    }
                 }
             })
         })
@@ -335,7 +363,11 @@ fn run_api(
     let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
     all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
     let events = all;
-    tracing::info!(n = events.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
+    tracing::info!(
+        n = events.len(),
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "asr done"
+    );
     Ok(events)
 }
 
@@ -363,10 +395,12 @@ fn transcribe_api(
         .set("Authorization", &format!("Bearer {key}"))
         .send_json(body)
         .map_err(|e| format!("请求失败: {e}"))?;
-    let v: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| format!("响应解析失败: {e}"))?;
-    if let Some(e) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+    let v: serde_json::Value = resp.into_json().map_err(|e| format!("响应解析失败: {e}"))?;
+    if let Some(e) = v
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+    {
         return Err(format!("API 报错: {e}"));
     }
     let text = v["text"].as_str().unwrap_or("").trim().to_string();
@@ -431,7 +465,11 @@ fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
         if t0.elapsed() > timeout {
             anyhow::bail!("llama-server 启动超时");
         }
-        if ureq::get(&url).timeout(Duration::from_secs(2)).call().is_ok() {
+        if ureq::get(&url)
+            .timeout(Duration::from_secs(2))
+            .call()
+            .is_ok()
+        {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(300));
@@ -471,10 +509,7 @@ fn transcribe_file(base: &str, wav: &Path) -> Result<String> {
 
 pub(crate) fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<Seg>> {
     let out = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-i",
-        ])
+        .args(["-hide_banner", "-i"])
         .arg(wav)
         .args(["-af", "silencedetect=noise=-28dB:d=0.4", "-f", "null", "-"])
         .output()
@@ -483,7 +518,12 @@ pub(crate) fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<Seg>> {
         anyhow::bail!(
             "ffmpeg silencedetect 失败（{}）：{}",
             out.status,
-            String::from_utf8_lossy(&out.stderr).lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ")
         );
     }
     let log = String::from_utf8_lossy(&out.stderr);
@@ -494,7 +534,12 @@ pub(crate) fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<Seg>> {
         if let Some(v) = line.split("silence_start:").nth(1) {
             start = v.trim().parse().ok();
         } else if let Some(v) = line.split("silence_end:").nth(1) {
-            let end: f64 = v.split_whitespace().next().unwrap_or("").parse().unwrap_or(0.0);
+            let end: f64 = v
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .parse()
+                .unwrap_or(0.0);
             if let Some(s) = start.take() {
                 silences.push((s, end));
             }
@@ -522,8 +567,8 @@ impl Energy {
     pub fn load(wav: &Path) -> Result<Self> {
         // 直接解析 16k 单声道 s16 wav（extract_audio 的固定产物）
         let data = std::fs::read(wav).with_context(|| format!("读取音频失败 {}", wav.display()))?;
-        let (body, _) = find_pcm_body(&data)
-            .ok_or_else(|| anyhow::anyhow!("无法解析 wav PCM 数据"))?;
+        let (body, _) =
+            find_pcm_body(&data).ok_or_else(|| anyhow::anyhow!("无法解析 wav PCM 数据"))?;
         let mut samples = Vec::with_capacity(body.len() / 2);
         for c in body.as_chunks::<2>().0 {
             samples.push(i16::from_le_bytes(*c));
@@ -531,7 +576,11 @@ impl Energy {
         const HOP: usize = 1600; // 100ms @16k
         let mut rms = Vec::with_capacity(samples.len() / HOP + 1);
         for ch in samples.chunks(HOP) {
-            let s: f64 = ch.iter().map(|&v| (v as f64 / 32768.0).powi(2)).sum::<f64>() / ch.len() as f64;
+            let s: f64 = ch
+                .iter()
+                .map(|&v| (v as f64 / 32768.0).powi(2))
+                .sum::<f64>()
+                / ch.len() as f64;
             rms.push((s.sqrt()) as f32);
         }
         Ok(Self { hop: 0.1, rms })
@@ -565,12 +614,16 @@ fn find_pcm_body(data: &[u8]) -> Option<(&[u8], u32)> {
     let mut rate = 0;
     while pos + 8 <= data.len() {
         let id = &data[pos..pos + 4];
-        let size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]) as usize;
+        let size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+            as usize;
         match id {
             b"fmt " => {
                 if pos + 8 + 16 <= data.len() {
                     rate = u32::from_le_bytes([
-                        data[pos + 12], data[pos + 13], data[pos + 14], data[pos + 15],
+                        data[pos + 12],
+                        data[pos + 13],
+                        data[pos + 14],
+                        data[pos + 15],
                     ]);
                 }
             }
@@ -672,7 +725,9 @@ fn split_smart(s: f64, e: f64, max: f64, energy: Option<&Energy>, out: &mut Vec<
     // ASR 后端常有上下文长度限制）
     let w0 = (target - SPLIT_WINDOW).max(s + MIN_PIECE.min(max / 2.0));
     let w1 = target;
-    let cut = energy.and_then(|en| en.quietest(w0.max(s), w1)).unwrap_or(target);
+    let cut = energy
+        .and_then(|en| en.quietest(w0.max(s), w1))
+        .unwrap_or(target);
     let cut = cut.clamp(s + 0.5, target);
     out.push((s, cut));
     split_smart(cut, e, max, energy, out);
@@ -692,8 +747,6 @@ fn invert_silence(dur: f64, sil: &[(f64, f64)]) -> Vec<(f64, f64)> {
     }
     out
 }
-
-
 
 pub fn cut_wav(src: &Path, start: f64, end: f64, dest: &Path) -> Result<()> {
     let dur = (end - start).max(0.05);

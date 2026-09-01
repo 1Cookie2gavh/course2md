@@ -67,8 +67,8 @@ pub fn load() -> anyhow::Result<ConfigFile> {
     if !p.is_file() {
         return Ok(ConfigFile::default());
     }
-    let s = std::fs::read_to_string(&p)
-        .with_context(|| format!("无法读取配置文件 {}", p.display()))?;
+    let s =
+        std::fs::read_to_string(&p).with_context(|| format!("无法读取配置文件 {}", p.display()))?;
     toml::from_str(&s).with_context(|| {
         format!(
             "配置文件解析失败（修正后重试；本次不回退默认值）：{}",
@@ -154,26 +154,87 @@ enabled = false
 /// 打印生效配置（CLI 覆盖合并前，来自文件的值）。
 pub fn print_effective(cfg: &ConfigFile) {
     let d = &cfg.defaults;
-    println!("{}: {}", crate::i18n::tr("Config file", "配置文件"), config_path().display());
+    println!(
+        "{}: {}",
+        crate::i18n::tr("Config file", "配置文件"),
+        config_path().display()
+    );
     println!("[defaults]");
     let s = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
-    println!("  out            : {}", d.out.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "out".into()));
-    println!("  similarity     : {}", d.similarity.map(|v| v.to_string()).unwrap_or_else(|| "0.85".into()));
-    println!("  sample_interval: {}", d.sample_interval.map(|v| v.to_string()).unwrap_or_else(|| "1.0".into()));
-    println!("  cooldown       : {}", d.cooldown.map(|v| v.to_string()).unwrap_or_else(|| "10.0".into()));
+    println!(
+        "  out            : {}",
+        d.out
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "out".into())
+    );
+    println!(
+        "  similarity     : {}",
+        d.similarity
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "0.85".into())
+    );
+    println!(
+        "  sample_interval: {}",
+        d.sample_interval
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "1.0".into())
+    );
+    println!(
+        "  cooldown       : {}",
+        d.cooldown
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "10.0".into())
+    );
     println!("  roi            : {}", s(&d.roi));
-    println!("  threads        : {}", d.threads.map(|v| v.to_string()).unwrap_or_else(|| "4".into()));
+    println!(
+        "  threads        : {}",
+        d.threads
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "4".into())
+    );
     println!("  provider       : {}", s(&d.provider));
     println!("  asr_model      : {}", s(&d.asr_model));
-    println!("  max_speech     : {}", d.max_speech.map(|v| v.to_string()).unwrap_or_else(|| "20.0".into()));
-    println!("  formats        : {}", d.formats.clone().map(|f| f.join(",")).unwrap_or_else(|| "md,html".into()));
-    println!("  model_dir      : {}", d.model_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(内置缓存目录)".into()));
+    println!(
+        "  max_speech     : {}",
+        d.max_speech
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "20.0".into())
+    );
+    println!(
+        "  formats        : {}",
+        d.formats
+            .clone()
+            .map(|f| f.join(","))
+            .unwrap_or_else(|| "md,html".into())
+    );
+    println!(
+        "  model_dir      : {}",
+        d.model_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(内置缓存目录)".into())
+    );
     println!("  keep_video     : {}", d.keep_video.unwrap_or(false));
     println!("[asr_api]");
     println!("  base_url       : {}", cfg.asr_api.base_url);
     println!("  model          : {}", cfg.asr_api.model);
-    println!("  api_key        : {}", if cfg.asr_api.api_key.is_empty() { "-" } else { "(已配置)" });
+    println!(
+        "  api_key        : {}",
+        if cfg.asr_api.api_key.is_empty() {
+            "-"
+        } else {
+            "(已配置)"
+        }
+    );
     println!("[llm]");
     println!("  enabled        : {}", cfg.llm.enabled);
-    println!("  model          : {}", if cfg.llm.model.is_empty() { "-" } else { &cfg.llm.model });
+    println!(
+        "  model          : {}",
+        if cfg.llm.model.is_empty() {
+            "-"
+        } else {
+            &cfg.llm.model
+        }
+    );
 }

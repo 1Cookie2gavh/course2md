@@ -117,12 +117,14 @@ pub async fn write_outputs(
                     .await?;
             }
             "html" => {
-                tokio::fs::write(out_dir.join("course.html"), render_html(meta, sections))
-                    .await?;
+                tokio::fs::write(out_dir.join("course.html"), render_html(meta, sections)).await?;
             }
             "json" => {
-                tokio::fs::write(out_dir.join("structured.json"), render_json(meta, sections)?)
-                    .await?;
+                tokio::fs::write(
+                    out_dir.join("structured.json"),
+                    render_json(meta, sections)?,
+                )
+                .await?;
             }
             other => anyhow::bail!("未知输出格式 {other:?}（可选 md/html/json）"),
         }
@@ -147,7 +149,10 @@ mod tests {
         };
         assert_eq!(fmt_ts(65.4), "01:05");
         assert_eq!(fmt_ts(3725.0), "1:02:05");
-        assert_eq!(ts_url(&m, 61.9), "https://www.bilibili.com/video/BV1xx?t=61");
+        assert_eq!(
+            ts_url(&m, 61.9),
+            "https://www.bilibili.com/video/BV1xx?t=61"
+        );
         let s = [Section {
             t: 10.0,
             image: "frames/slide_0001.jpg".into(),

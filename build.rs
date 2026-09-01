@@ -29,7 +29,9 @@ fn main() {
     // 增量：Package.swift 或源码变动才重建（swift build 自身也会增量）。
     let stamp = build_dir.join("libCAppleASR.a");
     if !stamp.is_file() {
-        let ok = run(Command::new("swift").args(["build", "-c", "release"]).current_dir(&pkg));
+        let ok = run(Command::new("swift")
+            .args(["build", "-c", "release"])
+            .current_dir(&pkg));
         if !ok {
             println!(
                 "cargo:warning=swift build 失败（见上方输出），跳过 Apple 原生模块；coreml 后端不可用"
@@ -44,21 +46,52 @@ fn main() {
     println!("cargo:rustc-link-lib=static=CAppleASR");
     // 框架（对象内嵌 autolink 提示，这里显式列出关键项以保证链接顺序）
     for fw in [
-        "Foundation", "CoreML", "Metal", "Accelerate", "CoreFoundation",
-        "AVFoundation", "AVFAudio", "AppKit", "CoreAudio", "CryptoKit",
-        "NaturalLanguage", "Network", "Security", "CoreGraphics",
+        "Foundation",
+        "CoreML",
+        "Metal",
+        "Accelerate",
+        "CoreFoundation",
+        "AVFoundation",
+        "AVFAudio",
+        "AppKit",
+        "CoreAudio",
+        "CryptoKit",
+        "NaturalLanguage",
+        "Network",
+        "Security",
+        "CoreGraphics",
     ] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }
     // Swift 运行时 overlay（/usr/lib/swift，macOS 15+ 系统自带）
     println!("cargo:rustc-link-search=native=/usr/lib/swift");
     for dylib in [
-        "swiftCore", "swift_Concurrency", "swift_Builtin_float", "swift_errno",
-        "swiftAccelerate", "swiftAVFoundation", "swiftCoreAudio", "swiftCoreFoundation",
-        "swiftCoreImage", "swiftCoreMIDI", "swiftDarwin", "swiftDispatch", "swiftIOKit",
-        "swiftMetal", "swiftNaturalLanguage", "swiftObjectiveC", "swiftObservation",
-        "swiftos", "swiftOSLog", "swiftQuartzCore", "swiftRegexBuilder", "swiftsimd",
-        "swiftSpatial", "swift_StringProcessing", "swiftUniformTypeIdentifiers", "swiftXPC",
+        "swiftCore",
+        "swift_Concurrency",
+        "swift_Builtin_float",
+        "swift_errno",
+        "swiftAccelerate",
+        "swiftAVFoundation",
+        "swiftCoreAudio",
+        "swiftCoreFoundation",
+        "swiftCoreImage",
+        "swiftCoreMIDI",
+        "swiftDarwin",
+        "swiftDispatch",
+        "swiftIOKit",
+        "swiftMetal",
+        "swiftNaturalLanguage",
+        "swiftObjectiveC",
+        "swiftObservation",
+        "swiftos",
+        "swiftOSLog",
+        "swiftQuartzCore",
+        "swiftRegexBuilder",
+        "swiftsimd",
+        "swiftSpatial",
+        "swift_StringProcessing",
+        "swiftUniformTypeIdentifiers",
+        "swiftXPC",
     ] {
         println!("cargo:rustc-link-lib=dylib={dylib}");
     }
@@ -81,11 +114,17 @@ fn main() {
             let exe_dir = PathBuf::from(out_dir).join("../../../");
             let dest = exe_dir.join("mlx.metallib");
             if std::fs::copy(&bundle, &dest).is_err() {
-                println!("cargo:warning=无法复制 mlx.metallib 到 {}", exe_dir.display());
+                println!(
+                    "cargo:warning=无法复制 mlx.metallib 到 {}",
+                    exe_dir.display()
+                );
             }
         }
     } else {
-        println!("cargo:warning=未找到 mlx.metallib（{}），CoreML 推理可能失败", bundle.display());
+        println!(
+            "cargo:warning=未找到 mlx.metallib（{}），CoreML 推理可能失败",
+            bundle.display()
+        );
     }
     // Swift 5 语言模式包的兼容钩子 + clang 运行时（___isPlatformVersionAtLeast 等）
     if let Some(swift_lib) = toolchain_swift_lib_dir() {
@@ -130,7 +169,10 @@ fn find_clang_rt_osx() -> Option<(PathBuf, PathBuf)> {
             collect_a_files(&e.path().join("usr/lib/clang"), &mut candidates);
         }
     }
-    collect_a_files(&PathBuf::from(&devdir).join("usr/lib/clang"), &mut candidates);
+    collect_a_files(
+        &PathBuf::from(&devdir).join("usr/lib/clang"),
+        &mut candidates,
+    );
     for p in candidates {
         let is_it = p.to_string_lossy().contains("darwin")
             && p.file_name().and_then(|s| s.to_str()) == Some("libclang_rt.osx.a");
@@ -155,7 +197,6 @@ fn collect_a_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-
 fn swiftc_available() -> bool {
     Command::new("xcrun")
         .args(["--find", "swift"])
@@ -173,8 +214,22 @@ fn run(cmd: &mut Command) -> bool {
                 println!(
                     "cargo:warning=swift build 退出码 {:?}（stdout 尾部）:\n{}\n（stderr 尾部）:\n{}",
                     out.status.code(),
-                    so.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
-                    se.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
+                    so.lines()
+                        .rev()
+                        .take(40)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    se.lines()
+                        .rev()
+                        .take(40)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                 );
             }
             out.status.success()
@@ -185,4 +240,3 @@ fn run(cmd: &mut Command) -> bool {
         }
     }
 }
-

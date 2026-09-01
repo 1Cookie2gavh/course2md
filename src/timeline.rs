@@ -113,7 +113,6 @@ fn split_at_boundaries(ev: TranscriptEvent, boundaries: &[f64]) -> Vec<Transcrip
         .collect()
 }
 
-
 pub fn write_jsonl(path: &Path, frames: &[FrameEvent], speech: &[TranscriptEvent]) -> Result<()> {
     use std::io::Write;
     let mut events: Vec<TimelineEvent> = vec![];
@@ -194,7 +193,12 @@ mod tests {
         assert_eq!(c0 + c1, 10);
         assert_eq!(c0, 5); // 50/50 时长 → 一半字符
         // 边界太靠近端点（<0.3s）不拆
-        let ev2 = TranscriptEvent { start: 0.0, end: 1.0, text: "abc".into(), raw: None };
+        let ev2 = TranscriptEvent {
+            start: 0.0,
+            end: 1.0,
+            text: "abc".into(),
+            raw: None,
+        };
         assert_eq!(split_at_boundaries(ev2, &[0.1]).len(), 1);
     }
 

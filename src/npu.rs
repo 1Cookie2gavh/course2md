@@ -143,7 +143,9 @@ server.serve_forever()
 pub fn resolve_npu_model(raw: Option<&str>) -> String {
     let s = raw.unwrap_or("").trim().to_ascii_lowercase();
     match s.as_str() {
-        "whisper" | "turbo" | "whisper-turbo" | "large" => "OpenVINO/whisper-large-v3-turbo-int8-ov".into(),
+        "whisper" | "turbo" | "whisper-turbo" | "large" => {
+            "OpenVINO/whisper-large-v3-turbo-int8-ov".into()
+        }
         "tiny" | "whisper-tiny" => "OpenVINO/whisper-tiny-fp16-ov".into(),
         "base" | "whisper-base" => "OpenVINO/whisper-base-fp16-ov".into(),
         "small" | "whisper-small" => "OpenVINO/whisper-small-fp16-ov".into(),
@@ -180,7 +182,10 @@ pub fn run_npu(
         let _ = child.kill();
         return Err(e).context("Intel NPU 服务启动超时（首次模型编译可能需要更多时间）");
     }
-    tracing::info!(secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "npu ready");
+    tracing::info!(
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "npu ready"
+    );
 
     let tmp = std::env::temp_dir().join(format!("course2md-npu-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
@@ -217,7 +222,10 @@ pub fn run_npu(
             "path": chunk.to_string_lossy(),
         });
 
-        match client.post(&format!("{base}/audio/transcriptions")).send_json(req_body) {
+        match client
+            .post(&format!("{base}/audio/transcriptions"))
+            .send_json(req_body)
+        {
             Ok(resp) => {
                 let v: serde_json::Value = resp.into_json()?;
                 let text = v["text"].as_str().unwrap_or("").trim().to_string();
@@ -240,11 +248,16 @@ pub fn run_npu(
 
     pb.finish_and_clear();
     // 优雅通知 worker 退出，并终止整个进程组（避免 uv 衍生的孙子进程残留）
-    let _ = client.post(&format!("{base}/shutdown")).timeout(Duration::from_millis(500)).send_json(serde_json::json!({}));
+    let _ = client
+        .post(&format!("{base}/shutdown"))
+        .timeout(Duration::from_millis(500))
+        .send_json(serde_json::json!({}));
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
-        unsafe { libc::kill(-pid, libc::SIGTERM); }
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+        }
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -256,7 +269,11 @@ pub fn run_npu(
 
     let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
     all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    tracing::info!(n = all.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "npu asr done");
+    tracing::info!(
+        n = all.len(),
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "npu asr done"
+    );
     Ok(all)
 }
 
@@ -315,7 +332,11 @@ fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
         if t0.elapsed() > timeout {
             anyhow::bail!("NPU worker 启动超时");
         }
-        if ureq::get(&url).timeout(Duration::from_secs(2)).call().is_ok() {
+        if ureq::get(&url)
+            .timeout(Duration::from_secs(2))
+            .call()
+            .is_ok()
+        {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(300));
