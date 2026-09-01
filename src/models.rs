@@ -14,7 +14,21 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const HF_GGUF: &str = "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/main";
+const HF_REPO_PATH: &str = "ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/main";
+
+/// Hugging Face 端点：尊重 HF_ENDPOINT 镜像（与 CoreML 路径行为一致）。
+/// 此前 GGUF 下载硬编码 huggingface.co，网络受限环境（如 Windows 直连
+/// 失败）设置镜像也无效（issue #2）。
+fn hf_base(endpoint: Option<String>) -> String {
+    endpoint
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://huggingface.co".into())
+}
+
+fn current_hf_endpoint() -> Option<String> {
+    std::env::var("HF_ENDPOINT").ok()
+}
 
 #[derive(Debug, Clone)]
 pub struct LlamaAsr {
@@ -82,14 +96,16 @@ pub async fn ensure_llama_or_download(root: &Path) -> Result<LlamaAsr> {
 pub async fn download_models(root: &Path) -> Result<()> {
     fs::create_dir_all(root)?;
     let p = llama_paths(root);
+    let base = hf_base(current_hf_endpoint());
+    tracing::info!(endpoint = %base, "huggingface endpoint");
     download_file(
-        &format!("{HF_GGUF}/Qwen3-ASR-1.7B-Q8_0.gguf"),
+        &format!("{base}/{HF_REPO_PATH}/Qwen3-ASR-1.7B-Q8_0.gguf"),
         &p.model,
         "Qwen3-ASR-1.7B-Q8_0.gguf",
     )
     .await?;
     download_file(
-        &format!("{HF_GGUF}/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"),
+        &format!("{base}/{HF_REPO_PATH}/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"),
         &p.mmproj,
         "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
     )
@@ -183,4 +199,24 @@ pub fn list_models(root: &Path) {
         if p.mmproj.is_file() { "OK" } else { "缺" },
         p.mmproj.display()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hf_endpoint_mirror_is_honored() {
+        assert_eq!(hf_base(None), "https://huggingface.co");
+        assert_eq!(
+            hf_base(Some("https://hf-mirror.com".into())),
+            "https://hf-mirror.com"
+        );
+        // 尾部斜杠归一；空白视为未设置
+        assert_eq!(
+            hf_base(Some("https://hf-mirror.com/".into())),
+            "https://hf-mirror.com"
+        );
+        assert_eq!(hf_base(Some("  ".into())), "https://huggingface.co");
+    }
 }
