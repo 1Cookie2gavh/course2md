@@ -70,7 +70,7 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
     for (id, help) in [
         ("source", "视频链接或本地文件"),
         ("out", "输出根目录（其下按 平台/标题/编号 归类）"),
-        ("similarity", "画面变化阈值，越低截图越多"),
+        ("similarity", "画面相似度阈值，越高越敏感（截图更多）"),
         ("sample_interval", "每隔几秒检查一次画面"),
         ("cooldown", "新截图之后至少间隔多少秒"),
         ("roi", "只比较画面中的区域，如 40%,0%-100%,100%"),

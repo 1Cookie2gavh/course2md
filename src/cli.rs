@@ -35,7 +35,7 @@ pub struct RunOpts {
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
-    /// Frame-similarity threshold; lower = more screenshots
+    /// Frame-similarity threshold; higher = more sensitive = more screenshots
     #[arg(long)]
     pub similarity: Option<f64>,
 

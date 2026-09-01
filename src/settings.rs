@@ -102,7 +102,7 @@ pub const TEMPLATE: &str = r#"# course2md 配置文件
 [defaults]
 # 输出根目录（其下按 平台/标题/编号 归类）
 #out = "out"
-# SSIM 画面相似度阈值，越低截图越多
+# SSIM 画面相似度阈值，越高越敏感、截图越多
 #similarity = 0.85
 # 每隔几秒检查一次画面
 #sample_interval = 1.0
@@ -121,7 +121,7 @@ pub const TEMPLATE: &str = r#"# course2md 配置文件
 #provider = "gpu"
 
 # 识别模型推荐 (各个后端通用)：
-# - qwen3 (强烈推荐): Qwen3-ASR 1.7B，中文及技术课程首选，专有名词准，标点规范，绝无句尾吞字
+# - qwen3 (默认推荐): Qwen3-ASR 1.7B，中文及中英混合技术课程整体更好，标点较完整
 # - whisper: Whisper Large-v3 Turbo，适合纯英文或多语种视频
 #asr_model = "qwen3"
 # 转写来源：auto = 平台字幕优先（人工>自动），无字幕再走本地 ASR；
