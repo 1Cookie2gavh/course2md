@@ -15,12 +15,13 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     let t_total = Instant::now();
     crate::error::require_cmd("ffmpeg")?;
     crate::error::require_cmd("ffprobe")?;
-    if !cfg.provider.eq_ignore_ascii_case("coreml")
-        && !cfg.provider.eq_ignore_ascii_case("api")
-        && !cfg.provider.eq_ignore_ascii_case("npu")
-    {
+    use config::AsrProvider;
+    if !matches!(
+        cfg.provider,
+        AsrProvider::Coreml | AsrProvider::Api | AsrProvider::Npu
+    ) {
         crate::error::require_cmd("llama-server")?;
-    } else if cfg.provider.eq_ignore_ascii_case("coreml")
+    } else if cfg.provider == AsrProvider::Coreml
         && crate::error::require_cmd("llama-server").is_err()
     {
         // fallback 是 best-effort：提前告知而不是失败后才发现
@@ -213,13 +214,7 @@ fn print_summary(
     eprintln!();
     eprintln!("{}:", crate::i18n::tr("Documents", "文稿"));
     for f in &cfg.formats {
-        let name = match f.as_str() {
-            "md" => "course.md",
-            "html" => "course.html",
-            "json" => "structured.json",
-            other => other,
-        };
-        let p = out.join(name);
+        let p = out.join(f.output_name());
         if p.is_file() {
             eprintln!("  {}", p.display());
         }

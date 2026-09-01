@@ -13,16 +13,16 @@ pub struct Defaults {
     pub similarity: Option<f64>,
     pub sample_interval: Option<f64>,
     pub cooldown: Option<f64>,
-    pub slide_mode: Option<String>,
+    pub slide_mode: Option<crate::config::SlideMode>,
     pub stable_secs: Option<f64>,
     pub max_height: Option<u32>,
     pub roi: Option<String>,
     pub threads: Option<i32>,
-    pub provider: Option<String>,
+    pub provider: Option<crate::config::AsrProvider>,
     /// coreml 后端的模型：qwen3 | whisper（首次使用可交互选择）
     pub asr_model: Option<String>,
     pub max_speech: Option<f32>,
-    pub formats: Option<Vec<String>>,
+    pub formats: Option<Vec<crate::config::OutputFormat>>,
     pub model_dir: Option<PathBuf>,
     pub keep_video: Option<bool>,
     pub no_download: Option<bool>,
@@ -193,7 +193,13 @@ pub fn print_effective(cfg: &ConfigFile) {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "4".into())
     );
-    println!("  provider       : {}", s(&d.provider));
+    println!(
+        "  provider       : {}",
+        d.provider
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "(按平台自动)".into())
+    );
+    println!("  slide_mode     : {}", d.slide_mode.unwrap_or_default());
     println!("  asr_model      : {}", s(&d.asr_model));
     println!(
         "  max_speech     : {}",
@@ -205,7 +211,11 @@ pub fn print_effective(cfg: &ConfigFile) {
         "  formats        : {}",
         d.formats
             .clone()
-            .map(|f| f.join(","))
+            .map(|f| f
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(","))
             .unwrap_or_else(|| "md,html".into())
     );
     println!(

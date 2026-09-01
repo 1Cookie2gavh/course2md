@@ -23,16 +23,17 @@ fn init_logging(verbose: u8, quiet: bool) {
 /// - macOS Apple Silicon: 优先 coreml
 /// - Linux: 若存在 Intel NPU (/dev/accel/accel0) 且未安装 llama-server，优先 npu
 /// - 其余平台/配置: gpu (llama.cpp)
-fn default_provider() -> String {
+fn default_provider() -> course2md::config::AsrProvider {
+    use course2md::config::AsrProvider;
     if cfg!(apple_native) {
-        "coreml".into()
+        AsrProvider::Coreml
     } else if cfg!(target_os = "linux")
         && std::path::Path::new("/dev/accel/accel0").exists()
         && course2md::error::require_cmd("llama-server").is_err()
     {
-        "npu".into()
+        AsrProvider::Npu
     } else {
-        "gpu".into()
+        AsrProvider::Gpu
     }
 }
 
@@ -69,18 +70,7 @@ fn run_opts_to_cfg(
     file: &settings::ConfigFile,
 ) -> anyhow::Result<config::PipelineConfig> {
     let d = &file.defaults;
-    if let Some(p) = &d.provider {
-        anyhow::ensure!(
-            matches!(p.as_str(), "coreml" | "gpu" | "cpu" | "api"),
-            "配置文件 provider 无效：{p:?}（可选 coreml/gpu/cpu/api）"
-        );
-    }
-    if let Some(m) = &d.slide_mode {
-        anyhow::ensure!(
-            matches!(m.as_str(), "first" | "stable"),
-            "配置文件 slide_mode 无效：{m:?}（可选 first/stable）"
-        );
-    }
+    use config::{OutputFormat, SlideMode};
     Ok(config::PipelineConfig {
         url: source,
         out_root: opts
@@ -101,15 +91,10 @@ fn run_opts_to_cfg(
             .or(d.max_height)
             .unwrap_or(1080)
             .clamp(240, 2160),
-        slide_mode: match opts.slide_mode.clone() {
-            Some(course2md::cli::SlideModeArg::First) => "first".into(),
-            Some(course2md::cli::SlideModeArg::Stable) => "stable".into(),
-            None => d
-                .slide_mode
-                .clone()
-                .unwrap_or_else(|| "stable".into())
-                .to_ascii_lowercase(),
-        },
+        slide_mode: opts
+            .slide_mode
+            .or(d.slide_mode)
+            .unwrap_or(SlideMode::Stable),
         stable_secs: opts
             .stable_secs
             .or(d.stable_secs)
@@ -123,23 +108,16 @@ fn run_opts_to_cfg(
             },
         },
         threads: opts.threads.or(d.threads).unwrap_or(4),
-        provider: match opts.provider.clone() {
-            Some(p) => match p {
-                course2md::cli::ProviderArg::Coreml => "coreml",
-                course2md::cli::ProviderArg::Gpu => "gpu",
-                course2md::cli::ProviderArg::Cpu => "cpu",
-                course2md::cli::ProviderArg::Api => "api",
-                course2md::cli::ProviderArg::Npu => "npu",
-            }
-            .to_string(),
-            None => d.provider.clone().unwrap_or_else(default_provider),
-        },
+        provider: opts
+            .provider
+            .or(d.provider)
+            .unwrap_or_else(default_provider),
         max_speech: opts.max_speech.or(d.max_speech).unwrap_or(20.0),
         formats: opts
             .formats
             .clone()
             .or_else(|| d.formats.clone())
-            .unwrap_or_else(|| vec!["md".into(), "html".into()]),
+            .unwrap_or_else(|| vec![OutputFormat::Md, OutputFormat::Html]),
         model_dir: config::model_dir_from(opts.model_dir.as_deref().or(d.model_dir.as_deref())),
         keep_video: opts.keep_video || d.keep_video.unwrap_or(false),
         no_download: opts.no_download || d.no_download.unwrap_or(false),

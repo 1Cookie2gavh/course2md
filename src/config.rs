@@ -1,4 +1,82 @@
+use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+/// ASR 后端。typed enum 取代散落各处的字符串比较（`eq_ignore_ascii_case`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AsrProvider {
+    Coreml,
+    Gpu,
+    Cpu,
+    Npu,
+    Api,
+}
+
+impl AsrProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Coreml => "coreml",
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+            Self::Npu => "npu",
+            Self::Api => "api",
+        }
+    }
+}
+
+impl fmt::Display for AsrProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 截图发射模式：first（首个不同帧）| stable（等待画面稳定，适合动画课件）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlideMode {
+    First,
+    #[default]
+    Stable,
+}
+
+impl fmt::Display for SlideMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::First => "first",
+            Self::Stable => "stable",
+        })
+    }
+}
+
+/// 输出格式。非法值在配置解析期即报错，不再拖到渲染阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    Md,
+    Html,
+    Json,
+}
+
+impl OutputFormat {
+    pub fn output_name(&self) -> &'static str {
+        match self {
+            Self::Md => "course.md",
+            Self::Html => "course.html",
+            Self::Json => "structured.json",
+        }
+    }
+}
+
+impl fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Md => "md",
+            Self::Html => "html",
+            Self::Json => "json",
+        })
+    }
+}
 
 /// 运行期管线配置（由 CLI 参数归一而来）。
 #[derive(Debug, Clone)]
@@ -11,14 +89,14 @@ pub struct PipelineConfig {
     /// 下载视频的高度上限（默认 1080；讲义截图质量优先）
     pub max_height: u32,
     /// 截图发射模式：first（首个不同帧）| stable（等待画面稳定，适合动画课件）
-    pub slide_mode: String,
+    pub slide_mode: SlideMode,
     /// stable 模式下画面需保持不变的秒数
     pub stable_secs: f64,
     pub roi: Option<Roi>,
     pub threads: i32,
-    pub provider: String,
+    pub provider: AsrProvider,
     pub max_speech: f32,
-    pub formats: Vec<String>,
+    pub formats: Vec<OutputFormat>,
     pub model_dir: PathBuf,
     pub keep_video: bool,
     pub no_download: bool,

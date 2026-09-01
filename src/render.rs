@@ -108,25 +108,24 @@ pub async fn write_outputs(
     out_dir: &Path,
     meta: &VideoMeta,
     sections: &[Section],
-    formats: &[String],
+    formats: &[crate::config::OutputFormat],
 ) -> Result<()> {
     for f in formats {
-        match f.as_str() {
-            "md" => {
+        match f {
+            crate::config::OutputFormat::Md => {
                 tokio::fs::write(out_dir.join("course.md"), render_markdown(meta, sections))
                     .await?;
             }
-            "html" => {
+            crate::config::OutputFormat::Html => {
                 tokio::fs::write(out_dir.join("course.html"), render_html(meta, sections)).await?;
             }
-            "json" => {
+            crate::config::OutputFormat::Json => {
                 tokio::fs::write(
                     out_dir.join("structured.json"),
                     render_json(meta, sections)?,
                 )
                 .await?;
             }
-            other => anyhow::bail!("未知输出格式 {other:?}（可选 md/html/json）"),
         }
     }
     Ok(())

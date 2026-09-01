@@ -101,7 +101,7 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<(f6
     //   last_emitted  已输出的视觉状态
     //   candidate     正在观察的候选画面（含首次出现时间，用于真实时间戳）
     // 发射条件：候选与上一输出差异显著 + 稳定时长足够 + 距上次发射 >= cooldown。
-    let stable_for = if cfg.slide_mode == "stable" {
+    let stable_for = if matches!(cfg.slide_mode, crate::config::SlideMode::Stable) {
         cfg.stable_secs
     } else {
         0.0

@@ -246,7 +246,7 @@ pub fn run_npu(
             libc::kill(-pid, libc::SIGTERM);
         }
     }
-    let _ = child.kill();
+    child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&tmp);
 
@@ -270,6 +270,42 @@ fn write_worker_script(out_dir: &Path) -> Result<PathBuf> {
     let p = dir.join("npu_worker.py");
     std::fs::write(&p, NPU_WORKER_SCRIPT)?;
     Ok(p)
+}
+
+fn spawn_npu_worker(script: &Path, model: &str, port: u16) -> Result<crate::runtime::ManagedChild> {
+    // 优先使用 uv（自动处理隔离环境与依赖），若无则回退系统 python3
+    let mut cmd = if crate::runtime::which("uv").is_some() {
+        let mut c = Command::new("uv");
+        c.args([
+            "run",
+            "--with",
+            "openvino-genai",
+            "--with",
+            "huggingface_hub",
+            "--with",
+            "numpy",
+            "python",
+        ]);
+        c
+    } else if crate::runtime::which("python3").is_some() {
+        Command::new("python3")
+    } else {
+        anyhow::bail!("未找到 uv 或 python3，无法启动 Intel NPU 识别后端。请先安装 uv 或 python3");
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.arg(script)
+        .arg(model)
+        .arg(port.to_string())
+        .arg("NPU")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+
+    crate::runtime::ManagedChild::spawn("NPU worker", &mut cmd)
 }
 
 #[cfg(test)]
@@ -318,40 +354,4 @@ mod tests {
             "org/custom-model"
         );
     }
-}
-
-fn spawn_npu_worker(script: &Path, model: &str, port: u16) -> Result<crate::runtime::ManagedChild> {
-    // 优先使用 uv（自动处理隔离环境与依赖），若无则回退系统 python3
-    let mut cmd = if crate::runtime::which("uv").is_some() {
-        let mut c = Command::new("uv");
-        c.args([
-            "run",
-            "--with",
-            "openvino-genai",
-            "--with",
-            "huggingface_hub",
-            "--with",
-            "numpy",
-            "python",
-        ]);
-        c
-    } else if crate::runtime::which("python3").is_some() {
-        Command::new("python3")
-    } else {
-        anyhow::bail!("未找到 uv 或 python3，无法启动 Intel NPU 识别后端。请先安装 uv 或 python3");
-    };
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    cmd.arg(script)
-        .arg(model)
-        .arg(port.to_string())
-        .arg("NPU")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-
-    crate::runtime::ManagedChild::spawn("NPU worker", &mut cmd)
 }

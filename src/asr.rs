@@ -41,10 +41,10 @@ pub fn sanitize_qwen_text(s: &str) -> String {
 
 pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<TranscriptEvent>> {
     use crate::checkpoint::{AsrIdentity, Checkpoint};
-    let provider = cfg.provider.to_ascii_lowercase();
+    use crate::config::AsrProvider;
     let open = |id: &AsrIdentity| Checkpoint::open(&cfg.out_dir, cfg.resume, id);
 
-    if provider == "api" {
+    if cfg.provider == AsrProvider::Api {
         let id = AsrIdentity::new("api", &cfg.asr_api.model, cfg.max_speech);
         let mut cp = open(&id)?;
         let api = cfg.asr_api.clone();
@@ -61,7 +61,7 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
         .context("ASR 线程 join 失败")?;
         return joined;
     }
-    if provider == "npu" {
+    if cfg.provider == AsrProvider::Npu {
         let model = crate::npu::resolve_npu_model(cfg.asr_model.as_deref());
         let id = AsrIdentity::new("npu", &model, cfg.max_speech);
         let mut cp = open(&id)?;
@@ -79,7 +79,7 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
         .context("ASR 线程 join 失败")?;
         return joined;
     }
-    if provider == "coreml" {
+    if cfg.provider == AsrProvider::Coreml {
         #[cfg(apple_native)]
         {
             let wav = wav.to_path_buf();
@@ -113,7 +113,12 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
             );
         }
     }
-    let ngl = if provider == "cpu" { 0 } else { 99 };
+    // 剩余 Gpu/Cpu 走 llama-server（Metal/CUDA/Vulkan/CPU）
+    let ngl = if cfg.provider == AsrProvider::Cpu {
+        0
+    } else {
+        99
+    };
     let threads = cfg.threads;
     let max_speech = cfg.max_speech;
     let llama = crate::models::ensure_llama_or_download(&cfg.model_dir).await?;
@@ -205,7 +210,7 @@ fn run_blocking(
         pb.inc(1);
     }
     pb.finish_and_clear();
-    let _ = child.kill();
+    child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&tmp);
     if let Some(e) = err {
