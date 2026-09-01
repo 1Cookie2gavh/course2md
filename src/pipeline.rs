@@ -115,19 +115,71 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         dest
     };
 
-    tracing::info!("extract slides and audio");
-    let audio_path = cfg.audio_path();
-    let (frames_res, audio_res) = tokio::join!(
-        scene::run(&cfg, &media),
-        media::extract_audio(&media, &audio_path)
-    );
-    let frames = frames_res?;
-    audio_res?;
-    anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
-    // ASR 可能合法返回空（静音课件）；由后续正常渲染成"无语音"讲义
+    // —— 转写来源：平台字幕优先（人工 > 自动），无字幕再走本地 ASR ——
+    // 有字幕时完全不抽音频、不加载模型（issue #1）
+    let subtitle: Option<(Vec<timeline::TranscriptEvent>, &'static str)> = match cfg
+        .transcript_source
+    {
+        config::TranscriptSource::Asr => None,
+        _ => {
+            let fetched = if is_local {
+                fetch::sidecar_subtitle(local)
+            } else {
+                tracing::info!("probe platform subtitles");
+                fetch::fetch_subtitle(&cfg.url, &cfg.out_dir)
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            match fetched {
+                Some(f) => {
+                    let content = std::fs::read_to_string(&f.path)
+                        .with_context(|| format!("读取字幕 {}", f.path.display()))?;
+                    let events = crate::subtitle::parse_subtitle(&content);
+                    if events.is_empty() {
+                        tracing::warn!(path = %f.path.display(), "字幕解析为空，回落 ASR");
+                        None
+                    } else {
+                        let source: &'static str = if f.auto { "auto-caption" } else { "subtitle" };
+                        tracing::info!(
+                            events = events.len(),
+                            source,
+                            path = %f.path.display(),
+                            "subtitle transcript"
+                        );
+                        Some((events, source))
+                    }
+                }
+                None => None,
+            }
+        }
+    };
+    if cfg.transcript_source == config::TranscriptSource::Subtitle && subtitle.is_none() {
+        anyhow::bail!(
+            "--transcript-source subtitle：未获取到字幕（平台未提供人工/自动字幕，本地输入无同名 .srt/.vtt）"
+        );
+    }
 
-    tracing::info!(device = %cfg.provider, "transcribe");
-    let events = asr::run(&cfg, &cfg.audio_path()).await?;
+    let transcript_source_used = subtitle.as_ref().map_or("asr", |(_, s)| *s);
+    let (frames, events) = if let Some((events, _source)) = subtitle {
+        // 字幕路径：只跑场景检测，跳过音频与 ASR
+        let frames = scene::run(&cfg, &media).await?;
+        (frames, events)
+    } else {
+        tracing::info!("extract slides and audio");
+        let audio_path = cfg.audio_path();
+        let (frames_res, audio_res) = tokio::join!(
+            scene::run(&cfg, &media),
+            media::extract_audio(&media, &audio_path)
+        );
+        let frames = frames_res?;
+        audio_res?;
+        tracing::info!(device = %cfg.provider, "transcribe");
+        let events = asr::run(&cfg, &cfg.audio_path()).await?;
+        (frames, events)
+    };
+    anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
+    // 转写可能合法返回空（静音课件）；由后续正常渲染成"无语音"讲义
 
     // 可选的 LLM 润色（配置已在管线开头校验）
     let events = if cfg.llm.enabled {
@@ -172,6 +224,40 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         is_local,
         media_deleted,
     );
+
+    // run.json：本次运行溯源（版本/源/转写来源/后端/模型/统计/耗时）。
+    // 「这份文稿到底是什么模型跑的」从此可查；issue 报告请附上此文件。
+    let speech_n: usize = sections.iter().map(|s| s.speech.len()).sum();
+    let chars: usize = sections
+        .iter()
+        .flat_map(|s| s.speech.iter())
+        .map(|e| e.text.chars().count())
+        .sum();
+    let run_info = serde_json::json!({
+        "course2md_version": env!("CARGO_PKG_VERSION"),
+        "source": {
+            "kind": if is_local { "local" } else { "remote" },
+            "platform": platform,
+            "id": id,
+            "url": cfg.url,
+        },
+        "provider": cfg.provider.as_str(),
+        "transcript_source": transcript_source_used,
+        "asr_model": cfg.asr_model.clone().unwrap_or_else(|| "backend-default".into()),
+        "resume": cfg.resume,
+        "formats": cfg.formats.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+        "llm_polish": cfg.llm.enabled,
+        "sections": sections.len(),
+        "speech_segments": speech_n,
+        "chars": chars,
+        "elapsed_secs": (stats.elapsed_secs * 100.0).round() / 100.0,
+    });
+    if let Err(e) = crate::checkpoint::atomic_write(
+        &cfg.out_dir.join("run.json"),
+        serde_json::to_string_pretty(&run_info)?.as_bytes(),
+    ) {
+        tracing::warn!("写 run.json 失败（不影响其他产物）：{e:#}");
+    }
     Ok(())
 }
 

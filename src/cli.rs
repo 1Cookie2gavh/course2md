@@ -87,6 +87,10 @@ pub struct RunOpts {
     #[arg(long)]
     pub asr_api_model: Option<String>,
 
+    /// Transcript source: auto (subtitle first, then ASR) | subtitle | asr
+    #[arg(long, value_enum)]
+    pub transcript_source: Option<crate::config::TranscriptSource>,
+
     /// Max seconds per speech segment (longer segments are split)
     #[arg(long)]
     pub max_speech: Option<f32>,

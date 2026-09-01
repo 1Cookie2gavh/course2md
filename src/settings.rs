@@ -21,6 +21,8 @@ pub struct Defaults {
     pub provider: Option<crate::config::AsrProvider>,
     /// coreml 后端的模型：qwen3 | whisper（首次使用可交互选择）
     pub asr_model: Option<String>,
+    /// 转写来源：auto（字幕优先）| subtitle | asr
+    pub transcript_source: Option<crate::config::TranscriptSource>,
     pub max_speech: Option<f32>,
     pub formats: Option<Vec<crate::config::OutputFormat>>,
     pub model_dir: Option<PathBuf>,
@@ -122,6 +124,9 @@ pub const TEMPLATE: &str = r#"# course2md 配置文件
 # - qwen3 (强烈推荐): Qwen3-ASR 1.7B，中文及技术课程首选，专有名词准，标点规范，绝无句尾吞字
 # - whisper: Whisper Large-v3 Turbo，适合纯英文或多语种视频
 #asr_model = "qwen3"
+# 转写来源：auto = 平台字幕优先（人工>自动），无字幕再走本地 ASR；
+# subtitle = 强制字幕（无字幕报错）；asr = 跳过字幕直接识别
+#transcript_source = "auto"
 
 # 单段语音最长秒数（过长会切分，自动在静音低能量点切分并外补 0.25s 静音 padding）
 #max_speech = 20.0

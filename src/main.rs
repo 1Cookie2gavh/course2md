@@ -109,6 +109,10 @@ fn run_opts_to_cfg(
         llm: resolve_llm(opts, file),
         asr_api: resolve_asr_api(opts, file),
         asr_model: opts.asr_model.clone().or_else(|| d.asr_model.clone()),
+        transcript_source: opts
+            .transcript_source
+            .or(d.transcript_source)
+            .unwrap_or_default(),
     })
 }
 

@@ -50,6 +50,19 @@ impl fmt::Display for SlideMode {
     }
 }
 
+/// 转写来源策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptSource {
+    /// 字幕优先：平台人工字幕 > 平台自动字幕 > 本地 ASR
+    #[default]
+    Auto,
+    /// 强制字幕：获取不到即报错（远程走 yt-dlp，本地查同名 .srt/.vtt）
+    Subtitle,
+    /// 强制本地 ASR（不查询平台字幕）
+    Asr,
+}
+
 /// 输出格式。非法值在配置解析期即报错，不再拖到渲染阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -107,6 +120,8 @@ pub struct PipelineConfig {
     pub llm: crate::llm::LlmSettings,
     /// 云端 STT（provider=api；已合并 CLI 覆盖）
     pub asr_api: crate::settings::AsrApi,
+    /// 转写来源：字幕优先 / 强制字幕 / 强制 ASR
+    pub transcript_source: TranscriptSource,
     /// coreml 后端模型选择：qwen3 | whisper
     pub asr_model: Option<String>,
     /// `-o` 根目录，实际课程目录是 `{out_root}/{platform}/{title}/{id}/`
@@ -564,6 +579,7 @@ mod tests {
             llm: Default::default(),
             asr_api: Default::default(),
             asr_model: None,
+            transcript_source: TranscriptSource::Auto,
         }
     }
 
