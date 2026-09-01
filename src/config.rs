@@ -389,6 +389,20 @@ pub fn resolve_resume(cli_resume: bool, cli_no_resume: bool, file_resume: Option
     file_resume.unwrap_or(false)
 }
 
+/// 平台默认后端提示（doctor 展示与 main 实际选择保持同一逻辑）。
+pub fn default_provider_hint() -> AsrProvider {
+    if cfg!(apple_native) {
+        AsrProvider::Coreml
+    } else if cfg!(target_os = "linux")
+        && Path::new("/dev/accel/accel0").exists()
+        && crate::error::require_cmd("llama-server").is_err()
+    {
+        AsrProvider::Npu
+    } else {
+        AsrProvider::Gpu
+    }
+}
+
 /// 像 URL 或已存在的本地文件才当作输入；否则视为没传参数。
 pub fn looks_like_source(s: &str) -> bool {
     let p = Path::new(s);

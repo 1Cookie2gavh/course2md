@@ -1,6 +1,6 @@
 use clap::FromArgMatches;
 use course2md::cli::{Cli, Command, ConfigCmd, LlmCmd, ModelsCmd, RunOpts};
-use course2md::{config, llm, models, pipeline, settings};
+use course2md::{config, doctor, llm, models, pipeline, settings};
 use tracing_subscriber::EnvFilter;
 
 fn init_logging(verbose: u8, quiet: bool) {
@@ -17,24 +17,6 @@ fn init_logging(verbose: u8, quiet: bool) {
         .with_target(verbose >= 2)
         .compact()
         .init();
-}
-
-/// 默认识别后端：
-/// - macOS Apple Silicon: 优先 coreml
-/// - Linux: 若存在 Intel NPU (/dev/accel/accel0) 且未安装 llama-server，优先 npu
-/// - 其余平台/配置: gpu (llama.cpp)
-fn default_provider() -> course2md::config::AsrProvider {
-    use course2md::config::AsrProvider;
-    if cfg!(apple_native) {
-        AsrProvider::Coreml
-    } else if cfg!(target_os = "linux")
-        && std::path::Path::new("/dev/accel/accel0").exists()
-        && course2md::error::require_cmd("llama-server").is_err()
-    {
-        AsrProvider::Npu
-    } else {
-        AsrProvider::Gpu
-    }
 }
 
 /// 配置文件 + CLI 覆盖 -> 生效 LLM 设置。
@@ -113,7 +95,7 @@ fn run_opts_to_cfg(
         provider: opts
             .provider
             .or(d.provider)
-            .unwrap_or_else(default_provider),
+            .unwrap_or_else(config::default_provider_hint),
         max_speech: opts.max_speech.or(d.max_speech).unwrap_or(20.0),
         formats: opts
             .formats
@@ -202,6 +184,10 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             Ok(())
+        }
+        Some(Command::Doctor) => {
+            init_logging(0, false);
+            doctor::run()
         }
         Some(Command::Config { cmd }) => {
             init_logging(0, false);

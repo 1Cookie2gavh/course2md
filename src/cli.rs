@@ -164,6 +164,8 @@ pub enum Command {
         #[command(subcommand)]
         cmd: LlmCmd,
     },
+    /// Diagnose the environment (tools, backends, config, model cache)
+    Doctor,
     /// Manage the config file
     Config {
         #[command(subcommand)]

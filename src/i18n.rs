@@ -124,6 +124,11 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
     );
     sub_about(cmd, &["llm", "status"], "查看当前配置（密钥打码）");
     sub_about(cmd, &["llm", "disable"], "关闭 LLM 润色（保留凭据）");
+    sub_about(
+        cmd,
+        &["doctor"],
+        "环境体检：依赖工具/后端可用性/配置/模型缓存",
+    );
     sub_about(cmd, &["config"], "配置文件管理");
     sub_about(
         cmd,

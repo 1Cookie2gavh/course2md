@@ -3,6 +3,7 @@ pub mod asr;
 pub mod checkpoint;
 pub mod cli;
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub mod fetch;
 pub mod i18n;
