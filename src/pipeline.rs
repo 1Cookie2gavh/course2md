@@ -256,27 +256,26 @@ fn fmt_duration(secs: f64) -> String {
 }
 
 /// 峰值常驻集（Linux 为 KB，macOS 为字节）。RUSAGE_CHILDREN 口径含 llama-server/ffmpeg。
+#[cfg(unix)]
 fn peak_rss_mb(who: libc::c_int) -> Option<f64> {
-    #[cfg(unix)]
-    {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        let rc = unsafe { libc::getrusage(who, usage.as_mut_ptr()) };
-        if rc != 0 {
-            return None;
-        }
-        let usage = unsafe { usage.assume_init() };
-        let rss = usage.ru_maxrss as f64;
-        #[cfg(target_os = "macos")]
-        {
-            Some(rss / (1024.0 * 1024.0))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Some(rss / 1024.0)
-        }
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let rc = unsafe { libc::getrusage(who, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
     }
-    #[cfg(not(unix))]
+    let usage = unsafe { usage.assume_init() };
+    let rss = usage.ru_maxrss as f64;
+    #[cfg(target_os = "macos")]
     {
-        None
+        Some(rss / (1024.0 * 1024.0))
     }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(rss / 1024.0)
+    }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_mb(_who: i32) -> Option<f64> {
+    None
 }
