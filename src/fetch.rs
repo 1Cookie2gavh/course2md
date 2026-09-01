@@ -78,7 +78,21 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
         }
         match run_status(&mut cmd).await {
             Ok(()) => {
-                tokio::fs::rename(&tmp, dest).await?;
+                // 新版 yt-dlp 在 merge 时会按 --merge-output-format 再补后缀：
+                // -o media.mp4.part 实际产出 media.mp4.part.mp4。两种命名都兼容。
+                let merged = PathBuf::from(format!("{}.mp4", tmp.display()));
+                let produced = if merged.is_file() {
+                    merged
+                } else if tmp.is_file() {
+                    tmp
+                } else {
+                    anyhow::bail!(
+                        "yt-dlp 结束但未找到产物（期望 {} 或 {}）",
+                        tmp.display(),
+                        merged.display()
+                    );
+                };
+                tokio::fs::rename(&produced, dest).await?;
                 return Ok(());
             }
             Err(e) => last_err = Some(e),
