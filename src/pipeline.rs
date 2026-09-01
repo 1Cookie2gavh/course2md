@@ -133,7 +133,7 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         peak_rss_mb(libc::RUSAGE_CHILDREN),
     );
     #[cfg(not(unix))]
-    let (peak_mb, child_peak_mb) = (None, None);
+    let (peak_mb, child_peak_mb) = (peak_rss_mb(0), peak_rss_mb(0));
     let stats = RunStats {
         elapsed_secs: t_total.elapsed().as_secs_f64(),
         peak_mb,
