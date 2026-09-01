@@ -297,12 +297,20 @@ pub fn run_coreml(
         match asr.transcribe(&chunk) {
             Ok(Some(text)) => {
                 let text = crate::asr::sanitize_qwen_text(&text);
-                if !text.is_empty() {
-                    // 只写 checkpoint：事件统一从 cp.events() 出（避免双份）
-                    cp.record(start, end, &text);
+                // 空结果也记录完成（静音 chunk）；写盘失败不标记完成
+                if let Err(e) = cp.record(start, end, &text) {
+                    let _ = std::fs::remove_file(&chunk);
+                    pb.finish_and_clear();
+                    return Err(e);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if let Err(e) = cp.record(start, end, "") {
+                    let _ = std::fs::remove_file(&chunk);
+                    pb.finish_and_clear();
+                    return Err(e);
+                }
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(&chunk);
                 pb.finish_and_clear();

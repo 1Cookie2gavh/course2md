@@ -40,15 +40,20 @@ pub fn sanitize_qwen_text(s: &str) -> String {
 }
 
 pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<TranscriptEvent>> {
-    let mut cp = crate::checkpoint::Checkpoint::open(&cfg.out_dir, cfg.resume)?;
-    if cfg.provider.eq_ignore_ascii_case("api") {
+    use crate::checkpoint::{AsrIdentity, Checkpoint};
+    let provider = cfg.provider.to_ascii_lowercase();
+    let open = |id: &AsrIdentity| Checkpoint::open(&cfg.out_dir, cfg.resume, id);
+
+    if provider == "api" {
+        let id = AsrIdentity::new("api", &cfg.asr_api.model, cfg.max_speech);
+        let mut cp = open(&id)?;
         let api = cfg.asr_api.clone();
         let max_speech = cfg.max_speech as f64;
         let wav = wav.to_path_buf();
         let joined = tokio::task::spawn_blocking(move || {
             let r = run_api(&api, &wav, max_speech, &mut cp);
             if r.is_ok() {
-                cp.finish();
+                cp.finish()?;
             }
             r
         })
@@ -56,15 +61,17 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
         .context("ASR 线程 join 失败")?;
         return joined;
     }
-    if cfg.provider.eq_ignore_ascii_case("npu") {
+    if provider == "npu" {
+        let model = crate::npu::resolve_npu_model(cfg.asr_model.as_deref());
+        let id = AsrIdentity::new("npu", &model, cfg.max_speech);
+        let mut cp = open(&id)?;
         let max_speech = cfg.max_speech as f64;
         let wav = wav.to_path_buf();
         let cfg = cfg.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            let mut cp = cp;
             let r = crate::npu::run_npu(&cfg, &wav, max_speech, &mut cp);
             if r.is_ok() {
-                cp.finish();
+                cp.finish()?;
             }
             r
         })
@@ -72,7 +79,7 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
         .context("ASR 线程 join 失败")?;
         return joined;
     }
-    if cfg.provider.eq_ignore_ascii_case("coreml") {
+    if provider == "coreml" {
         #[cfg(apple_native)]
         {
             let wav = wav.to_path_buf();
@@ -80,15 +87,15 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
             let model = crate::apple::resolve_model(
                 cfg.asr_model.as_deref().filter(|s| !s.trim().is_empty()),
             );
+            let id = AsrIdentity::new("coreml", &model, cfg.max_speech);
+            let mut cp = open(&id)?;
             let joined = tokio::task::spawn_blocking(move || {
                 let tmp =
                     std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
                 let _ = std::fs::create_dir_all(&tmp);
                 let res =
                     crate::apple::run_coreml(&wav, max_speech, &model, cut_wav, &tmp, &mut cp);
-                if res.is_ok() {
-                    cp.finish();
-                }
+                let res = res.and_then(|ev| cp.finish().map(|()| ev));
                 let _ = std::fs::remove_dir_all(&tmp);
                 res
             })
@@ -106,16 +113,14 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
             );
         }
     }
-    let ngl = if cfg.provider.eq_ignore_ascii_case("cpu") {
-        0
-    } else {
-        99
-    };
+    let ngl = if provider == "cpu" { 0 } else { 99 };
     let threads = cfg.threads;
     let max_speech = cfg.max_speech;
     let llama = crate::models::ensure_llama_or_download(&cfg.model_dir).await?;
-    // coreml 回落场景下 cp 已被 move：磁盘上的进度重新打开即可续
-    let mut cp = crate::checkpoint::Checkpoint::open(&cfg.out_dir, cfg.resume)?;
+    // coreml 回落场景：身份随实际转写后端（llama/qwen3），旧 coreml 进度作废，
+    // 避免同一 checkpoint 混入两个模型的转写文本。
+    let id = AsrIdentity::new("llama", "qwen3-1.7b-gguf", cfg.max_speech);
+    let mut cp = open(&id)?;
     let input = AsrInput {
         wav: wav.to_path_buf(),
         model: llama.model,
@@ -124,7 +129,7 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
     tokio::task::spawn_blocking(move || {
         let r = run_blocking(&input, ngl, threads, max_speech, &mut cp);
         if r.is_ok() {
-            cp.finish();
+            cp.finish()?;
         }
         r
     })
@@ -187,9 +192,10 @@ fn run_blocking(
         match transcribe_file(&base, &chunk) {
             Ok(raw) => {
                 let text = sanitize_qwen_text(&raw);
-                if !text.is_empty() {
-                    // 只写 checkpoint：事件统一从 cp.events() 出（避免双份）
-                    cp.record(start, end, &text);
+                // 空文本也记录（静音 chunk）；写盘失败则中断且不标记完成
+                if let Err(e) = cp.record(start, end, &text) {
+                    err = Some(e);
+                    break;
                 }
             }
             Err(e) => {
@@ -337,8 +343,12 @@ fn run_api(
     for (i, r) in rx {
         match r {
             Ok(text) => {
-                if let Some(t) = &text {
-                    cp.record(segs[i].start, segs[i].end, t);
+                // 空结果（None）同样记录完成，避免静音 chunk 反复重跑
+                if let Err(e) = cp.record(segs[i].start, segs[i].end, text.as_deref().unwrap_or(""))
+                    && err.is_none()
+                {
+                    err = Some(e);
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 results[i] = Some(text);
             }

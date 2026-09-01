@@ -229,11 +229,12 @@ pub fn run_npu(
             Ok(resp) => {
                 let v: serde_json::Value = resp.into_json()?;
                 let text = v["text"].as_str().unwrap_or("").trim().to_string();
-                if !text.is_empty() {
-                    let sanitized = crate::asr::sanitize_qwen_text(&text);
-                    if !sanitized.is_empty() {
-                        cp.record(start, end, &sanitized);
-                    }
+                let sanitized = crate::asr::sanitize_qwen_text(&text);
+                // 空结果也记录完成（静音 chunk）；写盘失败不标记完成
+                if let Err(e) = cp.record(start, end, &sanitized) {
+                    let _ = std::fs::remove_file(&chunk);
+                    err = Some(e);
+                    break;
                 }
             }
             Err(e) => {

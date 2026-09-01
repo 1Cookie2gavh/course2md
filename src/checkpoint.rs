@@ -1,15 +1,46 @@
 //! ASR checkpoint：逐 chunk 追加写 asr.jsonl，重跑时按精确时间边界跳过已完成段。
 //!
-//! - 每个 chunk 完成即 append + flush（崩溃最多丢当前 chunk）
-//! - `(start, end)` 精确匹配（同一音频 → VAD 确定性 → 同分段）
-//! - 全部完成后写 `.asr_done` 标记，重跑完全跳过 ASR
-//! - `--no-resume` 关闭（LLM 阶段结果不缓存，因为它便宜且可变）
+//! v2 语义（1.0 起）：
+//! - **运行身份**：`.asr_identity` 记录 (course2md 版本, provider, 模型, max_speech)。
+//!   身份不一致的旧进度（换模型/换后端/换切分长度）整体作废并重算，
+//!   杜绝「换模型后 resume 混用两个模型的转写」。
+//! - **空结果也算完成**：成功但无语音的 chunk 记录为 `text: ""`，
+//!   否则静音段每次断点续跑都会重复 ASR。
+//! - **写盘失败不标记完成**：record() 返回 Result，只有落盘成功才计入 done。
+//! - **损坏策略**：最后一行允许是崩溃残留的半截 JSON（容忍恢复）；
+//!   中间任何损坏行都是硬错误（静默跳过会导致转写内容悄悄缺失）。
+//! - **`--no-resume` 清档**：不复用进度时删除旧 checkpoint，
+//!   否则旧记录会与新记录叠加，之后 resume 会输出双份文本。
+//! - 全部完成后原子写 `.asr_done` 标记，重跑完全跳过 ASR。
 
 use crate::timeline::TranscriptEvent;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// 一条 ASR 记录的身份：决定 checkpoint 能否被复用。
+/// 任何影响转写内容语义的字段变化都必须使旧进度作废。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AsrIdentity {
+    pub course2md_version: String,
+    pub provider: String,
+    pub model: String,
+    /// 语音分段上限（秒）：决定 chunk 边界，即 checkpoint 的 key
+    pub max_speech: f32,
+}
+
+impl AsrIdentity {
+    pub fn new(provider: &str, model: &str, max_speech: f32) -> Self {
+        Self {
+            course2md_version: env!("CARGO_PKG_VERSION").to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            max_speech,
+        }
+    }
+}
 
 pub struct Checkpoint {
     path: PathBuf,
@@ -25,10 +56,11 @@ fn key(start: f64, end: f64) -> (u64, u64) {
 }
 
 impl Checkpoint {
-    /// 打开（或续读）out 目录下的 asr.jsonl。`resume=false` 时忽略既有进度。
-    pub fn open(out_dir: &Path, resume: bool) -> Result<Self> {
+    /// 在 out_dir 下打开（或按 resume/身份决定作废重开）checkpoint。
+    pub fn open(out_dir: &Path, resume: bool, identity: &AsrIdentity) -> Result<Self> {
         let path = out_dir.join("asr.jsonl");
         let done_path = out_dir.join(".asr_done");
+        let identity_path = out_dir.join(".asr_identity");
         let mut cp = Checkpoint {
             path: path.clone(),
             done_path: done_path.clone(),
@@ -36,69 +68,134 @@ impl Checkpoint {
             done: HashSet::new(),
             events: vec![],
         };
-        if !resume {
-            return Ok(cp);
-        }
-        if done_path.is_file() {
-            // 上次已全部完成：直接载入全部事件
-            cp.events = Self::load_events(&path)?;
-            cp.done = cp.events.iter().map(|e| key(e.start, e.end)).collect();
+
+        let identity_matches = Self::stored_identity(&identity_path).map(|stored| {
+            let ok = stored.as_ref() == Some(identity);
+            if !ok {
+                match stored {
+                    Some(old) => tracing::info!(
+                        old = ?old, new = ?identity,
+                        "asr checkpoint 身份不匹配（模型/后端/版本已变化），旧进度作废重算"
+                    ),
+                    None => tracing::info!(
+                        "asr checkpoint 无身份标记（1.0 前的旧格式），旧进度作废重算"
+                    ),
+                }
+            }
+            ok
+        });
+
+        let usable = resume && identity_matches.unwrap_or(false);
+        if !usable {
+            // 不复用：清掉全部旧进度（否则旧记录会叠加进本次结果）
+            Self::clear(&path, &done_path, &identity_path)?;
+        } else if done_path.is_file() {
+            let events = Self::load_events(&path)?;
+            cp.done = events.iter().map(|e| key(e.start, e.end)).collect();
+            cp.events = events
+                .into_iter()
+                .filter(|e| !e.text.trim().is_empty())
+                .collect();
             tracing::info!(n = cp.events.len(), "asr checkpoint complete, reusing");
-            return Ok(cp);
+        } else {
+            let partial = Self::load_events(&path)?;
+            if !partial.is_empty() {
+                tracing::info!(n = partial.len(), "asr checkpoint resumed (partial)");
+                cp.done = partial.iter().map(|e| key(e.start, e.end)).collect();
+                cp.events = partial
+                    .into_iter()
+                    .filter(|e| !e.text.trim().is_empty())
+                    .collect();
+                cp.file = Some(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .with_context(|| format!("打开 checkpoint {}", path.display()))?,
+                );
+            }
         }
-        let partial = Self::load_events(&path)?;
-        if !partial.is_empty() {
-            tracing::info!(n = partial.len(), "asr checkpoint resumed (partial)");
-            cp.done = partial.iter().map(|e| key(e.start, e.end)).collect();
-            cp.events = partial;
-            // 追加模式打开
-            cp.file = Some(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .with_context(|| format!("打开 checkpoint {}", path.display()))?,
-            );
-        }
+        // 记录本次身份（原子写；同时也作为「清档后」的新标记）
+        let id = serde_json::to_string(identity)?;
+        atomic_write(&identity_path, id.as_bytes())?;
         Ok(cp)
     }
 
-    fn load_events(path: &Path) -> Result<Vec<TranscriptEvent>> {
-        let mut out = vec![];
+    /// 磁盘上存的身份；文件不存在（1.0 前旧 checkpoint）返回 None。
+    fn stored_identity(path: &Path) -> Result<Option<AsrIdentity>> {
         if !path.is_file() {
-            return Ok(out);
+            return Ok(None);
         }
-        for (i, line) in std::fs::read_to_string(path)
-            .with_context(|| format!("读取 {}", path.display()))?
-            .lines()
-            .enumerate()
-        {
-            if line.trim().is_empty() {
-                continue;
+        let s =
+            std::fs::read_to_string(path).with_context(|| format!("读取 {}", path.display()))?;
+        Ok(Some(
+            serde_json::from_str(&s).context("checkpoint 身份文件损坏")?,
+        ))
+    }
+
+    fn clear(path: &Path, done_path: &Path, identity_path: &Path) -> Result<()> {
+        for p in [path, done_path] {
+            if p.exists() && std::fs::remove_file(p).is_err() {
+                anyhow::bail!("无法清除旧 checkpoint {}", p.display());
             }
-            match serde_json::from_str(line) {
-                Ok(ev) => out.push(ev),
+        }
+        let _ = std::fs::remove_file(identity_path);
+        Ok(())
+    }
+
+    /// 读取事件行。最后一行允许半截（崩溃残留）；中间损坏 → 硬错误。
+    /// 同一 (start,end) 只保留首条（防御历史文件中的重复行）。
+    fn load_events(path: &Path) -> Result<Vec<TranscriptEvent>> {
+        if !path.is_file() {
+            return Ok(vec![]);
+        }
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("读取 {}", path.display()))?;
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        let last_idx = lines.len().saturating_sub(1);
+        let mut out: Vec<TranscriptEvent> = vec![];
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        for (i, line) in lines.iter().enumerate() {
+            match serde_json::from_str::<TranscriptEvent>(line) {
+                Ok(ev) => {
+                    let k = key(ev.start, ev.end);
+                    if seen.insert(k) {
+                        out.push(ev);
+                    } else if i != last_idx {
+                        tracing::warn!(line = i + 1, "checkpoint 存在重复 chunk 记录，仅保留首条");
+                    }
+                }
                 Err(e) => {
-                    // 最后一行可能是崩溃时的半截写入：忽略；中间损坏则警告
-                    tracing::debug!("checkpoint line {} 解析失败（忽略）：{e}", i + 1);
+                    if i == last_idx {
+                        // 崩溃时最后一行可能只写了一半：容忍
+                        tracing::debug!("checkpoint 末行解析失败（按崩溃残留忽略）：{e}");
+                    } else {
+                        anyhow::bail!(
+                            "checkpoint {} 第 {} 行损坏（非末行，不能静默跳过，否则转写内容缺失）：{e}",
+                            path.display(),
+                            i + 1
+                        );
+                    }
                 }
             }
         }
         Ok(out)
     }
 
-    /// 该 chunk 是否已完成（可跳过）。
+    /// 该 chunk 是否已完成（可跳过）。空文本（静音）chunk 同样算完成。
     pub fn is_done(&self, start: f64, end: f64) -> bool {
         self.done.contains(&key(start, end))
     }
 
-    /// 已完成的所有事件（含 resume 加载的历史 + 本次新增）。
+    /// 已完成且有文本的事件（含 resume 加载的历史 + 本次新增）。
+    /// 空文本 chunk 是静音标记，不进时间线。
     pub fn events(&self) -> &[TranscriptEvent] {
         &self.events
     }
 
-    /// 记录一个完成的 chunk（append + flush）。
-    pub fn record(&mut self, start: f64, end: f64, text: &str) {
+    /// 记录一个完成的 chunk（append + flush）。写盘失败返回 Err 且不标记完成。
+    /// `text` 允许为空串：表示「成功识别且确认无语音」。
+    pub fn record(&mut self, start: f64, end: f64, text: &str) -> Result<()> {
         let ev = TranscriptEvent {
             start,
             end,
@@ -106,25 +203,231 @@ impl Checkpoint {
             raw: None,
         };
         if self.file.is_none() {
-            let _ = std::fs::create_dir_all(self.path.parent().unwrap_or(Path::new(".")));
-            self.file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .ok();
+            if let Some(dir) = self.path.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("创建 checkpoint 目录 {}", dir.display()))?;
+            }
+            self.file = Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .with_context(|| format!("打开 checkpoint {}", self.path.display()))?,
+            );
         }
-        if let Some(f) = &mut self.file
-            && writeln!(f, "{}", serde_json::to_string(&ev).unwrap_or_default()).is_ok()
-        {
-            let _ = f.flush();
+        let line = serde_json::to_string(&ev)?;
+        if let Some(f) = &mut self.file {
+            writeln!(f, "{line}")
+                .with_context(|| format!("写 checkpoint {}", self.path.display()))?;
+            f.flush()
+                .with_context(|| format!("flush checkpoint {}", self.path.display()))?;
         }
+        // 只有落盘成功才更新内存状态
         self.done.insert(key(start, end));
-        self.events.push(ev);
+        if !text.trim().is_empty() {
+            self.events.push(ev);
+        }
+        Ok(())
     }
 
-    /// 全部完成：写标记（后续重跑直接跳过 ASR）。
-    pub fn finish(&mut self) {
-        let _ = std::fs::write(&self.done_path, b"done\n");
+    /// 全部完成：原子写标记（后续重跑直接跳过 ASR）。
+    pub fn finish(&mut self) -> Result<()> {
+        atomic_write(&self.done_path, b"done\n")?;
         self.file = None;
+        Ok(())
+    }
+}
+
+/// 小文件原子写：tmp → fsync → rename，避免崩溃留下半截文件。
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("创建目录 {}", dir.display()))?;
+    }
+    {
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("创建 {}", tmp.display()))?;
+        std::io::Write::write_all(&mut f, bytes)
+            .with_context(|| format!("写 {}", tmp.display()))?;
+        f.sync_all().ok(); // 某些文件系统不支持 fsync 目录/文件，尽力而为
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(model: &str) -> AsrIdentity {
+        AsrIdentity::new("gpu", model, 20.0)
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("c2m-cp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn empty_chunk_is_recorded_and_skipped_on_resume() {
+        let d = tmpdir("empty");
+        let mut cp = Checkpoint::open(&d, true, &identity("qwen3")).unwrap();
+        cp.record(0.0, 2.0, "hello").unwrap();
+        cp.record(2.0, 4.0, "").unwrap(); // 静音 chunk
+        cp.finish().unwrap();
+        drop(cp);
+
+        let cp = Checkpoint::open(&d, true, &identity("qwen3")).unwrap();
+        assert!(cp.is_done(0.0, 2.0));
+        assert!(cp.is_done(2.0, 4.0), "空文本 chunk 也必须视为已完成");
+        assert_eq!(cp.events().len(), 1, "空文本不进时间线");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn identity_mismatch_discards_old_progress() {
+        let d = tmpdir("ident");
+        let mut cp = Checkpoint::open(&d, true, &identity("qwen3")).unwrap();
+        cp.record(0.0, 2.0, "旧模型的结果").unwrap();
+        drop(cp); // 未 finish：模拟中断
+
+        let cp = Checkpoint::open(&d, true, &identity("whisper")).unwrap();
+        assert!(!cp.is_done(0.0, 2.0), "换模型后旧 chunk 必须作废");
+        assert!(cp.events().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn no_resume_clears_old_files() {
+        let d = tmpdir("clear");
+        let mut cp = Checkpoint::open(&d, true, &identity("qwen3")).unwrap();
+        cp.record(0.0, 2.0, "x").unwrap();
+        cp.finish().unwrap();
+        assert!(d.join(".asr_done").is_file());
+
+        // --no-resume：旧进度必须被清掉，而不是叠加
+        let mut cp = Checkpoint::open(&d, false, &identity("qwen3")).unwrap();
+        assert!(cp.events().is_empty() && cp.done.is_empty());
+        cp.record(0.0, 2.0, "y").unwrap();
+        drop(cp);
+
+        let cp = Checkpoint::open(&d, true, &identity("qwen3")).unwrap();
+        assert_eq!(cp.events().len(), 1, "重复运行不得产生双份记录");
+        assert_eq!(cp.events()[0].text, "y");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_identity_is_discarded() {
+        let d = tmpdir("legacy");
+        std::fs::write(
+            d.join("asr.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&TranscriptEvent {
+                    start: 0.0,
+                    end: 1.0,
+                    text: "旧格式".into(),
+                    raw: None,
+                })
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(d.join(".asr_done"), b"done\n").unwrap();
+
+        let cp = Checkpoint::open(&d, true, &identity("qwen3")).unwrap();
+        assert!(cp.events().is_empty(), "无身份标记的 1.0 前进度必须作废");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn middle_corruption_is_hard_error_but_truncated_tail_recovers() {
+        let ev = |s: f64, t: &str| {
+            serde_json::to_string(&TranscriptEvent {
+                start: s,
+                end: s + 1.0,
+                text: t.into(),
+                raw: None,
+            })
+            .unwrap()
+        };
+        // 先建立身份（模拟一次正常 open），再植入损坏内容
+        let establish = |d: &Path| Checkpoint::open(d, true, &identity("qwen3")).unwrap();
+
+        // 中间损坏 → 硬错误
+        let d = tmpdir("mid");
+        establish(&d);
+        std::fs::write(
+            d.join("asr.jsonl"),
+            format!("{}\n garbage \n{}\n", ev(0.0, "a"), ev(1.0, "b")),
+        )
+        .unwrap();
+        assert!(Checkpoint::open(&d, true, &identity("qwen3")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+
+        // 末行半截 → 容忍并恢复前面的记录
+        let d = tmpdir("tail");
+        establish(&d);
+        std::fs::write(
+            d.join("asr.jsonl"),
+            format!("{}\n{{\"start\":1.", ev(0.0, "a")),
+        )
+        .unwrap();
+        let cp = Checkpoint::open(&d, true, &identity("qwen3")).unwrap();
+        assert_eq!(cp.events().len(), 1);
+        assert!(!cp.is_done(1.0, 2.0), "末行半截不应被计入完成");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unwritable_out_dir_fails_loudly() {
+        // out_dir 本身是个普通文件 → checkpoint 完全不可用，open 必须报错
+        let f = std::env::temp_dir().join(format!("c2m-cp-file-{}", std::process::id()));
+        std::fs::write(&f, b"x").unwrap();
+        assert!(Checkpoint::open(&f, false, &identity("qwen3")).is_err());
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn record_write_failure_does_not_mark_done() {
+        // 先正常打开，再破坏写入路径：把 asr.jsonl 所在目录换成只读场景较繁琐，
+        // 这里直接验证语义：record 失败 → done 不含该 chunk。
+        // 构造：打开后删除目录，record 无法建文件 → Err 且不标记。
+        let d = tmpdir("wfail");
+        let mut cp = Checkpoint::open(&d, true, &identity("qwen3")).unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::write(&d, b"x").unwrap(); // 目录换成普通文件 → 无法重建写入路径
+        assert!(cp.record(0.0, 1.0, "t").is_err(), "写盘失败必须报错");
+        assert!(!cp.is_done(0.0, 1.0), "写盘失败不得标记完成");
+        let _ = std::fs::remove_file(&d);
+    }
+
+    #[test]
+    fn duplicate_lines_keep_first() {
+        let d = tmpdir("dup");
+        let _ = Checkpoint::open(&d, true, &identity("qwen3")).unwrap(); // 建立身份
+        let l = serde_json::to_string(&TranscriptEvent {
+            start: 0.0,
+            end: 1.0,
+            text: "first".into(),
+            raw: None,
+        })
+        .unwrap();
+        let l2 = serde_json::to_string(&TranscriptEvent {
+            start: 0.0,
+            end: 1.0,
+            text: "second".into(),
+            raw: None,
+        })
+        .unwrap();
+        std::fs::write(d.join("asr.jsonl"), format!("{l}\n{l2}\n")).unwrap();
+        let cp = Checkpoint::open(&d, true, &identity("qwen3")).unwrap();
+        assert_eq!(cp.events().len(), 1);
+        assert_eq!(cp.events()[0].text, "first");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
