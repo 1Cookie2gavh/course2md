@@ -139,7 +139,7 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         events
     };
 
-    let sections = timeline::merge(frames.clone(), events.clone());
+    let sections = timeline::merge(frames.clone(), events.clone(), meta.duration);
     timeline::write_jsonl(&cfg.timeline_path(), &frames, &events)?;
     tracing::info!(sections = sections.len(), "merged");
 

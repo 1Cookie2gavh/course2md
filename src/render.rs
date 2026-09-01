@@ -91,6 +91,11 @@ pub fn render_html(meta: &VideoMeta, sections: &[Section]) -> String {
 
 pub fn render_json(meta: &VideoMeta, sections: &[Section]) -> Result<String> {
     Ok(serde_json::to_string_pretty(&crate::timeline::CourseDoc {
+        schema_version: 1,
+        generator: crate::timeline::Generator {
+            name: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+        },
         meta,
         sections,
     })?)
@@ -154,6 +159,7 @@ mod tests {
         );
         let s = [Section {
             t: 10.0,
+            end: 60.0,
             image: "frames/slide_0001.jpg".into(),
             speech: vec![TranscriptEvent {
                 start: 10.2,
