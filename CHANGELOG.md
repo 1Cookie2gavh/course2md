@@ -3,7 +3,7 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [1.2.0] — 未发布
+## [1.2.0] — 2026-09-01
 
 ### 新增：视频总结与凭据清理（来自 #7，感谢 @1Cookie2gavh）
 
