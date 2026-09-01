@@ -317,10 +317,8 @@ fn summarize_dir(
     );
     let mut events: Vec<course2md::timeline::TranscriptEvent> = vec![];
     for line in std::fs::read_to_string(&timeline_path)?.lines() {
-        if let Ok(ev) = serde_json::from_str::<TimelineEvent>(line) {
-            if let TimelineEvent::Speech(s) = ev {
-                events.push(s);
-            }
+        if let Ok(TimelineEvent::Speech(s)) = serde_json::from_str::<TimelineEvent>(line) {
+            events.push(s);
         }
     }
     anyhow::ensure!(!events.is_empty(), "{} 中没有语音事件", timeline_path.display());

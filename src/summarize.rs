@@ -71,18 +71,19 @@ fn parse_time(v: Option<&serde_json::Value>) -> f64 {
     if let Some(s) = v.and_then(|x| x.as_str()) {
         let s = s.trim().trim_start_matches('[').trim_end_matches(']');
         let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() == 2 {
-            if let (Ok(m), Ok(sec)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                return m * 60.0 + sec;
-            }
-        } else if parts.len() == 3 {
-            if let (Ok(h), Ok(m), Ok(sec)) = (
+        if parts.len() == 2
+            && let (Ok(m), Ok(sec)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+        {
+            return m * 60.0 + sec;
+        }
+        if parts.len() == 3
+            && let (Ok(h), Ok(m), Ok(sec)) = (
                 parts[0].parse::<f64>(),
                 parts[1].parse::<f64>(),
                 parts[2].parse::<f64>(),
-            ) {
-                return h * 3600.0 + m * 60.0 + sec;
-            }
+            )
+        {
+            return h * 3600.0 + m * 60.0 + sec;
         }
     }
     0.0
@@ -240,10 +241,10 @@ pub async fn summarize(
     })
     .await
     .context("合并线程 join 失败")?;
-    if let Ok(combined) = combined {
-        if let Some(sm) = parse_summary(&combined) {
-            return Ok(sm);
-        }
+    if let Ok(combined) = combined.as_deref()
+        && let Some(sm) = parse_summary(combined)
+    {
+        return Ok(sm);
     }
     // 合并失败：拼接分块总结兜底
     let mut tldr = String::new();
@@ -390,13 +391,13 @@ pub fn strip_md_summary(md: &str) -> String {
 
 /// 从 HTML 中移除已有总结区块（--force 重写时使用）。
 pub fn strip_html_summary(html: &str) -> String {
-    if let Some(start) = html.find("<section class=\"summary\">") {
-        if let Some(end_rel) = html[start..].find("</section>") {
-            let end = start + end_rel + "</section>".len();
-            let mut out = html[..start].to_string();
-            out.push_str(&html[end..]);
-            return out;
-        }
+    if let Some(start) = html.find("<section class=\"summary\">")
+        && let Some(end_rel) = html[start..].find("</section>")
+    {
+        let end = start + end_rel + "</section>".len();
+        let mut out = html[..start].to_string();
+        out.push_str(&html[end..]);
+        return out;
     }
     html.to_string()
 }

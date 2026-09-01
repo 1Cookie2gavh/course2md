@@ -306,10 +306,10 @@ pub fn parse_id_text_pairs(content: &str) -> Option<Vec<(usize, String)>> {
     }
     // 2) 清除尾逗号后重试
     let cleaned = clean_trailing_commas(slice);
-    if cleaned != slice {
-        if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned) {
-            return parse_items(&v);
-        }
+    if cleaned != slice
+        && let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned)
+    {
+        return parse_items(&v);
     }
     // 3) 宽容扫描：跳过坏项，收集合法 {"id":..,"text":".."}
     lenient_scan(slice)
@@ -357,7 +357,7 @@ fn lenient_scan(s: &str) -> Option<Vec<(usize, String)>> {
         let mut in_str = false;
         let mut esc = false;
         let mut end = None;
-        let bytes = tail[obj_start..].as_bytes();
+        let bytes = &tail.as_bytes()[obj_start..];
         for (k, &b) in bytes.iter().enumerate() {
             if in_str {
                 if esc {
@@ -384,10 +384,9 @@ fn lenient_scan(s: &str) -> Option<Vec<(usize, String)>> {
         }
         let end = end?;
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tail[obj_start..end]) {
-            if let (Some(id), Some(text)) = (
-                v.get("id").and_then(|x| x.as_u64()).map(|x| x as usize),
-                v.get("text").and_then(|x| x.as_str()).map(|s| s.to_string()),
-            ) {
+            let id = v.get("id").and_then(|x| x.as_u64()).map(|x| x as usize);
+            let text = v.get("text").and_then(|x| x.as_str()).map(|s| s.to_string());
+            if let (Some(id), Some(text)) = (id, text) {
                 out.push((id, text));
             }
         }
@@ -611,6 +610,7 @@ mod tests {
             prompt: None,
             disable_hint: false,
             vision: false,
+            summarize: false,
         }
     }
 
