@@ -3,16 +3,22 @@
 //! 配置文件：`~/.config/course2md/config.toml`（XDG；Windows 为 `%APPDATA%\course2md\config.toml`）。
 //! 支持 OpenAI 兼容 /chat/completions 端点；所有配置项均可被命令行覆盖。
 //! 关闭时每次任务结束打印开启提示（可用配置项或 `--no-llm-hint` 关闭）。
+//!
+//! 视觉润色（`vision = true`）：按 Section 分批，每个请求附该节幻灯片截图，
+//! 供模型校正技术词汇拼写（issue #5）；端点不支持图片时该批自动降级纯文本。
 
-use crate::timeline::TranscriptEvent;
+use crate::timeline::{Section, TranscriptEvent};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
 pub const DEFAULT_PROMPT: &str = "你是字幕校对器。修正语音识别文本中明显的错误\
 （错别字、同音字、专有名词拼写）与不通顺的语气词（如\"呃\"\"嗯\"\"这个那个\"等口头禅），\
 使文字自然、书面化。不增删实质内容、不翻译、不改原意、保持原语言。\
+若某条内容仅由语气词、口头禅或无实义片段构成（如单独的\"啊\"、\"对吧\"），\
+该条的 text 返回空字符串 \"\"（系统会删除该条）；有实质内容的条目不得删除。\
 输出与输入逐条对应的 JSON 字符串数组，不要输出任何其他内容。";
 
 /// 每次请求合并的语音段数。
@@ -30,6 +36,8 @@ pub struct LlmSettings {
     pub prompt: Option<String>,
     /// 关闭「可开启 LLM」的结束提示
     pub disable_hint: bool,
+    /// 视觉润色：每个请求附对应幻灯片截图，辅助纠正技术词汇（模型须支持图片输入）
+    pub vision: bool,
 }
 
 /// base_url -> 完整 chat/completions URL。
@@ -53,10 +61,16 @@ pub fn validate(s: &LlmSettings) -> Result<()> {
     Ok(())
 }
 
-/// 用 LLM 批量润色字幕；失败批次保留原文（润色失败不阻断转换）。
-pub fn polish(mut events: Vec<TranscriptEvent>, s: &LlmSettings) -> Vec<TranscriptEvent> {
-    let batches = events.chunks_mut(BATCH).len();
-    let pb = indicatif::ProgressBar::new(batches as u64);
+/// 对已合并的 Section 做润色（在 merge 之后调用）。
+/// - 失败批次保留原文（润色失败不阻断转换）
+/// - vision=true 且截图存在时，请求附该节幻灯片；带图失败自动降级纯文本重试一次
+/// - 模型对纯语气词条目返回空 text → 该条被删除（issue #5）
+pub fn polish_sections(sections: &mut [Section], frames_root: &Path, s: &LlmSettings) {
+    let total: usize = sections
+        .iter()
+        .map(|sec| sec.speech.chunks(BATCH).len())
+        .sum();
+    let pb = indicatif::ProgressBar::new(total as u64);
     pb.set_style(
         indicatif::ProgressStyle::with_template(
             "{spinner:.green} llm {pos}/{len} [{bar:32.cyan/blue}] {msg}",
@@ -65,41 +79,71 @@ pub fn polish(mut events: Vec<TranscriptEvent>, s: &LlmSettings) -> Vec<Transcri
         .progress_chars("##-"),
     );
     let mut warned = false;
-    for chunk in events.chunks_mut(BATCH) {
-        pb.inc(1);
-        // 带分段下标请求/校验：防止模型重排或漏项导致的静默错位
-        let items: Vec<(usize, &str)> = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (i, e.text.as_str()))
-            .collect();
-        match chat(s, &items) {
-            Ok(polished) => {
-                let mut by_id: Vec<Option<String>> = vec![None; chunk.len()];
-                let mut bad = false;
-                for (id, text) in polished {
-                    if id >= chunk.len() || by_id[id].is_some() {
-                        bad = true;
-                        break;
-                    }
-                    by_id[id] = Some(text);
-                }
-                if bad || by_id.iter().any(|v| v.is_none()) {
-                    warn_once(&mut warned, "LLM 返回 id 集与输入不符，该批保留原文");
-                    continue;
-                }
-                for (ev, new_text) in chunk.iter_mut().zip(by_id.into_iter().map(|v| v.unwrap())) {
-                    if !new_text.is_empty() && new_text != ev.text {
-                        ev.raw.get_or_insert_with(|| ev.text.clone());
-                        ev.text = new_text;
-                    }
-                }
-            }
-            Err(e) => warn_once(&mut warned, &format!("LLM 润色失败（{e:#}），保留原文")),
+    let mut vision_warned = false;
+    for sec in sections.iter_mut() {
+        if sec.speech.is_empty() {
+            continue;
         }
+        let image = if s.vision {
+            let p = frames_root.join(&sec.image);
+            p.is_file().then_some(p)
+        } else {
+            None
+        };
+        for chunk in sec.speech.chunks_mut(BATCH) {
+            pb.inc(1);
+            let items: Vec<(usize, &str)> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i, e.text.as_str()))
+                .collect();
+            let r = match (chat(s, &items, image.as_deref()), image.as_deref()) {
+                (Ok(v), _) => Ok(v),
+                (Err(e), Some(_)) => {
+                    warn_once(
+                        &mut vision_warned,
+                        &format!("带图润色失败（{e:#}），该批降级为纯文本重试"),
+                    );
+                    chat(s, &items, None)
+                }
+                (Err(e), None) => Err(e),
+            };
+            match r {
+                Ok(polished) => {
+                    if apply_polish(chunk, &polished) {
+                        warn_once(&mut warned, "LLM 返回 id 集与输入不符，该批保留原文");
+                    }
+                }
+                Err(e) => warn_once(&mut warned, &format!("LLM 润色失败（{e:#}），保留原文")),
+            }
+        }
+        // 删除「成功润色为空串」的纯语气词条目
+        sec.speech.retain(|e| !e.text.trim().is_empty());
     }
     pb.finish_and_clear();
-    events
+}
+
+/// 把 (id, 新文本) 应用到一批事件上；空字符串 = 删除该条（由调用方 retain）。
+/// 返回 true = 返回集与输入不匹配（重排/缺项/重复），该批保留原文。
+fn apply_polish(chunk: &mut [TranscriptEvent], polished: &[(usize, String)]) -> bool {
+    let mut by_id: Vec<Option<&str>> = vec![None; chunk.len()];
+    for (id, text) in polished {
+        if *id >= chunk.len() || by_id[*id].is_some() {
+            return true;
+        }
+        by_id[*id] = Some(text.as_str());
+    }
+    if by_id.iter().any(|v| v.is_none()) {
+        return true;
+    }
+    for (ev, new) in chunk.iter_mut().zip(by_id) {
+        let new = new.unwrap_or("");
+        if new != ev.text {
+            ev.raw.get_or_insert_with(|| ev.text.clone());
+            ev.text = new.to_string();
+        }
+    }
+    false
 }
 
 fn warn_once(warned: &mut bool, msg: &str) {
@@ -112,21 +156,23 @@ fn warn_once(warned: &mut bool, msg: &str) {
 }
 
 /// 发一批（id, 文本）给 LLM，返回润色后的 (id, 文本) 列表。
-fn chat(s: &LlmSettings, items: &[(usize, &str)]) -> Result<Vec<(usize, String)>> {
+/// `image` 提供时在用户消息中附上该幻灯片截图（OpenAI 兼容 image_url 协议）。
+fn chat(
+    s: &LlmSettings,
+    items: &[(usize, &str)],
+    image: Option<&Path>,
+) -> Result<Vec<(usize, String)>> {
     validate(s)?;
-    let payload: Vec<serde_json::Value> = items
-        .iter()
-        .map(|(i, t)| serde_json::json!({"id": i, "text": t}))
-        .collect();
-    let body = serde_json::json!({
-        "model": s.model,
-        "temperature": 0.0,
-        "max_tokens": 4096,
-        "messages": [
-            {"role": "system", "content": format!("{} 输出为 JSON 数组，每项形如 {{\"id\":序号,\"text\":润色后的文本}}，id 必须与输入一一对应。", effective_prompt(s))},
-            {"role": "user", "content": serde_json::to_string(&payload)?},
-        ],
-    });
+    let image_b64 = match image {
+        Some(p) => {
+            use base64::Engine as _;
+            let bytes =
+                std::fs::read(p).with_context(|| format!("读取幻灯片截图 {}", p.display()))?;
+            Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        None => None,
+    };
+    let body = build_chat_body(s, items, image_b64.as_deref())?;
     let resp = ureq::post(&endpoint(&s.base_url))
         .timeout(Duration::from_secs(180))
         .set("Content-Type", "application/json")
@@ -140,6 +186,42 @@ fn chat(s: &LlmSettings, items: &[(usize, &str)]) -> Result<Vec<(usize, String)>
         .to_string();
     parse_id_text_pairs(&content)
         .with_context(|| format!("LLM 响应不是 id/text JSON 数组: {:.200}", content))
+}
+
+/// 构造 /chat/completions 请求体（独立出来便于单测覆盖视觉路径）。
+fn build_chat_body(
+    s: &LlmSettings,
+    items: &[(usize, &str)],
+    image_b64: Option<&str>,
+) -> Result<serde_json::Value> {
+    let payload: Vec<serde_json::Value> = items
+        .iter()
+        .map(|(i, t)| serde_json::json!({"id": i, "text": t}))
+        .collect();
+    let vision_note = if image_b64.is_some() {
+        " 消息附带该段对应的课件截图，仅用于校正术语拼写与专有名词，不要描述或评论图片本身。"
+    } else {
+        ""
+    };
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": serde_json::to_string(&payload)?,
+    })];
+    if let Some(b64) = image_b64 {
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:image/jpeg;base64,{b64}")},
+        }));
+    }
+    Ok(serde_json::json!({
+        "model": s.model,
+        "temperature": 0.0,
+        "max_tokens": 4096,
+        "messages": [
+            {"role": "system", "content": format!("{} 输出为 JSON 数组，每项形如 {{\"id\":序号,\"text\":润色后的文本}}，id 必须与输入一一对应；纯语气词条目的 text 为空字符串。{vision_note}", effective_prompt(s))},
+            {"role": "user", "content": content},
+        ]
+    }))
 }
 
 /// 从模型输出提取 [{"id":n,"text":"..."}]（容忍代码围栏与前后杂文）。
@@ -256,6 +338,18 @@ pub fn setup_interactive(
     if !cfg.llm.base_url.is_empty() && !cfg.llm.base_url.contains("://") {
         cfg.llm.base_url = format!("https://{}", cfg.llm.base_url.trim());
     }
+    // 视觉能力仅交互式终端询问（脚本化调用全部传参时不阻塞）
+    if unsafe { libc::isatty(2) } == 1 {
+        cfg.llm.vision = dialoguer::Select::new()
+            .with_prompt("该模型支持视觉输入吗？（开启后润色时附幻灯片截图，辅助纠正技术词汇）")
+            .items([
+                "不支持 / 不使用（默认，纯文本润色）",
+                "支持（需多模态模型，如 Gemini / GPT-4o / Qwen-VL）",
+            ])
+            .default(if cfg.llm.vision { 1 } else { 0 })
+            .interact_opt()?
+            .is_some_and(|i| i == 1);
+    }
     cfg.llm.disable_hint = disable_hint;
     cfg.llm.enabled = true;
     Ok(cfg)
@@ -332,6 +426,83 @@ mod tests {
             endpoint("https://api.x.com/v1/chat/completions"),
             "https://api.x.com/v1/chat/completions"
         );
+    }
+
+    fn test_settings() -> LlmSettings {
+        LlmSettings {
+            enabled: true,
+            base_url: "https://api.x.com/v1".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            prompt: None,
+            disable_hint: false,
+            vision: false,
+        }
+    }
+
+    #[test]
+    fn apply_polish_empty_text_deletes_entry() {
+        let mut chunk = vec![
+            TranscriptEvent {
+                start: 0.0,
+                end: 1.0,
+                text: "今天讲编译原理".into(),
+                raw: None,
+            },
+            TranscriptEvent {
+                start: 1.0,
+                end: 2.0,
+                text: "啊".into(),
+                raw: None,
+            },
+        ];
+        let bad = apply_polish(
+            &mut chunk,
+            &[(0, "今天讲编译原理".into()), (1, String::new())],
+        );
+        assert!(!bad);
+        assert_eq!(chunk[1].text, "", "纯语气词被置空");
+        assert_eq!(chunk[1].raw.as_deref(), Some("啊"), "原文进 raw 溯源");
+        // 调用方语义：置空的条目随后被 retain 删除
+        chunk.retain(|e| !e.text.trim().is_empty());
+        assert_eq!(chunk.len(), 1);
+    }
+
+    #[test]
+    fn apply_polish_rejects_mismatched_ids() {
+        let mut chunk = vec![TranscriptEvent {
+            start: 0.0,
+            end: 1.0,
+            text: "a".into(),
+            raw: None,
+        }];
+        assert!(apply_polish(
+            &mut chunk,
+            &[(0, "x".into()), (1, "y".into())]
+        ));
+        assert!(apply_polish(&mut chunk, &[]));
+        assert_eq!(chunk[0].text, "a", "不匹配时保留原文");
+    }
+
+    #[test]
+    fn chat_body_text_vs_vision() {
+        let s = test_settings();
+        let items = [(0usize, "hello")];
+        let text_only = build_chat_body(&s, &items, None).unwrap();
+        let user: &Vec<serde_json::Value> = text_only["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0]["type"], "text");
+
+        let vision = build_chat_body(&s, &items, Some("aGVsbG8=")).unwrap();
+        let user: &Vec<serde_json::Value> = vision["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(user.len(), 2, "带图时附 image_url 内容块");
+        assert_eq!(user[1]["type"], "image_url");
+        assert_eq!(
+            user[1]["image_url"]["url"].as_str().unwrap(),
+            "data:image/jpeg;base64,aGVsbG8="
+        );
+        let sys = vision["messages"][0]["content"].as_str().unwrap();
+        assert!(sys.contains("课件截图"), "带图时系统提示说明截图用途");
     }
 
     #[test]

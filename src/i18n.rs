@@ -106,6 +106,11 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
         ("llm_api_key", "覆盖 LLM API Key"),
         ("llm_model", "覆盖 LLM 模型名"),
         ("llm_prompt", "覆盖 LLM 校对提示词"),
+        (
+            "llm_vision",
+            "视觉润色：请求附对应幻灯片截图，辅助纠正技术词汇（需多模态模型）",
+        ),
+        ("no_llm_vision", "本次运行关闭视觉润色"),
         ("no_llm_hint", "关闭结束时「可开启 LLM」提示（本次运行）"),
         ("verbose", "更详细日志"),
         ("quiet", "只显示错误"),

@@ -181,18 +181,24 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
     // 转写可能合法返回空（静音课件）；由后续正常渲染成"无语音"讲义
 
-    // 可选的 LLM 润色（配置已在管线开头校验）
-    let events = if cfg.llm.enabled {
-        tracing::info!(model = %cfg.llm.model, "llm polish");
+    // 合并先行：LLM 润色需要 section 上下文（视觉润色按节附对应截图，issue #5）
+    let mut sections = timeline::merge(frames.clone(), events.clone(), meta.duration);
+    if cfg.llm.enabled {
+        tracing::info!(model = %cfg.llm.model, vision = cfg.llm.vision, "llm polish");
         let ev = cfg.llm.clone();
-        let joined = tokio::task::spawn_blocking(move || crate::llm::polish(events, &ev)).await;
-        joined.context("LLM 线程 join 失败")?
-    } else {
-        events
-    };
-
-    let sections = timeline::merge(frames.clone(), events.clone(), meta.duration);
-    timeline::write_jsonl(&cfg.timeline_path(), &frames, &events)?;
+        let root = cfg.out_dir.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            crate::llm::polish_sections(&mut sections, &root, &ev);
+            sections
+        })
+        .await;
+        sections = joined.context("LLM 线程 join 失败")?;
+    }
+    let speech: Vec<timeline::TranscriptEvent> = sections
+        .iter()
+        .flat_map(|sec| sec.speech.iter().cloned())
+        .collect();
+    timeline::write_jsonl(&cfg.timeline_path(), &frames, &speech)?;
     tracing::info!(sections = sections.len(), "merged");
 
     render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats).await?;
@@ -247,6 +253,7 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         "resume": cfg.resume,
         "formats": cfg.formats.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
         "llm_polish": cfg.llm.enabled,
+        "llm_vision": cfg.llm.enabled && cfg.llm.vision,
         "sections": sections.len(),
         "speech_segments": speech_n,
         "chars": chars,
