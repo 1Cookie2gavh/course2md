@@ -197,6 +197,8 @@ pub fn test_connection(s: &LlmSettings) -> Result<()> {
 }
 
 /// `llm setup`：交互式补齐缺失项并写盘。
+/// 使用 dialoguer（console 行编辑）：支持左右箭头/Home/End 移动、
+/// 退格/删除等标准编辑键——裸 read_line 无法处理方向键转义序列（issue #3）。
 pub fn setup_interactive(
     mut cfg: crate::settings::ConfigFile,
     base_url: Option<String>,
@@ -204,50 +206,52 @@ pub fn setup_interactive(
     model: Option<String>,
     disable_hint: bool,
 ) -> Result<crate::settings::ConfigFile> {
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout().lock();
-    let mut line = String::new();
-
-    // 回车保留当前值；hint 为展示用的掩码（如 api_key 已配置时）。
-    let mut ask = |prompt: &str, current: &str, hint: &str| -> String {
-        line.clear();
-        let _ = write!(out, "{prompt}");
-        if !hint.is_empty() {
-            let _ = write!(out, "[回车保留 {hint}] ");
-        }
-        let _ = write!(out, ": ");
-        let _ = out.flush();
-        if stdin.read_line(&mut line).unwrap_or(0) == 0 {
-            return current.to_string();
-        }
-        let t = line.trim();
-        if t.is_empty() {
-            current.to_string()
+    let cur_or = |v: String, cur: &str| {
+        if v.trim().is_empty() {
+            cur.to_string()
         } else {
-            t.to_string()
+            v
         }
     };
 
-    cfg.llm.base_url = base_url.unwrap_or_else(|| {
-        ask(
-            "Base URL（OpenAI 兼容，如 https://api.deepseek.com/v1）",
-            &cfg.llm.base_url,
-            &cfg.llm.base_url,
-        )
-    });
-    cfg.llm.api_key = api_key.unwrap_or_else(|| {
-        ask(
-            "API Key",
-            &cfg.llm.api_key,
-            if cfg.llm.api_key.is_empty() {
-                ""
-            } else {
-                "已配置的 Key"
-            },
-        )
-    });
-    cfg.llm.model =
-        model.unwrap_or_else(|| ask("模型名（如 deepseek-chat）", &cfg.llm.model, &cfg.llm.model));
+    if let Some(v) = base_url {
+        cfg.llm.base_url = v;
+    } else {
+        let v: String = dialoguer::Input::new()
+            .with_prompt("Base URL（OpenAI 兼容，如 https://api.deepseek.com/v1）")
+            .with_initial_text(&cfg.llm.base_url)
+            .allow_empty(true)
+            .interact_text()?;
+        cfg.llm.base_url = cur_or(v, &cfg.llm.base_url);
+    }
+    if let Some(v) = api_key {
+        cfg.llm.api_key = v;
+    } else {
+        // 不回显已保存的 key：空输入 = 保留当前值
+        let keep_hint = if cfg.llm.api_key.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "（回车保留已配置的 {}...）",
+                &cfg.llm.api_key[..cfg.llm.api_key.len().min(6)]
+            )
+        };
+        let v: String = dialoguer::Input::<String>::new()
+            .with_prompt(format!("API Key{keep_hint}"))
+            .allow_empty(true)
+            .interact_text()?;
+        cfg.llm.api_key = cur_or(v, &cfg.llm.api_key);
+    }
+    if let Some(v) = model {
+        cfg.llm.model = v;
+    } else {
+        let v: String = dialoguer::Input::new()
+            .with_prompt("模型名（如 deepseek-chat）")
+            .with_initial_text(&cfg.llm.model)
+            .allow_empty(true)
+            .interact_text()?;
+        cfg.llm.model = cur_or(v, &cfg.llm.model);
+    }
     // 容错：没写 scheme 时补 https://
     if !cfg.llm.base_url.is_empty() && !cfg.llm.base_url.contains("://") {
         cfg.llm.base_url = format!("https://{}", cfg.llm.base_url.trim());
