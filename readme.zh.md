@@ -454,6 +454,31 @@ course2md --help
 
 ---
 
+## 视频总结（LLM，可选）
+
+开启 `[llm] summarize = true`（或配置后用 `course2md summarize`）后，
+course2md 会为文稿生成 **TL;DR / 核心要点 / 带时间戳大纲**，插入
+`course.md` / `course.html` 开头：
+
+```bash
+course2md summarize out/          # 为已有输出生成总结（幂等，--force 覆盖）
+course2md summarize out/ -o dir/  # 另导出独立 <标题>.summary.md
+```
+
+- 幻觉防护：仅以带时间戳字幕为输入、temperature=0、JSON 结构化输出
+- 超长视频自动 map-reduce（分段总结 → 合并）
+- 推理模型（DeepSeek V4 Flash 等）兼容：json_object 响应格式（端点不支持时自动降级）、
+  16384 max_tokens、失败批次拆半递归重试、润色 4 路并发
+
+## 清除凭据
+
+分享配置或提交代码前：
+
+```bash
+course2md remove          # 清除 LLM API 配置
+course2md remove --asr    # 同时清除云端 STT 的 API Key
+```
+
 ## 故障排查
 
 先跑环境体检：

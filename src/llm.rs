@@ -240,17 +240,7 @@ fn chat(
         None => None,
     };
     let body = build_chat_body(s, items, image_b64.as_deref())?;
-    let resp = ureq::post(&endpoint(&s.base_url))
-        .timeout(Duration::from_secs(300))
-        .set("Content-Type", "application/json")
-        .set("Authorization", &format!("Bearer {}", s.api_key))
-        .send_json(body)
-        .context("LLM 请求失败")?;
-    let v: serde_json::Value = resp.into_json().context("LLM 响应解析失败")?;
-    let content = v["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let content = send_chat(s, &body)?;
     parse_id_text_pairs(&content)
         .with_context(|| format!("LLM 响应不是 id/text JSON 数组: {:.200}", content))
 }
@@ -300,16 +290,20 @@ pub fn parse_id_text_pairs(content: &str) -> Option<Vec<(usize, String)>> {
         return None;
     }
     let slice = &content[start..=end];
-    // 1) 严格解析
-    if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(slice) {
-        return parse_items(&v);
+    // 1) 严格解析；个别项 id/text 类型不对时 parse_items 返回 None，
+    //    必须继续降级而不是整批丢弃（落入第 2/3 级）
+    if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(slice)
+        && let Some(items) = parse_items(&v)
+    {
+        return Some(items);
     }
     // 2) 清除尾逗号后重试
     let cleaned = clean_trailing_commas(slice);
-    if cleaned != slice {
-        if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned) {
-            return parse_items(&v);
-        }
+    if cleaned != slice
+        && let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned)
+        && let Some(items) = parse_items(&v)
+    {
+        return Some(items);
     }
     // 3) 宽容扫描：跳过坏项，收集合法 {"id":..,"text":".."}
     lenient_scan(slice)
@@ -322,14 +316,10 @@ fn parse_items(v: &[serde_json::Value]) -> Option<Vec<(usize, String)>> {
         let text = item.get("text")?.as_str()?.to_string();
         out.push((id, text));
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
-fn clean_trailing_commas(s: &str) -> String {
+pub(crate) fn clean_trailing_commas(s: &str) -> String {
     let mut out = s.to_string();
     loop {
         let prev = out.clone();
@@ -341,24 +331,22 @@ fn clean_trailing_commas(s: &str) -> String {
     out
 }
 
-/// 逐个扫描 {"id":N,"text":"..."}，坏项跳过；能取到至少一项即返回。
+/// 逐个扫描顶层 {...} 对象，坏项跳过；能取到至少一项即返回。
+/// 按对象顺序遍历（此前实现从 "id" 向后找 {，方向反了，会漏掉首对象）。
 fn lenient_scan(s: &str) -> Option<Vec<(usize, String)>> {
+    let bytes = s.as_bytes();
     let mut out: Vec<(usize, String)> = vec![];
-    let mut rest = s;
-    let mut guard = 0;
-    while let Some(rel) = rest.find("\"id\"") {
-        guard += 1;
-        if guard > 10_000 {
-            break;
-        }
-        let tail = &rest[rel..];
-        let obj_start = tail.find('{')?;
+    let mut i = 0usize;
+    let mut guard = 0usize;
+    while i < s.len() {
+        let Some(rel) = s[i..].find('{') else { break };
+        let obj_start = i + rel;
+        // 找配对的 }（跳过字符串字面量内的花括号）
         let mut depth = 0usize;
         let mut in_str = false;
         let mut esc = false;
         let mut end = None;
-        let bytes = tail[obj_start..].as_bytes();
-        for (k, &b) in bytes.iter().enumerate() {
+        for (k, &b) in bytes[obj_start..].iter().enumerate() {
             if in_str {
                 if esc {
                     esc = false;
@@ -382,37 +370,65 @@ fn lenient_scan(s: &str) -> Option<Vec<(usize, String)>> {
                 _ => {}
             }
         }
-        let end = end?;
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tail[obj_start..end]) {
-            if let (Some(id), Some(text)) = (
-                v.get("id").and_then(|x| x.as_u64()).map(|x| x as usize),
-                v.get("text").and_then(|x| x.as_str()).map(|s| s.to_string()),
-            ) {
-                out.push((id, text));
-            }
+        let Some(end) = end else { break };
+        guard += 1;
+        if guard > 10_000 {
+            break;
         }
-        rest = &tail[end.min(tail.len())..];
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s[obj_start..end])
+            && let (Some(id), Some(text)) = (
+                v.get("id").and_then(|x| x.as_u64()).map(|x| x as usize),
+                v.get("text")
+                    .and_then(|x| x.as_str())
+                    .map(|t| t.to_string()),
+            )
+        {
+            out.push((id, text));
+        }
+        i = end;
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
-/// 发原始 chat/completions 请求并返回 message.content（供 summarize 等复用）。
+/// 发原始 chat/completions 请求并返回 message.content（润色与总结共用）。
+///
+/// 兼容性降级：部分 OpenAI 兼容端点不支持 `response_format: json_object`
+///（直接 400）。带该字段的请求失败时去掉它重试一次，仍失败才报原始错误。
 pub(crate) fn send_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<String> {
-    let resp = ureq::post(&endpoint(&s.base_url))
-        .timeout(Duration::from_secs(300))
-        .set("Content-Type", "application/json")
-        .set("Authorization", &format!("Bearer {}", s.api_key))
-        .send_json(body.clone())
-        .context("LLM 请求失败")?;
+    let resp = match request_chat(s, body) {
+        Ok(r) => r,
+        Err(first) => {
+            if body.get("response_format").is_some() {
+                let mut relaxed = body.clone();
+                if let Some(obj) = relaxed.as_object_mut() {
+                    obj.remove("response_format");
+                }
+                match request_chat(s, &relaxed) {
+                    Ok(r) => {
+                        tracing::debug!("端点不支持 response_format，降级重试成功");
+                        r
+                    }
+                    Err(_) => return Err(first),
+                }
+            } else {
+                return Err(first);
+            }
+        }
+    };
     let v: serde_json::Value = resp.into_json().context("LLM 响应解析失败")?;
     Ok(v["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("")
         .to_string())
+}
+
+fn request_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<ureq::Response> {
+    ureq::post(&endpoint(&s.base_url))
+        .timeout(Duration::from_secs(300))
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", s.api_key))
+        .send_json(body.clone())
+        .context("LLM 请求失败")
 }
 
 /// 从模型输出中提取 JSON 字符串数组（容忍 ```json 围栏与前后杂文）。
@@ -611,6 +627,7 @@ mod tests {
             prompt: None,
             disable_hint: false,
             vision: false,
+            summarize: false,
         }
     }
 
@@ -656,6 +673,24 @@ mod tests {
         ));
         assert!(apply_polish(&mut chunk, &[]));
         assert_eq!(chunk[0].text, "a", "不匹配时保留原文");
+    }
+
+    #[test]
+    fn parse_pairs_tolerates_trailing_commas_and_bad_items() {
+        // 尾逗号（推理模型常见输出）
+        let got = parse_id_text_pairs("[{\"id\":0,\"text\":\"a\",},{\"id\":1,\"text\":\"b\",},]")
+            .unwrap();
+        assert_eq!(got, vec![(0, "a".into()), (1, "b".into())]);
+        // 个别坏项：跳过而不丢弃整批
+        let got = parse_id_text_pairs(
+            "[{\"id\":0,\"text\":\"a\"},{\"id\":\"oops\"},{\"id\":2,\"text\":\"c\"}]",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![(0, "a".into()), (2, "c".into())],
+            "坏项应被跳过（随后的拆半重试会覆盖 id=1）"
+        );
     }
 
     #[test]

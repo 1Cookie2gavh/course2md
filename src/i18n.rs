@@ -141,6 +141,14 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
         "生成带注释的配置文件模板（已存在则拒绝，--force 覆盖）",
     );
     sub_about(cmd, &["config", "show"], "查看配置文件路径与文件中的设置");
-    sub_about(cmd, &["summarize"], "用 LLM 为已有输出目录生成视频总结（写入 course.md/html）");
-    sub_about(cmd, &["remove"], "清除 LLM/STT 的 API 配置（凭据清除，提交代码前可执行）");
+    sub_about(
+        cmd,
+        &["summarize"],
+        "用 LLM 为已有输出目录生成视频总结（写入 course.md/html）",
+    );
+    sub_about(
+        cmd,
+        &["remove"],
+        "清除 LLM/STT 的 API 配置（凭据清除，提交代码前可执行）",
+    );
 }

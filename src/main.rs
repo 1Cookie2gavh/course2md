@@ -229,7 +229,14 @@ fn main() -> anyhow::Result<()> {
                 collect_targets(dir, &mut targets, 0)?;
             }
             if targets.is_empty() {
-                anyhow::bail!("未找到包含 timeline.jsonl 的输出目录：{}", args.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "));
+                anyhow::bail!(
+                    "未找到包含 timeline.jsonl 的输出目录：{}",
+                    args.dirs
+                        .iter()
+                        .map(|d| d.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
             for dir in &targets {
                 summarize_dir(&file, dir, args.force, args.out.as_deref(), &rt)?;
@@ -239,7 +246,11 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Remove(args)) => {
             init_logging(0, false);
             let mut cfg = settings::load()?;
-            let mut cleared = vec!["llm.api_key".to_string(), "llm.base_url".to_string(), "llm.model".to_string()];
+            let mut cleared = vec![
+                "llm.api_key".to_string(),
+                "llm.base_url".to_string(),
+                "llm.model".to_string(),
+            ];
             cfg.llm.api_key.clear();
             cfg.llm.base_url.clear();
             cfg.llm.model.clear();
@@ -253,7 +264,11 @@ fn main() -> anyhow::Result<()> {
                 cfg.asr_api.api_key.clear();
             }
             let path = settings::save(&cfg)?;
-            println!("已清除 API 配置（{}）：{}", cleared.join(", "), path.display());
+            println!(
+                "已清除 API 配置（{}）：{}",
+                cleared.join(", "),
+                path.display()
+            );
             if !args.asr {
                 println!("提示：--asr 可同时清除云端 STT（[asr_api]）的 API Key。");
             }
@@ -281,7 +296,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// 递归收集包含 timeline.jsonl 的输出目录（支持直接传单个输出目录或整个输出根）。
-fn collect_targets(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) -> anyhow::Result<()> {
+fn collect_targets(
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+    depth: usize,
+) -> anyhow::Result<()> {
     if dir.join("timeline.jsonl").is_file() {
         out.push(dir.to_path_buf());
         return Ok(());
@@ -317,13 +336,15 @@ fn summarize_dir(
     );
     let mut events: Vec<course2md::timeline::TranscriptEvent> = vec![];
     for line in std::fs::read_to_string(&timeline_path)?.lines() {
-        if let Ok(ev) = serde_json::from_str::<TimelineEvent>(line) {
-            if let TimelineEvent::Speech(s) = ev {
-                events.push(s);
-            }
+        if let Ok(TimelineEvent::Speech(s)) = serde_json::from_str::<TimelineEvent>(line) {
+            events.push(s);
         }
     }
-    anyhow::ensure!(!events.is_empty(), "{} 中没有语音事件", timeline_path.display());
+    anyhow::ensure!(
+        !events.is_empty(),
+        "{} 中没有语音事件",
+        timeline_path.display()
+    );
 
     if !force {
         let has_md = md_path.is_file()
@@ -362,7 +383,10 @@ fn summarize_dir(
         } else {
             html
         };
-        std::fs::write(&html_path, course2md::summarize::insert_into_html(&html, &sm))?;
+        std::fs::write(
+            &html_path,
+            course2md::summarize::insert_into_html(&html, &sm),
+        )?;
     }
     // 可选：导出独立总结文件到 -o 指定目录
     if let Some(out_dir) = out {
@@ -378,7 +402,10 @@ fn summarize_dir(
             course2md::summarize::sanitize_filename(&title)
         );
         let target = out_dir.join(fname);
-        std::fs::write(&target, course2md::summarize::render_standalone_md(&title, &sm))?;
+        std::fs::write(
+            &target,
+            course2md::summarize::render_standalone_md(&title, &sm),
+        )?;
         println!("已导出总结：{}", target.display());
     }
     println!(

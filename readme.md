@@ -453,6 +453,32 @@ Measured on Apple Silicon (arm64) running a **3-minute** 1080p recorded lecture 
 
 ---
 
+## Video Summary (LLM, optional)
+
+With `[llm] summarize = true` (or `course2md summarize` after setup), course2md
+generates a **TL;DR / key points / timestamped outline** and inserts it at the
+top of `course.md` / `course.html`:
+
+```bash
+course2md summarize out/          # summarize existing outputs (idempotent, --force to overwrite)
+course2md summarize out/ -o dir/  # also export standalone <title>.summary.md files
+```
+
+- Hallucination guards: timestamped-subtitles-only input, temperature=0, structured JSON output
+- Map-reduce for long videos (chunked summaries → merge)
+- Reasoning-model friendly: json_object response format (auto-fallback when the
+  endpoint rejects it), 16384 max_tokens, split-half retry on failures,
+  4-way concurrent polishing
+
+## Remove Credentials
+
+Before sharing your config or committing code:
+
+```bash
+course2md remove          # clear LLM API config
+course2md remove --asr    # also clear the cloud STT API key
+```
+
 ## Troubleshooting
 
 Run the environment check first:

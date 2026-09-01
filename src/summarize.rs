@@ -6,7 +6,7 @@
 use crate::fetch::VideoMeta;
 use crate::llm::{self, LlmSettings};
 use crate::timeline::TranscriptEvent;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// 直接单次总结的最大字幕字符数（约 4 万字符 ≈ 5-6 万 token，128K 上下文内安全）。
@@ -29,6 +29,9 @@ pub struct Summary {
     pub outline: Vec<OutlineItem>,
 }
 
+/// markdown 总结区块的精确起点标记（幂等判断 / strip 均基于此）。
+const SUMMARY_MD_MARKER: &str = "## 📝 视频总结";
+
 const SYSTEM_PROMPT: &str = "你是视频内容总结助手。根据提供的带时间戳字幕为视频生成结构化总结。\
 严格要求：1) 只依据字幕内容，严禁编造字幕中不存在的事实、数字、人名或观点；\
 2) 对不确定的信息宁可省略也不要猜测；3) 使用视频原语言输出；\
@@ -37,7 +40,11 @@ const SYSTEM_PROMPT: &str = "你是视频内容总结助手。根据提供的带
 fn build_transcript(events: &[TranscriptEvent]) -> String {
     let mut out = String::new();
     for e in events {
-        out.push_str(&format!("[{}] {}\n", crate::render::fmt_ts(e.start), e.text));
+        out.push_str(&format!(
+            "[{}] {}\n",
+            crate::render::fmt_ts(e.start),
+            e.text
+        ));
     }
     out
 }
@@ -52,18 +59,6 @@ outline 按时间顺序覆盖整个视频，3-8 节。"
     )
 }
 
-fn clean_trailing_commas(s: &str) -> String {
-    let mut out = s.to_string();
-    loop {
-        let prev = out.clone();
-        out = out.replace(",}", "}").replace(",]", "]");
-        if out == prev {
-            break;
-        }
-    }
-    out
-}
-
 fn parse_time(v: Option<&serde_json::Value>) -> f64 {
     if let Some(n) = v.and_then(|x| x.as_f64()) {
         return n;
@@ -71,18 +66,18 @@ fn parse_time(v: Option<&serde_json::Value>) -> f64 {
     if let Some(s) = v.and_then(|x| x.as_str()) {
         let s = s.trim().trim_start_matches('[').trim_end_matches(']');
         let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() == 2 {
-            if let (Ok(m), Ok(sec)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                return m * 60.0 + sec;
-            }
-        } else if parts.len() == 3 {
-            if let (Ok(h), Ok(m), Ok(sec)) = (
+        if parts.len() == 2
+            && let (Ok(m), Ok(sec)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+        {
+            return m * 60.0 + sec;
+        } else if parts.len() == 3
+            && let (Ok(h), Ok(m), Ok(sec)) = (
                 parts[0].parse::<f64>(),
                 parts[1].parse::<f64>(),
                 parts[2].parse::<f64>(),
-            ) {
-                return h * 3600.0 + m * 60.0 + sec;
-            }
+            )
+        {
+            return h * 3600.0 + m * 60.0 + sec;
         }
     }
     0.0
@@ -96,9 +91,14 @@ fn parse_summary(content: &str) -> Option<Summary> {
     }
     let slice = &content[start..=end];
     let parsed = serde_json::from_str::<serde_json::Value>(slice)
-        .or_else(|_| serde_json::from_str::<serde_json::Value>(&clean_trailing_commas(slice)))
+        .or_else(|_| serde_json::from_str::<serde_json::Value>(&llm::clean_trailing_commas(slice)))
         .ok()?;
-    let tldr = parsed.get("tldr").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let tldr = parsed
+        .get("tldr")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let mut key_points = vec![];
     if let Some(arr) = parsed.get("key_points").and_then(|v| v.as_array()) {
         for v in arr {
@@ -113,8 +113,18 @@ fn parse_summary(content: &str) -> Option<Summary> {
     let mut outline = vec![];
     if let Some(arr) = parsed.get("outline").and_then(|v| v.as_array()) {
         for v in arr {
-            let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            let detail = v.get("detail").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let title = v
+                .get("title")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let detail = v
+                .get("detail")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let t = parse_time(v.get("t"));
             if !title.is_empty() || !detail.is_empty() {
                 outline.push(OutlineItem { t, title, detail });
@@ -124,7 +134,11 @@ fn parse_summary(content: &str) -> Option<Summary> {
     if tldr.is_empty() && key_points.is_empty() && outline.is_empty() {
         return None;
     }
-    Some(Summary { tldr, key_points, outline })
+    Some(Summary {
+        tldr,
+        key_points,
+        outline,
+    })
 }
 
 fn chat_once(s: &LlmSettings, sys: &str, user: &str) -> Result<String> {
@@ -195,7 +209,11 @@ pub async fn summarize(
     }
     // ---- map-reduce ----
     let chunks = split_chunks(events, CHUNK_CHAR_LIMIT);
-    tracing::info!(chunks = chunks.len(), chars = total_chars, "summary map-reduce");
+    tracing::info!(
+        chunks = chunks.len(),
+        chars = total_chars,
+        "summary map-reduce"
+    );
     let mut partials: Vec<Summary> = Vec::new();
     for (idx, chunk) in chunks.iter().enumerate() {
         let t = build_transcript(chunk);
@@ -205,7 +223,11 @@ pub async fn summarize(
             .context("总结线程 join 失败")?
             .unwrap_or_else(|e| {
                 tracing::warn!("分段总结失败（chunk {idx}）：{e:#}");
-                Summary { tldr: String::new(), key_points: vec![], outline: vec![] }
+                Summary {
+                    tldr: String::new(),
+                    key_points: vec![],
+                    outline: vec![],
+                }
             });
         partials.push(sm);
     }
@@ -240,10 +262,10 @@ pub async fn summarize(
     })
     .await
     .context("合并线程 join 失败")?;
-    if let Ok(combined) = combined {
-        if let Some(sm) = parse_summary(&combined) {
-            return Ok(sm);
-        }
+    if let Ok(combined) = combined
+        && let Some(sm) = parse_summary(&combined)
+    {
+        return Ok(sm);
     }
     // 合并失败：拼接分块总结兜底
     let mut tldr = String::new();
@@ -259,12 +281,16 @@ pub async fn summarize(
     if kp.is_empty() && ol.is_empty() {
         bail!("视频总结失败：所有分段均未返回有效内容");
     }
-    Ok(Summary { tldr, key_points: kp, outline: ol })
+    Ok(Summary {
+        tldr,
+        key_points: kp,
+        outline: ol,
+    })
 }
 
 /// 生成插入 course.md 的总结区块（markdown）。
 pub fn render_md_block(sm: &Summary) -> String {
-    let mut out = String::from("\n## 📝 视频总结\n\n");
+    let mut out = format!("\n{SUMMARY_MD_MARKER}\n\n");
     out.push_str(&format!("> {}\n", sm.tldr));
     if !sm.key_points.is_empty() {
         out.push_str("\n### 核心要点\n\n");
@@ -275,7 +301,12 @@ pub fn render_md_block(sm: &Summary) -> String {
     if !sm.outline.is_empty() {
         out.push_str("\n### 内容大纲\n\n");
         for o in &sm.outline {
-            out.push_str(&format!("- **{}** {}：{}\n", crate::render::fmt_ts(o.t), o.title, o.detail));
+            out.push_str(&format!(
+                "- **{}** {}：{}\n",
+                crate::render::fmt_ts(o.t),
+                o.title,
+                o.detail
+            ));
         }
     }
     out.push('\n');
@@ -286,7 +317,10 @@ pub fn render_md_block(sm: &Summary) -> String {
 pub fn render_html_block(sm: &Summary) -> String {
     let mut out = String::new();
     out.push_str("<section class=\"summary\"><h2>📝 视频总结</h2>");
-    out.push_str(&format!("<p class=\"mute\">{}</p>", crate::render::esc(&sm.tldr)));
+    out.push_str(&format!(
+        "<p class=\"mute\">{}</p>",
+        crate::render::esc(&sm.tldr)
+    ));
     if !sm.key_points.is_empty() {
         out.push_str("<h3>核心要点</h3><ul>");
         for p in &sm.key_points {
@@ -354,9 +388,8 @@ pub fn sanitize_filename(name: &str) -> String {
     let mut s = String::new();
     for ch in name.chars() {
         match ch {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\u{201c}' | '\u{201d}' | '\u{ff1f}' | '\u{ff1a}' => {
-                s.push('_')
-            }
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\u{201c}' | '\u{201d}'
+            | '\u{ff1f}' | '\u{ff1a}' => s.push('_'),
             c if c.is_control() => s.push('_'),
             c => s.push(c),
         }
@@ -370,13 +403,14 @@ pub fn sanitize_filename(name: &str) -> String {
 }
 
 /// 判断已渲染文档是否已包含总结区块（用于幂等跳过）。
+/// 用精确 marker，避免视频标题本身含「视频总结」字样时误判。
 pub fn contains_summary(md: &str) -> bool {
-    md.contains("视频总结")
+    md.contains(SUMMARY_MD_MARKER)
 }
 
 /// 从 markdown 中移除已有总结区块（--force 重写时使用）。
 pub fn strip_md_summary(md: &str) -> String {
-    let marker = "## 📝 视频总结";
+    let marker = SUMMARY_MD_MARKER;
     if let Some(start) = md.find(marker) {
         let start_at = md[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
         let after = &md[start..];
@@ -390,13 +424,74 @@ pub fn strip_md_summary(md: &str) -> String {
 
 /// 从 HTML 中移除已有总结区块（--force 重写时使用）。
 pub fn strip_html_summary(html: &str) -> String {
-    if let Some(start) = html.find("<section class=\"summary\">") {
-        if let Some(end_rel) = html[start..].find("</section>") {
-            let end = start + end_rel + "</section>".len();
-            let mut out = html[..start].to_string();
-            out.push_str(&html[end..]);
-            return out;
-        }
+    if let Some(start) = html.find("<section class=\"summary\">")
+        && let Some(end_rel) = html[start..].find("</section>")
+    {
+        let end = start + end_rel + "</section>".len();
+        let mut out = html[..start].to_string();
+        out.push_str(&html[end..]);
+        return out;
     }
     html.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_summary_tolerates_fences_and_trailing_commas() {
+        let content = "```json\n{\"tldr\": \"讲编译原理\", \"key_points\": [\"词法\",\"语法\",], \"outline\": [{\"t\": \"00:30\", \"title\": \"开场\", \"detail\": \"介绍\"}]}\n```";
+        let sm = parse_summary(content).unwrap();
+        assert_eq!(sm.tldr, "讲编译原理");
+        assert_eq!(sm.key_points.len(), 2);
+        assert_eq!(sm.outline.len(), 1);
+        assert!(
+            (sm.outline[0].t - 30.0).abs() < 1e-6,
+            "mm:ss 字符串时间可解析"
+        );
+    }
+
+    #[test]
+    fn md_insert_and_strip_roundtrip() {
+        let md = "# 标题\n\n---\n\n## [00:00](u)\n\n正文\n";
+        let sm = Summary {
+            tldr: "概述".into(),
+            key_points: vec!["要点一".into()],
+            outline: vec![OutlineItem {
+                t: 12.0,
+                title: "章节".into(),
+                detail: "内容".into(),
+            }],
+        };
+        let with = insert_into_md(md, &sm);
+        assert!(contains_summary(&with));
+        assert!(
+            with.find("视频总结").unwrap() < with.find("## [00:00]").unwrap(),
+            "总结在正文前"
+        );
+        let stripped = strip_md_summary(&with);
+        assert!(!contains_summary(&stripped));
+        assert!(stripped.contains("## [00:00]"), "正文保留");
+        // 标题含「视频总结」不误判
+        assert!(!contains_summary("# 视频总结速览课\n\n正文"));
+    }
+
+    #[test]
+    fn html_insert_and_strip_roundtrip() {
+        let html =
+            "<html><body><header><h1>t</h1></header>\n<section><p>x</p></section>\n</body></html>";
+        let sm = Summary {
+            tldr: "t".into(),
+            key_points: vec![],
+            outline: vec![],
+        };
+        let with = insert_into_html(html, &sm);
+        assert!(
+            with.find("<section class=\"summary\">").unwrap() < with.find("<section>").unwrap()
+        );
+        let stripped = strip_html_summary(&with);
+        assert!(!stripped.contains("summary"));
+        assert!(stripped.contains("<section>"));
+    }
 }

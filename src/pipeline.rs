@@ -210,7 +210,11 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
             .collect();
         match crate::summarize::summarize(&cfg.llm, &speech, &meta).await {
             Ok(sm) => {
-                tracing::info!(points = sm.key_points.len(), chapters = sm.outline.len(), "summary done");
+                tracing::info!(
+                    points = sm.key_points.len(),
+                    chapters = sm.outline.len(),
+                    "summary done"
+                );
                 Some(sm)
             }
             Err(e) => {
@@ -223,7 +227,14 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     };
     tracing::info!(sections = sections.len(), "merged");
 
-    render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats, summary.as_ref()).await?;
+    render::write_outputs(
+        &cfg.out_dir,
+        &meta,
+        &sections,
+        &cfg.formats,
+        summary.as_ref(),
+    )
+    .await?;
     // 只删自己下载的视频；本地输入与既有工作区文件不动。
     let media_deleted =
         should_delete_media(is_local, cfg.no_download, media_existed, cfg.keep_video);
