@@ -93,8 +93,7 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
                 let tmp =
                     std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
                 let _ = std::fs::create_dir_all(&tmp);
-                let res =
-                    crate::apple::run_coreml(&wav, max_speech, &model, cut_wav, &tmp, &mut cp);
+                let res = crate::apple::run_coreml(&wav, max_speech, &model, &tmp, &mut cp);
                 let res = res.and_then(|ev| cp.finish().map(|()| ev));
                 let _ = std::fs::remove_dir_all(&tmp);
                 res
@@ -171,11 +170,40 @@ fn run_blocking(
 
     let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
+    let r = run_chunks(&input.wav, &segs, cp, &tmp, "asr", |_i, _seg, chunk| {
+        transcribe_file(&base, chunk).map(|t| {
+            let t = sanitize_qwen_text(&t);
+            (!t.is_empty()).then_some(t)
+        })
+    });
+    child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&tmp);
+    let events = r?;
+    tracing::info!(
+        n = events.len(),
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "asr done"
+    );
+    Ok(events)
+}
+
+/// 顺序 chunk 执行器：统一切音频、断点跳过、进度条、记录（含空结果）、
+/// chunk 清理与收尾排序。backend 只需提供「chunk 文件 → 文本」函数。
+/// Ok(None) = 后端确认无语音内容（同样记录完成，避免静音段反复重跑）。
+pub(crate) fn run_chunks(
+    wav: &Path,
+    segs: &[Seg],
+    cp: &mut crate::checkpoint::Checkpoint,
+    tmp_dir: &Path,
+    label: &str,
+    mut transcribe: impl FnMut(usize, Seg, &Path) -> Result<Option<String>>,
+) -> Result<Vec<TranscriptEvent>> {
     let pb = indicatif::ProgressBar::new(segs.len() as u64);
     pb.set_style(
-        indicatif::ProgressStyle::with_template(
-            "{spinner:.green} asr {pos}/{len} [{bar:32.cyan/blue}] {elapsed} {msg}",
-        )
+        indicatif::ProgressStyle::with_template(&format!(
+            "{{spinner:.green}} {label} {{pos}}/{{len}} [{{bar:32.cyan/blue}}] {{elapsed}} {{msg}}"
+        ))
         .unwrap()
         .progress_chars("##-"),
     );
@@ -187,21 +215,21 @@ fn run_blocking(
             pb.inc(1);
             continue; // 断点续跑：该 chunk 上次已完成
         }
-        let chunk = tmp.join(format!("c{i:04}.wav"));
-        if let Err(e) = cut_wav(&input.wav, seg.cut_start, seg.cut_end, &chunk) {
+        let chunk = tmp_dir.join(format!("c{i:04}.wav"));
+        if let Err(e) = cut_wav(wav, seg.cut_start, seg.cut_end, &chunk) {
             err = Some(e);
             break;
         }
-        match transcribe_file(&base, &chunk) {
-            Ok(raw) => {
-                let text = sanitize_qwen_text(&raw);
-                // 空文本也记录（静音 chunk）；写盘失败则中断且不标记完成
-                if let Err(e) = cp.record(start, end, &text) {
+        match transcribe(i, seg, &chunk) {
+            Ok(text) => {
+                // 空结果也记录完成；写盘失败则中断且不标记完成
+                if let Err(e) = cp.record(start, end, text.as_deref().unwrap_or("")) {
                     err = Some(e);
                     break;
                 }
             }
             Err(e) => {
+                let _ = std::fs::remove_file(&chunk);
                 err = Some(e);
                 break;
             }
@@ -210,20 +238,12 @@ fn run_blocking(
         pb.inc(1);
     }
     pb.finish_and_clear();
-    child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&tmp);
     if let Some(e) = err {
         return Err(e);
     }
     // 事件统一来自 checkpoint（历史 + 本次），按时间排序
     let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
     all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    tracing::info!(
-        n = all.len(),
-        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
-        "asr done"
-    );
     Ok(all)
 }
 
@@ -280,24 +300,21 @@ fn run_api(
     let wav_path = std::sync::Arc::new(wav.to_path_buf());
     let model = api.model.clone();
     let key = api.api_key.clone();
-    // 断点续跑：预计算每个 chunk 是否已完成（worker 线程不能借用 cp）
-    let skip: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> = segs
-        .iter()
-        .map(|s| {
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                cp.is_done(s.start, s.end),
-            ))
-        })
+    // 断点续跑：预先过滤出未完成的 chunk（worker 只拿真正需要执行的任务）
+    let pending: Vec<usize> = (0..segs.len())
+        .filter(|&i| !cp.is_done(segs[i].start, segs[i].end))
         .collect();
+    pb.set_position((segs.len() - pending.len()) as u64);
+    let pending = std::sync::Arc::new(pending);
 
-    // 有界并发（默认 4）：网络往返是主要瓶颈；结果按下标保序
+    // 有界并发（默认 4）：网络往返是主要瓶颈；结果经 channel 回收后记录
     const WORKERS: usize = 4;
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Option<String>, String>)>();
     let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handles: Vec<_> = (0..WORKERS)
         .map(|_| {
-            let (tx, client, segs, tmp, model, key, url, next, abort, wav_path, skip) = (
+            let (tx, client, segs, tmp, model, key, url, next, abort, wav_path, pending) = (
                 tx.clone(),
                 client.clone(),
                 segs.clone(),
@@ -308,21 +325,18 @@ fn run_api(
                 next.clone(),
                 abort.clone(),
                 wav_path.clone(),
-                skip.clone(),
+                pending.clone(),
             );
             std::thread::spawn(move || {
                 loop {
                     if abort.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if i >= segs.len() {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(i) = pending.get(idx).copied() else {
                         break;
-                    }
+                    };
                     let seg = segs[i];
-                    if skip[i].load(std::sync::atomic::Ordering::Relaxed) {
-                        continue; // 断点续跑（主线程预计算）
-                    }
                     let r = transcribe_api(
                         &client,
                         &url,
@@ -341,7 +355,6 @@ fn run_api(
         .collect();
     drop(tx);
 
-    let mut results: Vec<Option<Option<String>>> = vec![None; segs.len()];
     let mut err: Option<anyhow::Error> = None;
     for (i, r) in rx {
         match r {
@@ -353,7 +366,6 @@ fn run_api(
                     err = Some(e);
                     abort.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                results[i] = Some(text);
             }
             Err(e) => {
                 if err.is_none() {

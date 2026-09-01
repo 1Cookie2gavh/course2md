@@ -256,7 +256,6 @@ pub fn run_coreml(
     wav: &Path,
     max_speech: f64,
     model: &str,
-    cut: impl Fn(&Path, f64, f64, &Path) -> Result<()>,
     tmp_dir: &Path,
     cp: &mut crate::checkpoint::Checkpoint,
 ) -> Result<Vec<TranscriptEvent>> {
@@ -277,57 +276,16 @@ pub fn run_coreml(
         "coreml ready"
     );
 
-    let pb = indicatif::ProgressBar::new(segs.len() as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::with_template(
-            "{spinner:.green} asr {pos}/{len} [{bar:32.cyan/blue}] {elapsed} {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
-
-    for (i, seg) in segs.iter().copied().enumerate() {
-        let (start, end) = (seg.start, seg.end);
-        if cp.is_done(start, end) {
-            pb.inc(1);
-            continue; // 断点续跑
-        }
-        let chunk = tmp_dir.join(format!("c{i:04}.wav"));
-        cut(wav, seg.cut_start, seg.cut_end, &chunk)?;
-        match asr.transcribe(&chunk) {
-            Ok(Some(text)) => {
-                let text = crate::asr::sanitize_qwen_text(&text);
-                // 空结果也记录完成（静音 chunk）；写盘失败不标记完成
-                if let Err(e) = cp.record(start, end, &text) {
-                    let _ = std::fs::remove_file(&chunk);
-                    pb.finish_and_clear();
-                    return Err(e);
-                }
-            }
-            Ok(None) => {
-                if let Err(e) = cp.record(start, end, "") {
-                    let _ = std::fs::remove_file(&chunk);
-                    pb.finish_and_clear();
-                    return Err(e);
-                }
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&chunk);
-                pb.finish_and_clear();
-                return Err(e);
-            }
-        }
-        let _ = std::fs::remove_file(&chunk);
-        pb.inc(1);
-    }
-    pb.finish_and_clear();
-    // 事件统一来自 checkpoint（历史 + 本次），按时间排序
-    let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
-    all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+    let r = crate::asr::run_chunks(wav, &segs, cp, tmp_dir, "asr", |_i, _seg, chunk| {
+        asr.transcribe(chunk).map(|t| {
+            let t = t.map(|s| crate::asr::sanitize_qwen_text(&s));
+            t.filter(|s| !s.is_empty())
+        })
+    })?;
     tracing::info!(
-        n = all.len(),
+        n = r.len(),
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
         "asr done"
     );
-    Ok(all)
+    Ok(r)
 }

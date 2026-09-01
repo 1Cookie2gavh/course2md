@@ -9,7 +9,7 @@ use crate::checkpoint::Checkpoint;
 use crate::config::PipelineConfig;
 use crate::timeline::TranscriptEvent;
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -176,64 +176,29 @@ pub fn run_npu(
     let tmp = std::env::temp_dir().join(format!("course2md-npu-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
-    let pb = ProgressBar::new(segs.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} npu asr {pos}/{len} [{bar:32.cyan/blue}] {elapsed} {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
-
     let client = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(120))
         .build();
 
-    let mut err: Option<anyhow::Error> = None;
-
-    for (i, seg) in segs.iter().copied().enumerate() {
-        let (start, end) = (seg.start, seg.end);
-        if cp.is_done(start, end) {
-            pb.inc(1);
-            continue;
-        }
-
-        let chunk = tmp.join(format!("c{i:04}.wav"));
-        if let Err(e) = crate::asr::cut_wav(wav, seg.cut_start, seg.cut_end, &chunk) {
-            err = Some(e);
-            break;
-        }
-
+    let r = crate::asr::run_chunks(wav, &segs, cp, &tmp, "npu asr", |_i, _seg, chunk| {
         let req_body = serde_json::json!({
             "path": chunk.to_string_lossy(),
         });
-
-        match client
+        let resp = client
             .post(&format!("{base}/audio/transcriptions"))
             .send_json(req_body)
-        {
-            Ok(resp) => {
-                let v: serde_json::Value = resp.into_json()?;
-                let text = v["text"].as_str().unwrap_or("").trim().to_string();
-                let sanitized = crate::asr::sanitize_qwen_text(&text);
-                // 空结果也记录完成（静音 chunk）；写盘失败不标记完成
-                if let Err(e) = cp.record(start, end, &sanitized) {
-                    let _ = std::fs::remove_file(&chunk);
-                    err = Some(e);
-                    break;
-                }
-            }
-            Err(e) => {
-                err = Some(anyhow::anyhow!("NPU 转写请求失败: {e}"));
-                let _ = std::fs::remove_file(&chunk);
-                break;
-            }
+            .map_err(|e| anyhow::anyhow!("NPU 转写请求失败: {e}"))?;
+        let v: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| anyhow::anyhow!("NPU 响应解析失败: {e}"))?;
+        if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+            anyhow::bail!("NPU worker 报错: {e}");
         }
-        let _ = std::fs::remove_file(&chunk);
-        pb.inc(1);
-    }
+        let text = v["text"].as_str().unwrap_or("").trim().to_string();
+        let sanitized = crate::asr::sanitize_qwen_text(&text);
+        Ok((!sanitized.is_empty()).then_some(sanitized))
+    });
 
-    pb.finish_and_clear();
     // 优雅通知 worker 退出，并终止整个进程组（避免 uv 衍生的孙子进程残留）
     let _ = client
         .post(&format!("{base}/shutdown"))
@@ -250,18 +215,13 @@ pub fn run_npu(
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&tmp);
 
-    if let Some(e) = err {
-        return Err(e);
-    }
-
-    let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
-    all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+    let events = r?;
     tracing::info!(
-        n = all.len(),
+        n = events.len(),
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
         "npu asr done"
     );
-    Ok(all)
+    Ok(events)
 }
 
 fn write_worker_script(out_dir: &Path) -> Result<PathBuf> {
