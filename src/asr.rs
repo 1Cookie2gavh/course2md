@@ -160,9 +160,19 @@ fn run_blocking(
     let port = crate::runtime::free_port()?;
     tracing::info!(bin = %bin.display(), port, ngl, "llama-server");
     let mut child = spawn_server(&bin, &input.model, &input.mmproj, ngl, threads, port)?;
+    let stderr_tail = child
+        .take_stderr()
+        .map(crate::runtime::drain_stderr)
+        .unwrap_or_default();
     let base = format!("http://127.0.0.1:{port}");
-    // 子进程秒退（端口冲突/模型损坏）会立即报错，而不是等满 300s
-    crate::runtime::wait_ready(&base, Duration::from_secs(300), &mut child)?;
+    // 子进程秒退（端口冲突/模型损坏）会立即报错，而不是等满 300s；
+    // 失败时附上 llama-server 自己的 stderr 尾部，诊断信息不因 piped 而丢失
+    if let Err(e) = crate::runtime::wait_ready(&base, Duration::from_secs(300), &mut child) {
+        return Err(e.context(format!(
+            "llama-server 启动失败，其 stderr 尾部：\n{}",
+            stderr_tail.tail()
+        )));
+    }
     tracing::info!(
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
         "server ready"
@@ -179,7 +189,15 @@ fn run_blocking(
     child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&tmp);
-    let events = r?;
+    let events = r.map_err(|e| {
+        // 转写中途失败大概率是 server 侧问题，附上 stderr 尾部便于定位
+        let tail = stderr_tail.tail();
+        if tail.is_empty() {
+            e
+        } else {
+            e.context(format!("llama-server stderr 尾部：\n{}", tail))
+        }
+    })?;
     tracing::info!(
         n = events.len(),
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
@@ -464,7 +482,10 @@ fn spawn_server(
         .arg("--host")
         .arg("127.0.0.1")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        // stderr 不能 inherit：llama-server 每个 chunk 都打 slot timing 日志，
+        // 会插在进度条重绘中间，破坏 indicatif 的原地更新（issue #4）。
+        // 改为 piped + 后台 drain，尾部缓存用于失败诊断，debug 日志可转发。
+        .stderr(Stdio::piped());
     crate::runtime::ManagedChild::spawn("llama-server", &mut cmd)
 }
 
