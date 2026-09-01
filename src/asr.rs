@@ -40,13 +40,20 @@ pub fn sanitize_qwen_text(s: &str) -> String {
 }
 
 pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<TranscriptEvent>> {
+    let mut cp = crate::checkpoint::Checkpoint::open(&cfg.out_dir, cfg.resume)?;
     if cfg.provider.eq_ignore_ascii_case("api") {
         let api = cfg.asr_api.clone();
         let max_speech = cfg.max_speech as f64;
         let wav = wav.to_path_buf();
-        let joined = tokio::task::spawn_blocking(move || run_api(&api, &wav, max_speech))
-            .await
-            .context("ASR 线程 join 失败")?;
+        let joined = tokio::task::spawn_blocking(move || {
+            let r = run_api(&api, &wav, max_speech, &mut cp);
+            if r.is_ok() {
+                cp.finish();
+            }
+            r
+        })
+        .await
+        .context("ASR 线程 join 失败")?;
         return joined;
     }
     if cfg.provider.eq_ignore_ascii_case("coreml") {
@@ -58,7 +65,10 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
             let joined = tokio::task::spawn_blocking(move || {
                 let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
                 let _ = std::fs::create_dir_all(&tmp);
-                let res = crate::apple::run_coreml(&wav, max_speech, &model, cut_wav, &tmp);
+                let res = crate::apple::run_coreml(&wav, max_speech, &model, cut_wav, &tmp, &mut cp);
+                if res.is_ok() {
+                    cp.finish();
+                }
                 let _ = std::fs::remove_dir_all(&tmp);
                 res
             })
@@ -84,14 +94,22 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
     let threads = cfg.threads;
     let max_speech = cfg.max_speech;
     let llama = crate::models::ensure_llama_or_download(&cfg.model_dir).await?;
+    // coreml 回落场景下 cp 已被 move：磁盘上的进度重新打开即可续
+    let mut cp = crate::checkpoint::Checkpoint::open(&cfg.out_dir, cfg.resume)?;
     let input = AsrInput {
         wav: wav.to_path_buf(),
         model: llama.model,
         mmproj: llama.mmproj,
     };
-    tokio::task::spawn_blocking(move || run_blocking(&input, ngl, threads, max_speech))
-        .await
-        .context("ASR 线程 join 失败")?
+    tokio::task::spawn_blocking(move || {
+        let r = run_blocking(&input, ngl, threads, max_speech, &mut cp);
+        if r.is_ok() {
+            cp.finish();
+        }
+        r
+    })
+    .await
+    .context("ASR 线程 join 失败")?
 }
 
 fn run_blocking(
@@ -99,6 +117,7 @@ fn run_blocking(
     ngl: i32,
     threads: i32,
     max_speech: f32,
+    cp: &mut crate::checkpoint::Checkpoint,
 ) -> Result<Vec<TranscriptEvent>> {
     let t0 = Instant::now();
     let segs = ffmpeg_vad(&input.wav, max_speech)?;
@@ -134,6 +153,10 @@ fn run_blocking(
     let mut err: Option<anyhow::Error> = None;
     for (i, seg) in segs.iter().copied().enumerate() {
         let (start, end) = (seg.start, seg.end);
+        if cp.is_done(start, end) {
+            pb.inc(1);
+            continue; // 断点续跑：该 chunk 上次已完成
+        }
         let chunk = tmp.join(format!("c{i:04}.wav"));
         if let Err(e) = cut_wav(&input.wav, seg.cut_start, seg.cut_end, &chunk) {
             err = Some(e);
@@ -143,6 +166,7 @@ fn run_blocking(
             Ok(raw) => {
                 let text = sanitize_qwen_text(&raw);
                 if !text.is_empty() {
+                    cp.record(start, end, &text);
                     events.push(TranscriptEvent { start, end, text, raw: None });
                 }
             }
@@ -161,12 +185,21 @@ fn run_blocking(
     if let Some(e) = err {
         return Err(e);
     }
-    tracing::info!(n = events.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
-    Ok(events)
+    // resume 场景：合并历史 + 本次事件，按时间排序
+    let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
+    all.extend(events);
+    all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+    tracing::info!(n = all.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
+    Ok(all)
 }
 
 /// 云端 STT：ffmpeg VAD 分段 + 逐段 POST /audio/transcriptions（OpenAI 兼容 / OpenRouter）。
-fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result<Vec<TranscriptEvent>> {
+fn run_api(
+    api: &crate::settings::AsrApi,
+    wav: &Path,
+    max_speech: f64,
+    cp: &mut crate::checkpoint::Checkpoint,
+) -> Result<Vec<TranscriptEvent>> {
     let t0 = Instant::now();
     // key 解析（非递归）：配置 > 非空环境变量；空值不覆盖（防无限递归）
     let api_key = if !api.api_key.trim().is_empty() {
@@ -210,6 +243,11 @@ fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result
     let wav_path = std::sync::Arc::new(wav.to_path_buf());
     let model = api.model.clone();
     let key = api.api_key.clone();
+    // 断点续跑：预计算每个 chunk 是否已完成（worker 线程不能借用 cp）
+    let skip: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> = segs
+        .iter()
+        .map(|s| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cp.is_done(s.start, s.end))))
+        .collect();
 
     // 有界并发（默认 4）：网络往返是主要瓶颈；结果按下标保序
     const WORKERS: usize = 4;
@@ -218,7 +256,7 @@ fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result
     let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handles: Vec<_> = (0..WORKERS)
         .map(|_| {
-            let (tx, client, segs, tmp, model, key, url, next, abort, wav_path) = (
+            let (tx, client, segs, tmp, model, key, url, next, abort, wav_path, skip) = (
                 tx.clone(),
                 client.clone(),
                 segs.clone(),
@@ -229,6 +267,7 @@ fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result
                 next.clone(),
                 abort.clone(),
                 wav_path.clone(),
+                skip.clone(),
             );
             std::thread::spawn(move || loop {
                 if abort.load(std::sync::atomic::Ordering::Relaxed) {
@@ -239,6 +278,9 @@ fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result
                     break;
                 }
                 let seg = segs[i];
+                if skip[i].load(std::sync::atomic::Ordering::Relaxed) {
+                    continue; // 断点续跑（主线程预计算）
+                }
                 let r = transcribe_api(&client, &url, &model, &key, &tmp.join(format!("c{i:04}.wav")), seg, &wav_path);
                 if tx.send((i, r)).is_err() {
                     break;
@@ -252,7 +294,12 @@ fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result
     let mut err: Option<anyhow::Error> = None;
     for (i, r) in rx {
         match r {
-            Ok(text) => results[i] = Some(text),
+            Ok(text) => {
+                if let Some(t) = &text {
+                    cp.record(segs[i].start, segs[i].end, t);
+                }
+                results[i] = Some(text);
+            }
             Err(e) => {
                 if err.is_none() {
                     err = Some(anyhow::anyhow!("云端 STT 失败（chunk {i}）：{e}"));
@@ -270,7 +317,7 @@ fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result
     if let Some(e) = err {
         return Err(e);
     }
-    let events: Vec<TranscriptEvent> = segs
+    let new_events: Vec<TranscriptEvent> = segs
         .iter()
         .zip(results)
         .filter_map(|(seg, text)| {
@@ -282,6 +329,11 @@ fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result
             })
         })
         .collect();
+    // resume：合并历史 + 本次
+    let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
+    all.extend(new_events);
+    all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+    let events = all;
     tracing::info!(n = events.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
     Ok(events)
 }

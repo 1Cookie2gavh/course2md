@@ -139,6 +139,14 @@ pub struct RunOpts {
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
+    /// Resume from checkpoints in the output dir (skip completed ASR chunks)
+    #[arg(long)]
+    pub resume: bool,
+
+    /// Ignore existing checkpoints and redo everything
+    #[arg(long)]
+    pub no_resume: bool,
+
     /// Errors only
     #[arg(short, long)]
     pub quiet: bool,

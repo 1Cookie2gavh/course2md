@@ -22,6 +22,8 @@ pub struct PipelineConfig {
     pub model_dir: PathBuf,
     pub keep_video: bool,
     pub no_download: bool,
+    /// 断点续跑：跳过输出目录中已完成的 ASR chunk
+    pub resume: bool,
     /// LLM 字幕润色（已合并 CLI 覆盖后的生效配置）
     pub llm: crate::llm::LlmSettings,
     /// 云端 STT（provider=api；已合并 CLI 覆盖）

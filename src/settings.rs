@@ -26,6 +26,7 @@ pub struct Defaults {
     pub model_dir: Option<PathBuf>,
     pub keep_video: Option<bool>,
     pub no_download: Option<bool>,
+    pub resume: Option<bool>,
 }
 
 /// 云端 STT（provider = "api"，OpenAI 兼容 /audio/transcriptions，如 OpenRouter）。

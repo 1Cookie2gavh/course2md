@@ -126,6 +126,7 @@ fn run_opts_to_cfg(
         ),
         keep_video: opts.keep_video || d.keep_video.unwrap_or(false),
         no_download: opts.no_download || d.no_download.unwrap_or(false),
+        resume: opts.resume || d.resume.unwrap_or(false),
         llm: resolve_llm(opts, file),
         asr_api: resolve_asr_api(opts, file),
         asr_model: opts

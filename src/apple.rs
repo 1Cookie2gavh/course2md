@@ -210,6 +210,7 @@ pub fn run_coreml(
     model: &str,
     cut: impl Fn(&Path, f64, f64, &Path) -> Result<()>,
     tmp_dir: &Path,
+    cp: &mut crate::checkpoint::Checkpoint,
 ) -> Result<Vec<TranscriptEvent>> {
     let t0 = Instant::now();
     let raw = vad(wav, 0.25, 0.35)?;
@@ -237,12 +238,17 @@ pub fn run_coreml(
     let mut events = vec![];
     for (i, seg) in segs.iter().copied().enumerate() {
         let (start, end) = (seg.start, seg.end);
+        if cp.is_done(start, end) {
+            pb.inc(1);
+            continue; // 断点续跑
+        }
         let chunk = tmp_dir.join(format!("c{i:04}.wav"));
         cut(wav, seg.cut_start, seg.cut_end, &chunk)?;
         match asr.transcribe(&chunk) {
             Ok(Some(text)) => {
                 let text = crate::asr::sanitize_qwen_text(&text);
                 if !text.is_empty() {
+                    cp.record(start, end, &text);
                     events.push(TranscriptEvent { start, end, text, raw: None });
                 }
             }
@@ -257,6 +263,10 @@ pub fn run_coreml(
         pb.inc(1);
     }
     pb.finish_and_clear();
-    tracing::info!(n = events.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
-    Ok(events)
+    // resume：合并历史 + 本次
+    let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
+    all.extend(events);
+    all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+    tracing::info!(n = all.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
+    Ok(all)
 }
