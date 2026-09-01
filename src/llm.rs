@@ -30,6 +30,8 @@ pub struct LlmSettings {
     pub prompt: Option<String>,
     /// 关闭「可开启 LLM」的结束提示
     pub disable_hint: bool,
+    /// 转换完成后自动生成视频总结并写入 md/html（需 enabled）
+    pub summarize: bool,
 }
 
 /// base_url -> 完整 chat/completions URL。
@@ -67,39 +69,62 @@ pub fn polish(mut events: Vec<TranscriptEvent>, s: &LlmSettings) -> Vec<Transcri
     let mut warned = false;
     for chunk in events.chunks_mut(BATCH) {
         pb.inc(1);
-        // 带分段下标请求/校验：防止模型重排或漏项导致的静默错位
-        let items: Vec<(usize, &str)> = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (i, e.text.as_str()))
-            .collect();
-        match chat(s, &items) {
-            Ok(polished) => {
-                let mut by_id: Vec<Option<String>> = vec![None; chunk.len()];
-                let mut bad = false;
-                for (id, text) in polished {
-                    if id >= chunk.len() || by_id[id].is_some() {
-                        bad = true;
-                        break;
-                    }
-                    by_id[id] = Some(text);
-                }
-                if bad || by_id.iter().any(|v| v.is_none()) {
-                    warn_once(&mut warned, "LLM 返回 id 集与输入不符，该批保留原文");
+        polish_chunk(s, chunk, &mut warned);
+    }
+    pb.finish_and_clear();
+    events
+}
+
+/// 递归润色一个分块；整块失败（如推理模型 token 耗尽返回空）时拆半重试，保证尽力而为。
+fn polish_chunk(s: &LlmSettings, chunk: &mut [TranscriptEvent], warned: &mut bool) {
+    if chunk.is_empty() {
+        return;
+    }
+    // 带分段下标请求/校验：防止模型重排或漏项导致的静默错位
+    let items: Vec<(usize, &str)> = chunk
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i, e.text.as_str()))
+        .collect();
+    match chat(s, &items) {
+        Ok(polished) => {
+            let mut by_id: Vec<Option<String>> = vec![None; chunk.len()];
+            let mut bad = false;
+            for (id, text) in polished {
+                if id >= chunk.len() || by_id[id].is_some() {
+                    bad = true;
                     continue;
                 }
-                for (ev, new_text) in chunk.iter_mut().zip(by_id.into_iter().map(|v| v.unwrap())) {
+                by_id[id] = Some(text);
+            }
+            let applied = by_id.iter().filter(|v| v.is_some()).count();
+            if applied == 0 {
+                warn_once(warned, "LLM 未返回任何有效条目，该批保留原文");
+                return;
+            }
+            if bad {
+                warn_once(warned, "LLM 返回部分条目异常，仅应用有效条目");
+            }
+            for (ev, new_text) in chunk.iter_mut().zip(by_id.into_iter()) {
+                if let Some(new_text) = new_text {
                     if !new_text.is_empty() && new_text != ev.text {
                         ev.raw.get_or_insert_with(|| ev.text.clone());
                         ev.text = new_text;
                     }
                 }
             }
-            Err(e) => warn_once(&mut warned, &format!("LLM 润色失败（{e:#}），保留原文")),
+        }
+        Err(e) => {
+            if chunk.len() <= 1 {
+                warn_once(warned, &format!("LLM 润色失败（{e:#}），保留原文"));
+                return;
+            }
+            tracing::debug!("LLM 批次失败，拆半重试（{} 段）", chunk.len());
+            let mid = chunk.len() / 2;
+            polish_chunk(s, &mut chunk[..mid], warned);
+            polish_chunk(s, &mut chunk[mid..], warned);
         }
     }
-    pb.finish_and_clear();
-    events
 }
 
 fn warn_once(warned: &mut bool, msg: &str) {
@@ -121,40 +146,139 @@ fn chat(s: &LlmSettings, items: &[(usize, &str)]) -> Result<Vec<(usize, String)>
     let body = serde_json::json!({
         "model": s.model,
         "temperature": 0.0,
-        "max_tokens": 4096,
+        "max_tokens": 16384,
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": format!("{} 输出为 JSON 数组，每项形如 {{\"id\":序号,\"text\":润色后的文本}}，id 必须与输入一一对应。", effective_prompt(s))},
             {"role": "user", "content": serde_json::to_string(&payload)?},
         ],
     });
-    let resp = ureq::post(&endpoint(&s.base_url))
-        .timeout(Duration::from_secs(180))
-        .set("Content-Type", "application/json")
-        .set("Authorization", &format!("Bearer {}", s.api_key))
-        .send_json(body)
-        .context("LLM 请求失败")?;
-    let v: serde_json::Value = resp.into_json().context("LLM 响应解析失败")?;
-    let content = v["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    parse_id_text_pairs(&content)
-        .with_context(|| format!("LLM 响应不是 id/text JSON 数组: {:.200}", content))
+    let content = send_chat(&s, &body).context("LLM 请求失败")?;
+    parse_id_text_pairs(&content).with_context(|| {
+        let hint = if content.trim().is_empty() {
+            "content 为空（推理模型可能耗尽 token 预算，将自动拆半重试）".to_string()
+        } else {
+            format!("{:.200}", content)
+        };
+        format!("LLM 响应不是 id/text JSON 数组: {hint}")
+    })
 }
 
-/// 从模型输出提取 [{"id":n,"text":"..."}]（容忍代码围栏与前后杂文）。
+pub(crate) fn send_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<String> {
+    let resp = ureq::post(&endpoint(&s.base_url))
+        .timeout(Duration::from_secs(300))
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", s.api_key))
+        .send_json(body.clone())
+        .context("LLM 请求失败")?;
+    let v: serde_json::Value = resp.into_json().context("LLM 响应解析失败")?;
+    Ok(v["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string())
+}
+
+/// 从模型输出提取 [{"id":n,"text":"..."}]（容忍代码围栏、前后杂文、尾逗号与个别坏项）。
 pub fn parse_id_text_pairs(content: &str) -> Option<Vec<(usize, String)>> {
     let start = content.find('[')?;
     let end = content.rfind(']')?;
     if end <= start {
         return None;
     }
-    let v: Vec<serde_json::Value> = serde_json::from_str(&content[start..=end]).ok()?;
+    let slice = &content[start..=end];
+    // 1) 严格解析
+    if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(slice) {
+        return parse_items(&v);
+    }
+    // 2) 清除尾逗号后重试
+    let cleaned = remove_trailing_commas(slice);
+    if cleaned != slice {
+        if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned) {
+            return parse_items(&v);
+        }
+    }
+    // 3) 宽容扫描：跳过坏项，收集合法 {"id":..,"text":".."}
+    lenient_scan(slice)
+}
+
+fn parse_items(v: &[serde_json::Value]) -> Option<Vec<(usize, String)>> {
     let mut out = vec![];
     for item in v {
         let id = item.get("id")?.as_u64()? as usize;
         let text = item.get("text")?.as_str()?.to_string();
         out.push((id, text));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn remove_trailing_commas(s: &str) -> String {
+    let mut out = s.to_string();
+    loop {
+        let prev = out.clone();
+        out = out.replace(",}", "}").replace(",]", "]");
+        if out == prev {
+            break;
+        }
+    }
+    out
+}
+
+/// 逐个扫描 {"id":N,"text":"..."}，坏项跳过；能取到至少一项即返回。
+fn lenient_scan(s: &str) -> Option<Vec<(usize, String)>> {
+    let mut out: Vec<(usize, String)> = vec![];
+    let mut rest = s;
+    let mut guard = 0;
+    while let Some(rel) = rest.find("\"id\"") {
+        guard += 1;
+        if guard > 10_000 {
+            break;
+        }
+        let tail = &rest[rel..];
+        // 找该对象起点
+        let obj_start = tail.find('{')?;
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut end = None;
+        let bytes = tail[obj_start..].as_bytes();
+        for (k, &b) in bytes.iter().enumerate() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(obj_start + k + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tail[obj_start..end]) {
+            if let (Some(id), Some(text)) = (
+                v.get("id").and_then(|x| x.as_u64()).map(|x| x as usize),
+                v.get("text").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            ) {
+                out.push((id, text));
+            }
+        }
+        rest = &tail[end.min(tail.len())..];
     }
     if out.is_empty() {
         None

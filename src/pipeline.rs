@@ -125,11 +125,28 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         events
     };
 
+    // 可选的 LLM 视频总结（自动写入 md/html 开头）
+    let summary = if cfg.llm.enabled && cfg.llm.summarize {
+        tracing::info!(model = %cfg.llm.model, "llm summary");
+        match crate::summarize::summarize(&cfg.llm, &events, &meta).await {
+            Ok(sm) => {
+                tracing::info!(points = sm.key_points.len(), chapters = sm.outline.len(), "summary done");
+                Some(sm)
+            }
+            Err(e) => {
+                tracing::warn!("LLM 总结失败（{e:#}），跳过总结");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let sections = timeline::merge(frames.clone(), events.clone());
     timeline::write_jsonl(&cfg.timeline_path(), &frames, &events)?;
     tracing::info!(sections = sections.len(), "merged");
 
-    render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats).await?;
+    render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats, summary.as_ref()).await?;
     // 只删自己下载的视频；本地输入文件不动。
     if !cfg.keep_video && media != local {
         let _ = tokio::fs::remove_file(&media).await;

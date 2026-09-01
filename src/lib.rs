@@ -14,4 +14,5 @@ pub mod pipeline;
 pub mod render;
 pub mod settings;
 pub mod scene;
+pub mod summarize;
 pub mod timeline;

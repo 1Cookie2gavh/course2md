@@ -141,6 +141,8 @@ enabled = false
 #prompt = ""
 # 关闭任务结束时的 LLM 开启提示
 #disable_hint = false
+# 转换完成后自动生成视频总结（TL;DR/要点/大纲）并写入 md/html 开头（需 enabled）
+#summarize = false
 "#;
 
 /// 打印生效配置（CLI 覆盖合并前，来自文件的值）。
@@ -168,4 +170,5 @@ pub fn print_effective(cfg: &ConfigFile) {
     println!("[llm]");
     println!("  enabled        : {}", cfg.llm.enabled);
     println!("  model          : {}", if cfg.llm.model.is_empty() { "-" } else { &cfg.llm.model });
+    println!("  summarize      : {}", cfg.llm.summarize);
 }

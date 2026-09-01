@@ -96,29 +96,36 @@ pub fn render_json(meta: &VideoMeta, sections: &[Section]) -> Result<String> {
     })?)
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
 
-/// 按 formats 集合写文件。
+/// 按 formats 集合写文件；summary 非空时插入 md/html（元信息之后）。
 pub async fn write_outputs(
     out_dir: &Path,
     meta: &VideoMeta,
     sections: &[Section],
     formats: &[String],
+    summary: Option<&crate::summarize::Summary>,
 ) -> Result<()> {
     for f in formats {
         match f.as_str() {
             "md" => {
-                tokio::fs::write(out_dir.join("course.md"), render_markdown(meta, sections))
-                    .await?;
+                let mut md = render_markdown(meta, sections);
+                if let Some(sm) = summary {
+                    md = crate::summarize::insert_into_md(&md, sm);
+                }
+                tokio::fs::write(out_dir.join("course.md"), md).await?;
             }
             "html" => {
-                tokio::fs::write(out_dir.join("course.html"), render_html(meta, sections))
-                    .await?;
+                let mut html = render_html(meta, sections);
+                if let Some(sm) = summary {
+                    html = crate::summarize::insert_into_html(&html, sm);
+                }
+                tokio::fs::write(out_dir.join("course.html"), html).await?;
             }
             "json" => {
                 tokio::fs::write(out_dir.join("structured.json"), render_json(meta, sections)?)
