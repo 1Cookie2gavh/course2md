@@ -90,16 +90,22 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<(f6
     let mut buf = vec![0u8; frame_len];
     let pb = ProgressBar::new(total);
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} sample {pos}/{len} [{bar:32.cyan/blue}] {msg}")
-            .unwrap()
-            .progress_chars("##-"),
+        ProgressStyle::with_template(
+            "{spinner:.green} sample {pos}/{len} [{bar:32.cyan/blue}] {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-"),
     );
 
     // 三状态检测：检测永不休眠（cooldown 只限制「发射」，不再造成盲区）。
     //   last_emitted  已输出的视觉状态
     //   candidate     正在观察的候选画面（含首次出现时间，用于真实时间戳）
     // 发射条件：候选与上一输出差异显著 + 稳定时长足够 + 距上次发射 >= cooldown。
-    let stable_for = if cfg.slide_mode == "stable" { cfg.stable_secs } else { 0.0 };
+    let stable_for = if matches!(cfg.slide_mode, crate::config::SlideMode::Stable) {
+        cfg.stable_secs
+    } else {
+        0.0
+    };
     let mut times: Vec<(f64, f64)> = vec![];
     let mut last_emitted: Option<GrayImage> = None;
     let mut candidate: Option<GrayImage> = None;
@@ -187,9 +193,11 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
 
     let pb = ProgressBar::new(times.len() as u64);
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} extract {pos}/{len} [{bar:32.cyan/blue}] {msg}")
-            .unwrap()
-            .progress_chars("##-"),
+        ProgressStyle::with_template(
+            "{spinner:.green} extract {pos}/{len} [{bar:32.cyan/blue}] {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-"),
     );
     let mut frames = vec![];
     for (i, &(onset_t, capture_t)) in times.iter().enumerate() {

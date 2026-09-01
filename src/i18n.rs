@@ -31,11 +31,7 @@ pub fn is_zh() -> bool {
 
 /// 按当前语言返回文案。
 pub fn tr<'a>(en: &'a str, zh: &'a str) -> &'a str {
-    if is_zh() {
-        zh
-    } else {
-        en
-    }
+    if is_zh() { zh } else { en }
 }
 
 /// 把 clap Command 的帮助文案替换为当前语言。
@@ -74,16 +70,31 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
     for (id, help) in [
         ("source", "视频链接或本地文件"),
         ("out", "输出根目录（其下按 平台/标题/编号 归类）"),
-        ("similarity", "画面变化阈值，越低截图越多"),
+        ("similarity", "画面相似度阈值，越高越敏感（截图更多）"),
         ("sample_interval", "每隔几秒检查一次画面"),
         ("cooldown", "新截图之后至少间隔多少秒"),
         ("roi", "只比较画面中的区域，如 40%,0%-100%,100%"),
         ("threads", "识别线程数"),
-        ("provider", "识别后端：coreml（仅 macOS Apple Silicon）/ gpu（Metal/CUDA）/ cpu / api（云端 STT）/ npu（Intel NPU）"),
-        ("asr_model", "coreml 后端模型：qwen3 | whisper（large-v3-turbo）"),
-        ("asr_api_base_url", "云端 STT base URL（OpenAI 兼容，如 https://openrouter.ai/api/v1）"),
-        ("asr_api_key", "云端 STT API Key（也读 OPENROUTER_API_KEY 环境变量）"),
-        ("asr_api_model", "云端 STT 模型（如 qwen/qwen3-asr-flash-2026-02-10）"),
+        (
+            "provider",
+            "识别后端：gpu（默认推荐，Metal/CUDA）/ npu（Intel NPU加速）/ coreml / cpu / api（云端）",
+        ),
+        (
+            "asr_model",
+            "识别模型：qwen3（强烈推荐 Qwen3-ASR 1.7B）| whisper（多语言）| tiny | base",
+        ),
+        (
+            "asr_api_base_url",
+            "云端 STT base URL（OpenAI 兼容，如 https://openrouter.ai/api/v1）",
+        ),
+        (
+            "asr_api_key",
+            "云端 STT API Key（也读 OPENROUTER_API_KEY 环境变量）",
+        ),
+        (
+            "asr_api_model",
+            "云端 STT 模型（如 qwen/qwen3-asr-flash-2026-02-10）",
+        ),
         ("max_speech", "单段语音最长秒数（过长会切分）"),
         ("formats", "输出格式"),
         ("model_dir", "模型目录（默认 ~/.cache/course2md/models）"),
@@ -113,8 +124,17 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
     );
     sub_about(cmd, &["llm", "status"], "查看当前配置（密钥打码）");
     sub_about(cmd, &["llm", "disable"], "关闭 LLM 润色（保留凭据）");
+    sub_about(
+        cmd,
+        &["doctor"],
+        "环境体检：依赖工具/后端可用性/配置/模型缓存",
+    );
     sub_about(cmd, &["config"], "配置文件管理");
-    sub_about(cmd, &["config", "init"], "生成带注释的配置文件模板（已存在则拒绝，--force 覆盖）");
+    sub_about(
+        cmd,
+        &["config", "init"],
+        "生成带注释的配置文件模板（已存在则拒绝，--force 覆盖）",
+    );
     sub_about(cmd, &["config", "show"], "查看配置文件路径与文件中的设置");
     sub_about(cmd, &["summarize"], "用 LLM 为已有输出目录生成视频总结（写入 course.md/html）");
     sub_about(cmd, &["remove"], "清除 LLM/STT 的 API 配置（凭据清除，提交代码前可执行）");

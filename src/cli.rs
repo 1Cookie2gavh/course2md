@@ -37,7 +37,7 @@ pub struct RunOpts {
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
-    /// Frame-similarity threshold; lower = more screenshots
+    /// Frame-similarity threshold; higher = more sensitive = more screenshots
     #[arg(long)]
     pub similarity: Option<f64>,
 
@@ -55,7 +55,7 @@ pub struct RunOpts {
 
     /// Slide emission mode: first | stable (stable waits for animation to settle)
     #[arg(long, value_enum)]
-    pub slide_mode: Option<SlideModeArg>,
+    pub slide_mode: Option<crate::config::SlideMode>,
 
     /// Seconds a frame must stay unchanged before emitting (stable mode)
     #[arg(long)]
@@ -69,11 +69,11 @@ pub struct RunOpts {
     #[arg(long)]
     pub threads: Option<i32>,
 
-    /// ASR backend: coreml (Apple Silicon only) / gpu (Metal/CUDA) / cpu / api (cloud STT)
+    /// ASR backend: coreml (Apple Silicon only) / gpu (Metal/CUDA) / cpu / npu (Intel NPU) / api (cloud STT)
     #[arg(long, value_enum)]
-    pub provider: Option<ProviderArg>,
+    pub provider: Option<crate::config::AsrProvider>,
 
-    /// coreml backend model: qwen3 | whisper (large-v3-turbo)
+    /// ASR model: qwen3 (default & recommended Qwen3-ASR 1.7B) | whisper (large-v3-turbo) | tiny | base
     #[arg(long)]
     pub asr_model: Option<String>,
 
@@ -89,13 +89,17 @@ pub struct RunOpts {
     #[arg(long)]
     pub asr_api_model: Option<String>,
 
+    /// Transcript source: auto (subtitle first, then ASR) | subtitle | asr
+    #[arg(long, value_enum)]
+    pub transcript_source: Option<crate::config::TranscriptSource>,
+
     /// Max seconds per speech segment (longer segments are split)
     #[arg(long)]
     pub max_speech: Option<f32>,
 
-    /// Output formats
-    #[arg(long, value_delimiter = ',')]
-    pub formats: Option<Vec<String>>,
+    /// Output formats (md/html/json)
+    #[arg(long, value_delimiter = ',', value_enum)]
+    pub formats: Option<Vec<crate::config::OutputFormat>>,
 
     /// Model directory (default ~/.cache/course2md/models)
     #[arg(long)]
@@ -146,27 +150,12 @@ pub struct RunOpts {
     pub resume: bool,
 
     /// Ignore existing checkpoints and redo everything
-    #[arg(long)]
+    #[arg(long, conflicts_with = "resume")]
     pub no_resume: bool,
 
     /// Errors only
     #[arg(short, long)]
     pub quiet: bool,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum ProviderArg {
-    Coreml,
-    Gpu,
-    Cpu,
-    Api,
-    Npu,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum SlideModeArg {
-    First,
-    Stable,
 }
 
 #[derive(Subcommand)]
@@ -181,6 +170,8 @@ pub enum Command {
         #[command(subcommand)]
         cmd: LlmCmd,
     },
+    /// Diagnose the environment (tools, backends, config, model cache)
+    Doctor,
     /// Manage the config file
     Config {
         #[command(subcommand)]

@@ -29,16 +29,62 @@ impl VideoMeta {
 
 /// 抓取元数据（不下载）。
 pub async fn fetch_meta(url: &str) -> Result<VideoMeta> {
-    let out = run(Command::new("yt-dlp").args([
-        "-J",
-        "--no-warnings",
-        "--no-playlist",
-    ])
-    .arg(url))
+    let out = run(Command::new("yt-dlp")
+        .args(["-J", "--no-warnings", "--no-playlist"])
+        .arg(url))
     .await?;
-    let meta: VideoMeta =
-        serde_json::from_str(&out).context("解析 yt-dlp 元数据 JSON 失败")?;
+    let meta: VideoMeta = serde_json::from_str(&out).context("解析 yt-dlp 元数据 JSON 失败")?;
     Ok(meta)
+}
+
+/// 抓取的平台字幕（yt-dlp 产物）。
+pub struct SubtitleFetch {
+    pub path: PathBuf,
+    /// true = 平台自动生成字幕（auto-caption）
+    pub auto: bool,
+}
+
+/// 用 yt-dlp 获取平台字幕并转为 srt：先人工字幕，再自动字幕。
+/// 平台不提供字幕时 yt-dlp 正常退出但不产出文件 → 返回 None。
+pub async fn fetch_subtitle(url: &str, out_dir: &Path) -> Result<Option<SubtitleFetch>> {
+    let dir = out_dir.join(".subs");
+    // 每次重新抓取，避免读到上次运行残留的旧字幕
+    let _ = std::fs::remove_dir_all(&dir);
+    tokio::fs::create_dir_all(&dir).await?;
+    let tmpl = dir.join("sub");
+    for auto in [false, true] {
+        let mut cmd = Command::new("yt-dlp");
+        cmd.args([
+            "--skip-download",
+            "--convert-subs",
+            "srt",
+            "--sub-format",
+            "srt/vtt/best",
+            "--sub-langs",
+            "zh.*,en.*",
+            "-o",
+        ])
+        .arg(&tmpl);
+        if auto {
+            cmd.arg("--write-auto-subs");
+        } else {
+            cmd.arg("--write-subs");
+        }
+        cmd.arg(url);
+        // 无字幕不是错误（yt-dlp 打 warning 后成功退出）；网络失败也先继续尝试 auto
+        if run(&mut cmd).await.is_err() {
+            continue;
+        }
+        if let Some(path) = crate::subtitle::pick_subtitle_file(&dir) {
+            return Ok(Some(SubtitleFetch { path, auto }));
+        }
+    }
+    Ok(None)
+}
+
+/// 本地视频的同名字幕 sidecar（lecture.mp4 → lecture.srt/.vtt）。
+pub fn sidecar_subtitle(video: &Path) -> Option<SubtitleFetch> {
+    crate::subtitle::sidecar_subtitle(video).map(|path| SubtitleFetch { path, auto: false })
 }
 
 /// 下载视频到 `dest`（默认 1080p 上限，mp4 合并）。已存在则跳过。
@@ -124,4 +170,3 @@ async fn run_status(cmd: &mut Command) -> Result<()> {
     }
     Ok(())
 }
-

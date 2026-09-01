@@ -10,7 +10,11 @@
 use std::process::Command;
 
 fn have_ffmpeg() -> bool {
-    Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// 生成 20s 1280x720 测试视频（黑/灰/白整屏填充，亮度差异大、SSIM 可区分；
@@ -54,14 +58,14 @@ fn scene_detects_slides_with_true_timestamps() {
         similarity: 0.9,
         sample_interval: 0.5,
         cooldown: 10.0,
-        slide_mode: "first".into(),
+        slide_mode: course2md::config::SlideMode::First,
         stable_secs: 0.0,
         max_height: 1080,
         roi: None,
         threads: 2,
-        provider: "cpu".into(),
+        provider: course2md::config::AsrProvider::Cpu,
         max_speech: 20.0,
-        formats: vec!["md".into()],
+        formats: vec![course2md::config::OutputFormat::Md],
         model_dir: dir.clone(),
         keep_video: true,
         no_download: true,
@@ -69,6 +73,7 @@ fn scene_detects_slides_with_true_timestamps() {
         llm: Default::default(),
         asr_api: Default::default(),
         asr_model: None,
+        transcript_source: course2md::config::TranscriptSource::Asr,
     };
 
     let frames = tokio::runtime::Runtime::new()
@@ -82,7 +87,11 @@ fn scene_detects_slides_with_true_timestamps() {
     //   14.5s "D" 距上次发射 <10s，被跳过。
     let ts: Vec<f64> = frames.iter().map(|f| f.t).collect();
     assert!(ts.len() >= 2, "至少应检出 2 帧，got {ts:?}");
-    assert!((ts[0] - 0.0).abs() < 1.0, "第一帧应为 0s 附近，got {}", ts[0]);
+    assert!(
+        (ts[0] - 0.0).abs() < 1.0,
+        "第一帧应为 0s 附近，got {}",
+        ts[0]
+    );
     assert!(
         (ts[1] - 7.5).abs() < 1.0,
         "第二帧应为 C 页首次出现时间 7.5s（而非 cooldown 到期的 ~10s），got {}（全部：{ts:?}）",
@@ -122,14 +131,14 @@ drawbox=color=gray:t=fill:enable='gte(t,3.5)'";
         similarity: 0.9,
         sample_interval: 0.5,
         cooldown: 2.0,
-        slide_mode: "stable".into(),
+        slide_mode: course2md::config::SlideMode::Stable,
         stable_secs: 1.2,
         max_height: 1080,
         roi: None,
         threads: 2,
-        provider: "cpu".into(),
+        provider: course2md::config::AsrProvider::Cpu,
         max_speech: 20.0,
-        formats: vec!["md".into()],
+        formats: vec![course2md::config::OutputFormat::Md],
         model_dir: dir.clone(),
         keep_video: true,
         no_download: true,
@@ -137,6 +146,7 @@ drawbox=color=gray:t=fill:enable='gte(t,3.5)'";
         llm: Default::default(),
         asr_api: Default::default(),
         asr_model: None,
+        transcript_source: course2md::config::TranscriptSource::Asr,
     };
 
     let frames = tokio::runtime::Runtime::new()

@@ -13,14 +13,16 @@ use std::time::Instant;
 
 pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     let t_total = Instant::now();
+    cfg.validate().context("配置预检失败")?;
     crate::error::require_cmd("ffmpeg")?;
     crate::error::require_cmd("ffprobe")?;
-    if !cfg.provider.eq_ignore_ascii_case("coreml")
-        && !cfg.provider.eq_ignore_ascii_case("api")
-        && !cfg.provider.eq_ignore_ascii_case("npu")
-    {
+    use config::AsrProvider;
+    if !matches!(
+        cfg.provider,
+        AsrProvider::Coreml | AsrProvider::Api | AsrProvider::Npu
+    ) {
         crate::error::require_cmd("llama-server")?;
-    } else if cfg.provider.eq_ignore_ascii_case("coreml")
+    } else if cfg.provider == AsrProvider::Coreml
         && crate::error::require_cmd("llama-server").is_err()
     {
         // fallback 是 best-effort：提前告知而不是失败后才发现
@@ -88,32 +90,96 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     );
 
     let dest = cfg.media_path();
+    // 文件所有权：只有本次运行真正下载的文件才允许结束时清理。
+    // --no-download 复用的既有 media.mp4 属于用户资产，永远不删。
+    let media_existed = !is_local && dest.is_file();
     // 本地文件直接原地处理，不拷贝；下载类输入落到 dest。
     let media: std::path::PathBuf = if is_local {
         tracing::info!(path = %local.display(), "local video");
         local.to_path_buf()
+    } else if media_existed {
+        tracing::info!(path = %dest.display(), "media exists, skip download");
+        dest
     } else if !cfg.no_download {
         tracing::info!("download video");
-        fetch::download(&cfg.url, &dest, cfg.max_height, tracing::enabled!(tracing::Level::DEBUG)).await?;
+        fetch::download(
+            &cfg.url,
+            &dest,
+            cfg.max_height,
+            tracing::enabled!(tracing::Level::DEBUG),
+        )
+        .await?;
         dest
     } else {
         anyhow::ensure!(dest.is_file(), "--no-download 但 {} 不存在", dest.display());
         dest
     };
 
-    tracing::info!("extract slides and audio");
-    let audio_path = cfg.audio_path();
-    let (frames_res, audio_res) = tokio::join!(
-        scene::run(&cfg, &media),
-        media::extract_audio(&media, &audio_path)
-    );
-    let frames = frames_res?;
-    audio_res?;
-    anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
-    // ASR 可能合法返回空（静音课件）；由后续正常渲染成"无语音"讲义
+    // —— 转写来源：平台字幕优先（人工 > 自动），无字幕再走本地 ASR ——
+    // 有字幕时完全不抽音频、不加载模型（issue #1）
+    let subtitle: Option<(Vec<timeline::TranscriptEvent>, &'static str)> = match cfg
+        .transcript_source
+    {
+        config::TranscriptSource::Asr => None,
+        _ => {
+            let fetched = if is_local {
+                fetch::sidecar_subtitle(local)
+            } else {
+                tracing::info!("probe platform subtitles");
+                fetch::fetch_subtitle(&cfg.url, &cfg.out_dir)
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            match fetched {
+                Some(f) => {
+                    let content = std::fs::read_to_string(&f.path)
+                        .with_context(|| format!("读取字幕 {}", f.path.display()))?;
+                    let events = crate::subtitle::parse_subtitle(&content);
+                    if events.is_empty() {
+                        tracing::warn!(path = %f.path.display(), "字幕解析为空，回落 ASR");
+                        None
+                    } else {
+                        let source: &'static str = if f.auto { "auto-caption" } else { "subtitle" };
+                        tracing::info!(
+                            events = events.len(),
+                            source,
+                            path = %f.path.display(),
+                            "subtitle transcript"
+                        );
+                        Some((events, source))
+                    }
+                }
+                None => None,
+            }
+        }
+    };
+    if cfg.transcript_source == config::TranscriptSource::Subtitle && subtitle.is_none() {
+        anyhow::bail!(
+            "--transcript-source subtitle：未获取到字幕（平台未提供人工/自动字幕，本地输入无同名 .srt/.vtt）"
+        );
+    }
 
-    tracing::info!(device = %cfg.provider, "transcribe");
-    let events = asr::run(&cfg, &cfg.audio_path()).await?;
+    let transcript_source_used = subtitle.as_ref().map_or("asr", |(_, s)| *s);
+    let (frames, events) = if let Some((events, _source)) = subtitle {
+        // 字幕路径：只跑场景检测，跳过音频与 ASR
+        let frames = scene::run(&cfg, &media).await?;
+        (frames, events)
+    } else {
+        tracing::info!("extract slides and audio");
+        let audio_path = cfg.audio_path();
+        let (frames_res, audio_res) = tokio::join!(
+            scene::run(&cfg, &media),
+            media::extract_audio(&media, &audio_path)
+        );
+        let frames = frames_res?;
+        audio_res?;
+        tracing::info!(device = %cfg.provider, "transcribe");
+        let events = asr::run(&cfg, &cfg.audio_path()).await?;
+        (frames, events)
+    };
+    anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
+    // 转写可能合法返回空（静音课件）；由后续正常渲染成"无语音"讲义
 
     // 可选的 LLM 润色（配置已在管线开头校验）
     let events = if cfg.llm.enabled {
@@ -142,13 +208,15 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         None
     };
 
-    let sections = timeline::merge(frames.clone(), events.clone());
+    let sections = timeline::merge(frames.clone(), events.clone(), meta.duration);
     timeline::write_jsonl(&cfg.timeline_path(), &frames, &events)?;
     tracing::info!(sections = sections.len(), "merged");
 
     render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats, summary.as_ref()).await?;
-    // 只删自己下载的视频；本地输入文件不动。
-    if !cfg.keep_video && media != local {
+    // 只删自己下载的视频；本地输入与既有工作区文件不动。
+    let media_deleted =
+        should_delete_media(is_local, cfg.no_download, media_existed, cfg.keep_video);
+    if media_deleted {
         let _ = tokio::fs::remove_file(&media).await;
     }
 
@@ -164,7 +232,49 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         peak_mb,
         child_peak_mb,
     };
-    print_summary(&cfg, &meta, &sections, &stats, &media, is_local);
+    print_summary(
+        &cfg,
+        &meta,
+        &sections,
+        &stats,
+        &media,
+        is_local,
+        media_deleted,
+    );
+
+    // run.json：本次运行溯源（版本/源/转写来源/后端/模型/统计/耗时）。
+    // 「这份文稿到底是什么模型跑的」从此可查；issue 报告请附上此文件。
+    let speech_n: usize = sections.iter().map(|s| s.speech.len()).sum();
+    let chars: usize = sections
+        .iter()
+        .flat_map(|s| s.speech.iter())
+        .map(|e| e.text.chars().count())
+        .sum();
+    let run_info = serde_json::json!({
+        "course2md_version": env!("CARGO_PKG_VERSION"),
+        "source": {
+            "kind": if is_local { "local" } else { "remote" },
+            "platform": platform,
+            "id": id,
+            "url": cfg.url,
+        },
+        "provider": cfg.provider.as_str(),
+        "transcript_source": transcript_source_used,
+        "asr_model": cfg.asr_model.clone().unwrap_or_else(|| "backend-default".into()),
+        "resume": cfg.resume,
+        "formats": cfg.formats.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+        "llm_polish": cfg.llm.enabled,
+        "sections": sections.len(),
+        "speech_segments": speech_n,
+        "chars": chars,
+        "elapsed_secs": (stats.elapsed_secs * 100.0).round() / 100.0,
+    });
+    if let Err(e) = crate::checkpoint::atomic_write(
+        &cfg.out_dir.join("run.json"),
+        serde_json::to_string_pretty(&run_info)?.as_bytes(),
+    ) {
+        tracing::warn!("写 run.json 失败（不影响其他产物）：{e:#}");
+    }
     Ok(())
 }
 
@@ -181,6 +291,7 @@ fn print_summary(
     stats: &RunStats,
     media: &Path,
     is_local: bool,
+    media_deleted: bool,
 ) {
     let out = &cfg.out_dir;
     let speech_n: usize = sections.iter().map(|s| s.speech.len()).sum();
@@ -191,50 +302,99 @@ fn print_summary(
         .sum();
 
     eprintln!();
-    eprintln!("{}", crate::i18n::tr("──────── course2md done ────────", "──────── course2md 完成 ────────"));
+    eprintln!(
+        "{}",
+        crate::i18n::tr(
+            "──────── course2md done ────────",
+            "──────── course2md 完成 ────────"
+        )
+    );
     eprintln!("{}: {}", crate::i18n::tr("Title", "标题"), meta.title);
-    eprintln!("{}: {}", crate::i18n::tr("Output dir", "输出目录"), out.display());
+    eprintln!(
+        "{}: {}",
+        crate::i18n::tr("Output dir", "输出目录"),
+        out.display()
+    );
     eprintln!();
     eprintln!("{}:", crate::i18n::tr("Documents", "文稿"));
     for f in &cfg.formats {
-        let name = match f.as_str() {
-            "md" => "course.md",
-            "html" => "course.html",
-            "json" => "structured.json",
-            other => other,
-        };
-        let p = out.join(name);
+        let p = out.join(f.output_name());
         if p.is_file() {
             eprintln!("  {}", p.display());
         }
     }
-    eprintln!("{}: {}/frames/  ({} {})", crate::i18n::tr("Screenshots", "截图"), out.display(), sections.len(), crate::i18n::tr("images", "张"));
+    eprintln!(
+        "{}: {}/frames/  ({} {})",
+        crate::i18n::tr("Screenshots", "截图"),
+        out.display(),
+        sections.len(),
+        crate::i18n::tr("images", "张")
+    );
     eprintln!("音频：{}", cfg.audio_path().display());
     if is_local {
-        eprintln!("{}: {}  ({})", crate::i18n::tr("Video", "视频"), media.display(), crate::i18n::tr("local input, untouched", "本地输入，未改动"));
-    } else if cfg.keep_video {
-        eprintln!("{}: {}  ({})", crate::i18n::tr("Video", "视频"), media.display(), crate::i18n::tr("kept", "已保留"));
+        eprintln!(
+            "{}: {}  ({})",
+            crate::i18n::tr("Video", "视频"),
+            media.display(),
+            crate::i18n::tr("local input, untouched", "本地输入，未改动")
+        );
+    } else if media_deleted {
+        eprintln!(
+            "{}: {} ({})",
+            crate::i18n::tr("Video", "视频"),
+            crate::i18n::tr("downloaded this run, deleted", "本次下载，已删除"),
+            crate::i18n::tr("use --keep-video to keep", "用 --keep-video 可保留")
+        );
     } else {
-        eprintln!("{}: {} (--keep-video)", crate::i18n::tr("Video", "视频"), crate::i18n::tr("deleted", "已删除"));
+        eprintln!(
+            "{}: {}  ({})",
+            crate::i18n::tr("Video", "视频"),
+            media.display(),
+            crate::i18n::tr("kept", "已保留")
+        );
     }
-    eprintln!("{}: {}", crate::i18n::tr("Timeline", "时间线"), cfg.timeline_path().display());
+    eprintln!(
+        "{}: {}",
+        crate::i18n::tr("Timeline", "时间线"),
+        cfg.timeline_path().display()
+    );
     eprintln!();
     eprintln!(
         "{}: {} {} / {} {} / {} {}",
         crate::i18n::tr("Stats", "统计"),
-        sections.len(), crate::i18n::tr("screenshots", "张截图"),
-        speech_n, crate::i18n::tr("speech segments", "段语音"),
-        chars, crate::i18n::tr("chars", "字")
+        sections.len(),
+        crate::i18n::tr("screenshots", "张截图"),
+        speech_n,
+        crate::i18n::tr("speech segments", "段语音"),
+        chars,
+        crate::i18n::tr("chars", "字")
     );
-    eprintln!("{}: {}", crate::i18n::tr("Elapsed", "耗时"), fmt_duration(stats.elapsed_secs));
+    eprintln!(
+        "{}: {}",
+        crate::i18n::tr("Elapsed", "耗时"),
+        fmt_duration(stats.elapsed_secs)
+    );
     match (stats.peak_mb, stats.child_peak_mb) {
         (Some(mb), Some(c)) => eprintln!(
-            "{}: {mb:.0} MB (course2md) + {} {c:.0} MB (llama-server/ffmpeg)", crate::i18n::tr("Peak memory", "峰值内存"), crate::i18n::tr("largest child", "最大子进程")
+            "{}: {mb:.0} MB (course2md) + {} {c:.0} MB (llama-server/ffmpeg)",
+            crate::i18n::tr("Peak memory", "峰值内存"),
+            crate::i18n::tr("largest child", "最大子进程")
         ),
-        (Some(mb), None) => eprintln!("{}: {mb:.0} MB", crate::i18n::tr("Peak memory (process RSS)", "峰值内存（本进程 RSS）")),
-        _ => eprintln!("{}: {}", crate::i18n::tr("Peak memory", "峰值内存"), crate::i18n::tr("unavailable", "不可用")),
+        (Some(mb), None) => eprintln!(
+            "{}: {mb:.0} MB",
+            crate::i18n::tr("Peak memory (process RSS)", "峰值内存（本进程 RSS）")
+        ),
+        _ => eprintln!(
+            "{}: {}",
+            crate::i18n::tr("Peak memory", "峰值内存"),
+            crate::i18n::tr("unavailable", "不可用")
+        ),
     }
-    eprintln!("{}: {}", crate::i18n::tr("Model dir", "模型目录"), cfg.model_dir.display());
+    eprintln!(
+        "{}: {}",
+        crate::i18n::tr("Model dir", "模型目录"),
+        cfg.model_dir.display()
+    );
     eprintln!("──────────────────────────────");
     if !cfg.llm.enabled && !cfg.llm.disable_hint {
         crate::llm::write_hint_note(&crate::settings::config_path());
@@ -279,6 +439,17 @@ fn local_fingerprint(p: &Path) -> String {
     format!("{h:016x}")[..8].to_string()
 }
 
+/// 结束时是否允许删除媒体文件：仅当「本次运行下载的」且未要求保留。
+/// --no-download 复用的既有文件、本地输入永远不删。
+fn should_delete_media(
+    is_local: bool,
+    no_download: bool,
+    media_existed: bool,
+    keep_video: bool,
+) -> bool {
+    !is_local && !no_download && !media_existed && !keep_video
+}
+
 fn fmt_duration(secs: f64) -> String {
     let s = secs.max(0.0).round() as u64;
     if s < 60 {
@@ -313,4 +484,23 @@ fn peak_rss_mb(who: libc::c_int) -> Option<f64> {
 #[cfg(not(unix))]
 fn peak_rss_mb(_who: i32) -> Option<f64> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_delete_media;
+
+    #[test]
+    fn never_delete_files_we_did_not_download() {
+        // --no-download 复用既有文件：不删（旧行为会删！）
+        assert!(!should_delete_media(false, true, true, false));
+        // 上次运行已存在的文件（resume 场景）：不删
+        assert!(!should_delete_media(false, false, true, false));
+        // 本地输入：不删
+        assert!(!should_delete_media(true, false, false, false));
+        // 本次真下载 + keep_video：不删
+        assert!(!should_delete_media(false, false, false, true));
+        // 本次真下载 + 未要求保留：删
+        assert!(should_delete_media(false, false, false, false));
+    }
 }

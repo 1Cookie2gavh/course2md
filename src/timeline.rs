@@ -28,6 +28,9 @@ pub struct TranscriptEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Section {
     pub t: f64,
+    /// 本截图覆盖的结束时间（下一张截图起点；最后一段为媒体时长）
+    #[serde(default)]
+    pub end: f64,
     pub image: String,
     pub speech: Vec<TranscriptEvent>,
 }
@@ -44,7 +47,11 @@ pub enum TimelineEvent {
 /// 每条语音按中点归属「时间 ≤ 中点的最后一张截图」；首张之前的归首张。
 /// 跨越截图边界的语音段先按边界拆开（文本按时间比例近似分割），
 /// 避免整段被错误塞进后一张截图（图文错页）。
-pub fn merge(frames: Vec<FrameEvent>, speech: Vec<TranscriptEvent>) -> Vec<Section> {
+pub fn merge(
+    frames: Vec<FrameEvent>,
+    speech: Vec<TranscriptEvent>,
+    media_end: f64,
+) -> Vec<Section> {
     if frames.is_empty() {
         return vec![];
     }
@@ -52,10 +59,16 @@ pub fn merge(frames: Vec<FrameEvent>, speech: Vec<TranscriptEvent>) -> Vec<Secti
         .into_iter()
         .map(|f| Section {
             t: f.t,
+            end: 0.0,
             image: f.image,
             speech: vec![],
         })
         .collect();
+    // 每段的结束时间 = 下一段起点；末段用媒体时长（未知时退化为自身起点）
+    for i in 0..sections.len() {
+        let next = sections.get(i + 1).map(|s| s.t).unwrap_or(f64::INFINITY);
+        sections[i].end = next.min(media_end.max(sections[i].t));
+    }
     let boundaries: Vec<f64> = sections.iter().map(|s| s.t).collect();
     for ev in speech {
         for piece in split_at_boundaries(ev, &boundaries) {
@@ -99,7 +112,9 @@ fn split_at_boundaries(ev: TranscriptEvent, boundaries: &[f64]) -> Vec<Transcrip
                 total_chars
             } else {
                 let cumulative = ((e - ev.start) / total).clamp(0.0, 1.0);
-                ((total_chars as f64 * cumulative).round() as usize).clamp(char_pos, total_chars)
+                let ideal = (total_chars as f64 * cumulative).round() as usize;
+                // 比例切点吸附到最近的标点/空格，避免词中切断（如「绝无句|尾吞字」）
+                snap_to_punct(&chars, ideal, char_pos + 1, total_chars)
             };
             let text: String = chars[char_pos..end_char].iter().collect();
             char_pos = end_char;
@@ -113,6 +128,24 @@ fn split_at_boundaries(ev: TranscriptEvent, boundaries: &[f64]) -> Vec<Transcrip
         .collect()
 }
 
+/// 在 ideal 附近（±WINDOW 字符）找最近的句读/空格作为切点，切点落在标点之后；
+/// 找不到回落 ideal（受 lo/hi 约束保持单调与字符守恒）。
+fn snap_to_punct(chars: &[char], ideal: usize, lo: usize, hi: usize) -> usize {
+    const WINDOW: i32 = 6;
+    const PUNCT: &str = "。！？；：，、,.!?;: ";
+    for off in 0..=WINDOW {
+        for cand in [ideal as i32 - off, ideal as i32 + off] {
+            if cand < lo as i32 || cand > hi as i32 {
+                continue;
+            }
+            let idx = cand as usize;
+            if idx >= 1 && idx <= chars.len() && PUNCT.contains(chars[idx - 1]) {
+                return idx;
+            }
+        }
+    }
+    ideal.clamp(lo, hi)
+}
 
 pub fn write_jsonl(path: &Path, frames: &[FrameEvent], speech: &[TranscriptEvent]) -> Result<()> {
     use std::io::Write;
@@ -139,10 +172,19 @@ fn time_of(e: &TimelineEvent) -> f64 {
 }
 
 /// 全量结构化输出（structured.json 的主体）。
+/// schema_version 标记字段语义版本；后续任何破坏性变更必须递增此值。
 #[derive(Debug, Serialize)]
 pub struct CourseDoc<'a> {
+    pub schema_version: u32,
+    pub generator: Generator,
     pub meta: &'a VideoMeta,
     pub sections: &'a [Section],
+}
+
+#[derive(Debug, Serialize)]
+pub struct Generator {
+    pub name: &'static str,
+    pub version: &'static str,
 }
 
 #[cfg(test)]
@@ -169,14 +211,14 @@ mod tests {
     fn merge_assigns_by_midpoint() {
         let frames = vec![frame(0.0), frame(60.0), frame(120.0)];
         let speech = vec![sp(10.0, 20.0), sp(50.0, 70.0), sp(5.0, 8.0)];
-        let s = merge(frames, speech);
+        let s = merge(frames, speech, 120.0);
         // sp(50,70) 跨越 60s 边界：拆成 (50,60)->slide0 与 (60,70)->slide1
         assert_eq!(s[0].speech.len(), 3); // mid=15 + mid=6.5 + 拆分前半
         assert_eq!(s[1].speech.len(), 1); // 拆分后半
         // 拆分后的时间正确
         assert!((s[0].speech[1].end - 60.0).abs() < 1e-6);
         assert!((s[1].speech[0].start - 60.0).abs() < 1e-6);
-        assert!(merge(vec![], vec![sp(1.0, 2.0)]).is_empty());
+        assert!(merge(vec![], vec![sp(1.0, 2.0)], 10.0).is_empty());
     }
 
     #[test]
@@ -194,8 +236,52 @@ mod tests {
         assert_eq!(c0 + c1, 10);
         assert_eq!(c0, 5); // 50/50 时长 → 一半字符
         // 边界太靠近端点（<0.3s）不拆
-        let ev2 = TranscriptEvent { start: 0.0, end: 1.0, text: "abc".into(), raw: None };
+        let ev2 = TranscriptEvent {
+            start: 0.0,
+            end: 1.0,
+            text: "abc".into(),
+            raw: None,
+        };
         assert_eq!(split_at_boundaries(ev2, &[0.1]).len(), 1);
+    }
+
+    #[test]
+    fn split_snaps_to_punctuation_near_proportional_point() {
+        // 比例切点 idx=5（「很」），最近的句读是 idx=3 的「，」→ 切在其后
+        let ev = TranscriptEvent {
+            start: 0.0,
+            end: 10.0,
+            text: "你好，世界很好。再见".into(),
+            raw: None,
+        };
+        let parts = split_at_boundaries(ev.clone(), &[5.0]);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].text, "你好，");
+        assert_eq!(parts[1].text, "世界很好。再见");
+        let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(joined, ev.text);
+
+        // 英文：吸附到最近的空格，不再切在单词中间
+        let ev2 = TranscriptEvent {
+            start: 0.0,
+            end: 10.0,
+            text: "compiler optimization lecture".into(),
+            raw: None,
+        };
+        let parts2 = split_at_boundaries(ev2, &[5.0]);
+        assert_eq!(parts2[0].text, "compiler ");
+        assert_eq!(parts2[1].text, "optimization lecture");
+    }
+
+    #[test]
+    fn section_end_is_next_frame_start_or_media_end() {
+        let frames = vec![frame(0.0), frame(60.0)];
+        let s = merge(frames, vec![], 95.0);
+        assert_eq!(s[0].end, 60.0);
+        assert_eq!(s[1].end, 95.0, "末段 end = 媒体时长");
+        // 时长未知（0）时退化为自身起点，不 panic 不产生负区间
+        let s2 = merge(vec![frame(5.0)], vec![], 0.0);
+        assert_eq!(s2[0].end, 5.0);
     }
 
     #[test]

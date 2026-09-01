@@ -167,6 +167,29 @@ cargo build --release
 
 ---
 
+---
+
+## 模型选型与错漏分析指南（Model Selection & Accuracy Guide）
+
+为了保证网课与学术视频转换的高质量，`course2md` 在多款模型间进行了严格的实测对照。**所有平台均首推采用 Qwen3-ASR 1.7B**。
+
+### 1. 真实评测错漏分析（以同一段 3 分钟大学计算机课程为例）
+
+| 维度 | Qwen3-ASR 1.7B（全平台首选推荐） | Whisper Large-v3 Turbo | Whisper Tiny / Base |
+| :--- | :--- | :--- | :--- |
+| **中英混合专业词汇** | **极准**：精准识别 `NeoVim`、`Altair 8800`、`Computer Science`、`ICQ`、`OICQ`、`QQ`、`native speaker`、`ChatGPT`、`Web Coding`、`Codex` | **存在误判**：识别出 `NeoWim`，但将 `Altair 8800` 误为 `"PCG RTIR 8800"`，`Web Coding` 误为 `"vipcoding"` | **严重幻觉**：`NeoVim` 严重错认为“牛味”、“捏尾巴”；专业术语大部分无法辨识 |
+| **句子完整度** | **100% 完整**：无漏句、无截断，说话人语速较快时依然完整留存 | **偶发截断**：长分段末尾偶发丢失整句（例如漏掉“啊，整理一次，从PC到互联网...”） | **分段碎裂**：多处短句残缺 |
+| **标点符号规范** | **规范完整**：全自动输出符合中文语法的逗号、句号、双引号（如“AI替我上大学”、“hello”） | **标点缺失**：句号大面积缺失，长难句连成一片 | **基本无有效标点** |
+
+### 2. 几个主要模型的优劣与适用场景
+
+| 模型 | 推荐级别 | 推荐运行方式 | 显存/内存占用 | 核心优势 | 劣势与注意事项 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen3-ASR 1.7B** | **★★★★★<br>(强烈推荐)** | • macOS: `--provider gpu` (Metal 加速，仅需 13 秒)<br>• Linux: `--provider gpu` (CUDA) 或 `--provider npu`<br>• 通用: `--provider cpu` 或 `--provider api` | ~1.7GB~2.4GB | 中文及技术课程整体表现更好；标点较完整，专有名词更稳 | 模型体积略大于 0.6B |
+| **Qwen3-ASR 0.6B** | **★★★★☆<br>(极致高能效)** | • macOS: `--provider coreml` (Apple Neural Engine 原生)<br>• NPU: `--provider npu --asr-model 0.6b` | ~600MB~1GB | 体积小、在轻薄本和电池模式下能效极高；纯本地零外部依赖 | 生僻复杂技术词理解略逊于 1.7B 满血版 |
+| **Whisper Large-v3 Turbo** | **★★★☆☆<br>(纯英文/小语种)** | • NPU: `--provider npu --asr-model whisper`<br>• macOS: `--provider coreml --asr-model whisper` | ~800MB~1.5GB | 纯英文或非中文多语种识别能力优秀；OpenVINO NPU 上达 12x 实时加速 | 中文标点欠缺；语速快时偶发句尾吞词；技术词音近误判率高 |
+| **Whisper Tiny / Base** | **★☆☆☆☆<br>(仅供测试)** | • NPU: `--provider npu --asr-model tiny` | <200MB | 极速（39x 实时，3分钟仅需4秒），极低显存 | 严重音近幻觉，不建议用于正式讲义 |
+
 ## 配置文件（Configuration）
 
 为了避免每次输入冗长的命令行参数，`course2md` 提供了完善的全局配置文件支持。
@@ -197,7 +220,7 @@ course2md config show
 # 输出根目录（其下按 平台/标题/编号 自动归类）
 out = "out"
 
-# 画面变化 SSIM 相似度阈值（0.0 ~ 1.0），数值越低截图越多
+# 画面变化 SSIM 相似度阈值（0.0 ~ 1.0），数值越高越敏感、截图越多
 similarity = 0.85
 
 # 画面采样检查间隔（秒）
@@ -346,6 +369,7 @@ out/<平台>/<标题>/<编号>/
 ├── audio.wav          # 提取的音频（16kHz 单声道 WAV）
 ├── timeline.jsonl     # 带时间戳对齐的原始识别序列
 ├── meta.json          # 视频标题、作者、时长等元数据
+├── run.json           # 本次运行溯源：版本、转写来源、provider/模型、统计
 └── media.mp4          # 下载的视频（本地文件输入时不重复复制；默认转换完成后自动清理）
 ```
 
@@ -380,12 +404,13 @@ out/<平台>/<标题>/<编号>/
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
 | `-o, --out <目录>` | 指定输出根目录 | `out` |
+| `--transcript-source <auto/subtitle/asr>` | 转写来源：`auto` = 平台字幕优先（人工>自动），无字幕再走本地 ASR；`subtitle` = 强制字幕（无则报错）；`asr` = 跳过字幕直接识别 | `auto` |
 | `--provider <coreml/gpu/cpu/api/npu>` | 识别后端：`coreml`（macOS 默认）、`gpu`（非 Mac 默认）、`cpu`、`api`（云端 STT） | 视平台而定 |
 | `--asr-model <qwen3/whisper>` | CoreML 识别模型变体（`qwen3` 0.6B 或 `whisper` large-v3-turbo） | `qwen3` |
 | `--asr-api-base-url <URL>` | 云端 STT base URL（OpenAI 兼容） | `https://openrouter.ai/api/v1` |
 | `--asr-api-key <KEY>` | 云端 STT API Key（亦可设置 `OPENROUTER_API_KEY` 环境变量） | 配置文件 / 环境变量 |
 | `--asr-api-model <模型名>` | 云端 STT 模型名称（如 `qwen/qwen3-asr-flash-2026-02-10`） | `qwen/qwen3-asr-flash-2026-02-10` |
-| `--similarity <0~1>` | SSIM 画面相似度阈值；**数值越低截图越多** | `0.85` |
+| `--similarity <0~1>` | SSIM 画面相似度阈值；**数值越高越敏感、截图越多** | `0.85` |
 | `--sample-interval <秒>` | 画面采样检查间隔（秒） | `1.0` |
 | `--cooldown <秒>` | 连续两张截图之间的最短间隔时间（秒） | `10.0` |
 | `--roi <x1,y1-x2,y2>` | 只比较画面指定区域（如 `40%,0%-100%,100%`） | 全屏 |
@@ -397,6 +422,8 @@ out/<平台>/<标题>/<编号>/
 | `--llm` | 本次运行强制启用 LLM 字幕润色 | 关闭 |
 | `--no-llm` | 本次运行强制禁用 LLM 字幕润色 | 关闭 |
 | `--no-llm-hint` | 本次运行关闭任务结束时的 LLM 开启提示 | 关闭 |
+| `--resume` | 从输出目录续跑未完成的 ASR chunk | 关闭 |
+| `--no-resume` | 丢弃既有进度，全部重算 | 关闭 |
 | `-v, --verbose` | 输出更详细的执行日志（可叠加 `-vv` 进入 debug） | 默认 info |
 | `-q, --quiet` | 静默模式，只显示错误 | 关闭 |
 
@@ -424,6 +451,33 @@ course2md --help
 👉 详见完整的 [macOS 性能与功耗基准报告](docs/BENCHMARKS.md)（含测试方法论、详细能耗拆解与复现脚本）。
 
 ---
+
+## 故障排查
+
+先跑环境体检：
+
+```bash
+course2md doctor
+```
+
+一次性报告 ffmpeg / ffprobe / yt-dlp / llama-server / uv 可用性、平台后端
+（CoreML / NPU）、配置文件（含权限告警）与本地模型缓存状态。
+
+提 issue 时请附上：
+
+1. `course2md doctor` 完整输出
+2. 输出目录中的 `run.json`（记录 provider/模型/转写来源/统计，不含凭据）
+3. 所用命令行（涉密 URL 可打码）
+
+常见问题：
+
+| 症状 | 处理 |
+| :--- | :--- |
+| 网络受限下载失败 | `export HF_ENDPOINT=https://hf-mirror.com`（GGUF 与 CoreML 下载均生效） |
+| 换模型后转写混杂 | 1.0 起旧 checkpoint 自动作废；也可 `--no-resume` 强制重算 |
+| `--no-download` 删了我的视频 | 1.0 已修复——非本次运行下载的文件永不删除 |
+| NPU 上英文课被转成中文 | 1.0 已修复——语言改为自动检测，不再强制中文 |
+| 想直接用平台字幕 | 1.0 默认行为（`--transcript-source auto`）；强制字幕用 `--transcript-source subtitle` |
 
 ## 开源协议
 

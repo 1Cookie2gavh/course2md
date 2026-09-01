@@ -167,18 +167,41 @@ cargo build --release
 
 ---
 
+---
+
+## Model Selection & Accuracy Guide
+
+To ensure high-quality illustrated notes from lectures and technical talks, `course2md` was benchmarked thoroughly across models. **We strongly recommend Qwen3-ASR 1.7B across all platforms.**
+
+### 1. Real-World Transcription Error & Omission Analysis (Same 3-min CS Lecture)
+
+| Evaluation Metric | Qwen3-ASR 1.7B (Strongly Recommended) | Whisper Large-v3 Turbo | Whisper Tiny / Base |
+| :--- | :--- | :--- | :--- |
+| **Technical Jargon & Code-Switching** | **Flawless**: Accurately transcribes `NeoVim`, `Altair 8800`, `Computer Science`, `ICQ`, `OICQ`, `QQ`, `native speaker`, `ChatGPT`, `Web Coding`, `Codex` | **Partial mishearings**: Captures `NeoWim`, but misrecognizes `Altair 8800` as `"PCG RTIR 8800"` and `Web Coding` as `"vipcoding"` | **Severe phonetic hallucinations**: `NeoVim` misheard as "cow smell" / "pinching tail" in Chinese; most technical terms mangled |
+| **Sentence Completeness** | **100% Complete**: Zero dropped clauses or truncated segment endings | **Occasional Truncation**: Fast speech at segment ends occasionally gets dropped (e.g. omitted an entire sentence on PC-to-Internet transition) | **Fragmented**: Choppy fragments |
+| **Punctuation & Formatting** | **Standard & Clean**: Outputs natural commas, periods, and quotation marks (e.g. quotes around phrases and proper nouns) | **Sparse punctuation**: Mostly misses periods and quotes; runs sentences together | **Barely any valid punctuation** |
+
+### 2. Model Trade-offs & Recommendations
+
+| Model | Recommendation | Recommended Backend | Memory Footprint | Key Strengths | Limitations |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen3-ASR 1.7B** | **★★★★★<br>(Default & Recommended)** | • macOS: `--provider gpu` (Metal accelerated in 13s)<br>• Linux: `--provider gpu` (CUDA) or `--provider npu`<br>• Universal: `--provider cpu` or `--provider api` | ~1.7–2.4 GB | Gold standard for Chinese & mixed-language technical lectures; flawless technical vocabulary; full punctuation; no truncated clauses | Larger download than 0.6B |
+| **Qwen3-ASR 0.6B** | **★★★★☆<br>(Lightweight)** | • macOS: `--provider coreml` (Native Apple Neural Engine)<br>• NPU: `--provider npu --asr-model 0.6b` | ~600 MB–1 GB | Compact, lowest power draw on laptops on battery; zero external dependencies | Slightly lower comprehension on rare technical jargon compared to 1.7B |
+| **Whisper Large-v3 Turbo** | **★★★☆☆<br>(Multilingual)** | • NPU: `--provider npu --asr-model whisper`<br>• macOS: `--provider coreml --asr-model whisper` | ~800 MB–1.5 GB | Strong for pure English or non-Chinese multilingual lectures; 12x real-time on Intel NPU | Sparse Chinese punctuation; occasional dropped clauses at segment boundaries; higher phonetic confusion on tech terms |
+| **Whisper Tiny / Base** | **★☆☆☆☆<br>(Fast Pipeline Test Only)** | • NPU: `--provider npu --asr-model tiny` | <200 MB | Ultra-fast (~39x real-time, 3 min in 4s), minimal RAM | High error rate and phonetic hallucinations; not recommended for production notes |
+
 ## Configuration
 
 To avoid passing repetitive command-line arguments, `course2md` provides a global TOML configuration file.
 
-### Configuration Path
+## Configuration Path
 - **macOS / Linux**: `~/.config/course2md/config.toml` (follows `$XDG_CONFIG_HOME`)
 - **Windows**: `%APPDATA%\course2md\config.toml`
 
 ### Priority Hierarchy
 **CLI Flags > Configuration File (config.toml) > Built-in Defaults**
 
-### Configuration Management Commands
+## Configuration Management Commands
 
 ```bash
 # 1. Generate an annotated configuration template (use --force to overwrite existing)
@@ -188,7 +211,7 @@ course2md config init
 course2md config show
 ```
 
-### Configuration File Structure
+## Configuration File Structure
 
 ```toml
 # ~/.config/course2md/config.toml
@@ -345,6 +368,7 @@ out/<platform>/<title>/<id>/
 ├── audio.wav          # Extracted audio (16kHz mono WAV)
 ├── timeline.jsonl     # Timestamp-aligned event stream
 ├── meta.json          # Video title, author, duration metadata
+├── run.json           # Run provenance: version, transcript source, provider/model, stats
 └── media.mp4          # Downloaded video (local input is read in-place; cleaned up by default)
 ```
 
@@ -379,12 +403,13 @@ Model dir: /Users/username/.cache/course2md/models
 | Option | Description | Default |
 | :--- | :--- | :--- |
 | `-o, --out <DIR>` | Output root directory | `out` |
+| `--transcript-source <auto/subtitle/asr>` | Transcript source: `auto` = platform subtitles first (manual > auto-caption), fall back to local ASR; `subtitle` = fail if none; `asr` = skip subtitles | `auto` |
 | `--provider <coreml/gpu/cpu/api/npu>` | ASR backend: `coreml` (macOS arm64), `gpu` (non-Mac), `cpu`, or `api` (cloud STT) | Platform default |
 | `--asr-model <qwen3/whisper>` | CoreML ASR model variant (`qwen3` 0.6B or `whisper` large-v3-turbo) | `qwen3` |
 | `--asr-api-base-url <URL>` | Cloud STT base URL (OpenAI-compatible) | `https://openrouter.ai/api/v1` |
 | `--asr-api-key <KEY>` | Cloud STT API Key (or set `OPENROUTER_API_KEY` env) | Config / Env |
 | `--asr-api-model <MODEL>` | Cloud STT model slug (e.g. `qwen/qwen3-asr-flash-2026-02-10`) | `qwen/qwen3-asr-flash-2026-02-10` |
-| `--similarity <0~1>` | SSIM similarity threshold; **lower = more slides captured** | `0.85` |
+| `--similarity <0~1>` | SSIM similarity threshold; **higher = more sensitive = more slides captured** | `0.85` |
 | `--sample-interval <SEC>` | Frame sampling check interval in seconds | `1.0` |
 | `--cooldown <SEC>` | Minimum seconds between two consecutive slide captures | `10.0` |
 | `--roi <x1,y1-x2,y2>` | Region of interest for slide comparison (e.g. `40%,0%-100%,100%`) | Full frame |
@@ -396,6 +421,8 @@ Model dir: /Users/username/.cache/course2md/models
 | `--llm` | Force enable LLM subtitle polishing for this run | Disabled |
 | `--no-llm` | Force disable LLM subtitle polishing for this run | Disabled |
 | `--no-llm-hint` | Suppress post-run LLM suggestion hint | Disabled |
+| `--resume` | Resume unfinished ASR chunks from the output dir | Disabled |
+| `--no-resume` | Discard existing checkpoints and redo everything | Disabled |
 | `-v, --verbose` | Increase logging verbosity (use `-vv` for debug) | `info` |
 | `-q, --quiet` | Quiet mode (errors only) | Disabled |
 
@@ -423,6 +450,35 @@ Measured on Apple Silicon (arm64) running a **3-minute** 1080p recorded lecture 
 👉 See the comprehensive [macOS Benchmark Report](docs/BENCHMARKS.md) for full methodology, energy breakdowns, and reproduction scripts.
 
 ---
+
+## Troubleshooting
+
+Run the environment check first:
+
+```bash
+course2md doctor
+```
+
+It reports ffmpeg / ffprobe / yt-dlp / llama-server / uv availability, platform
+backends (CoreML / NPU), config-file validity (including permission warnings),
+and the local model cache state.
+
+When opening an issue, please attach:
+
+1. The full output of `course2md doctor`
+2. The `run.json` file from the output directory (records provider, model,
+   transcript source, and stats — no credentials)
+3. The command line you used (redact URLs if needed)
+
+Common fixes:
+
+| Symptom | Fix |
+| :--- | :--- |
+| Download fails on restricted networks | `export HF_ENDPOINT=https://hf-mirror.com` (honored by both GGUF and CoreML downloads) |
+| Transcripts look mixed/inconsistent after switching models | Pre-1.0 checkpoints are discarded automatically; rerun with `--no-resume` to force a clean pass |
+| `--no-download` deleted my video | Fixed in 1.0 — files not downloaded by the current run are never removed |
+| English course transcribed as Chinese on NPU | Fixed in 1.0 — language is auto-detected; force nothing |
+| Prefer platform subtitles over local ASR | Default behavior in 1.0 (`--transcript-source auto`); force with `--transcript-source subtitle` |
 
 ## License
 

@@ -23,7 +23,11 @@ mod ffi {
             out_n: *mut c_int,
         ) -> c_int;
         pub fn c2m_free_doubles(p: *mut c_double);
-        pub fn c2m_asr_create(model: *const c_char, err: *mut c_char, err_len: usize) -> *mut std::ffi::c_void;
+        pub fn c2m_asr_create(
+            model: *const c_char,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> *mut std::ffi::c_void;
         pub fn c2m_asr_transcribe(
             handle: *mut std::ffi::c_void,
             wav_path: *const c_char,
@@ -128,17 +132,56 @@ fn normalize(s: &str) -> String {
 /// 首次使用：让用户选择下载哪个模型（非交互环境默认 qwen3）。
 fn prompt_model_choice() -> String {
     if !atty_or_tty() {
-        tracing::info!("非交互环境，默认使用 qwen3 模型（--asr-model whisper 可切换）");
+        tracing::info!("非交互环境，默认使用 Qwen3-ASR 模型（--asr-model whisper 可切换）");
         return "qwen3".into();
     }
     use std::io::{BufRead, Write};
     let mut out = std::io::stderr();
     let _ = writeln!(
         out,
-        "选择 CoreML 识别模型 / Select CoreML ASR model:"
+        "
+======================================================="
     );
-    let _ = writeln!(out, "  1) qwen3    - Qwen3-ASR 0.6B（默认 / default，约 1-2GB）");
-    let _ = writeln!(out, "  2) whisper  - Whisper large-v3-turbo（多语言 / multilingual）");
+    let _ = writeln!(
+        out,
+        "选择识别模型 / Select ASR Model (首次运行指引):
+"
+    );
+    let _ = writeln!(
+        out,
+        "  1) qwen3 (Qwen3-ASR) [★ 强烈推荐 / Strongly Recommended]"
+    );
+    let _ = writeln!(
+        out,
+        "     - 优势: 中文及中英文混合技术课程识别准确率最高，专有名词（如 NeoVim、"
+    );
+    let _ = writeln!(
+        out,
+        "             ChatGPT、Web Coding、Codex）识别极准，标点规范，绝无句尾漏字截断。"
+    );
+    let _ = writeln!(
+        out,
+        "     - 提示: macOS 上追求 1.7B 满血版请使用 --provider gpu (Metal 硬件加速，"
+    );
+    let _ = writeln!(out, "             实测 3 分钟音频仅 13 秒完成，零漏句)。");
+    let _ = writeln!(
+        out,
+        "
+  2) whisper (Whisper Large-v3 Turbo)"
+    );
+    let _ = writeln!(out, "     - 优势: 纯英文或非中文多语种识别能力优秀。");
+    let _ = writeln!(
+        out,
+        "     - 劣势: 中文课程标点缺失较多，语速快或长句末尾偶发吞句漏字，"
+    );
+    let _ = writeln!(
+        out,
+        "             技术术语易发生音近识别错误（如 Web Coding 识别为 vipcoding）。"
+    );
+    let _ = writeln!(
+        out,
+        "======================================================="
+    );
     let _ = write!(out, "输入序号并回车（默认 1）/ Enter choice [1]: ");
     let _ = out.flush();
     let mut line = String::new();
@@ -177,7 +220,12 @@ impl CoremlAsr {
         let path = CString::new(wav.to_string_lossy().as_bytes())?;
         let mut out = vec![0u8; 16 * 1024];
         let rc = unsafe {
-            ffi::c2m_asr_transcribe(self.handle, path.as_ptr(), out.as_mut_ptr() as *mut _, out.len())
+            ffi::c2m_asr_transcribe(
+                self.handle,
+                path.as_ptr(),
+                out.as_mut_ptr() as *mut _,
+                out.len(),
+            )
         };
         match rc {
             0 => {
@@ -200,15 +248,11 @@ impl Drop for CoremlAsr {
     }
 }
 
-// SAFETY: 句柄仅在此线程使用（ASR 全程在同一个阻塞线程内）。
-unsafe impl Send for CoremlAsr {}
-
 /// CoreML 全流程：Silero VAD 分段 → 逐段转写。
 pub fn run_coreml(
     wav: &Path,
     max_speech: f64,
     model: &str,
-    cut: impl Fn(&Path, f64, f64, &Path) -> Result<()>,
     tmp_dir: &Path,
     cp: &mut crate::checkpoint::Checkpoint,
 ) -> Result<Vec<TranscriptEvent>> {
@@ -224,47 +268,21 @@ pub fn run_coreml(
     ensure_metallib()?;
     tracing::info!(model, "loading CoreML ASR（首次使用会自动下载模型）");
     let asr = CoremlAsr::load(model).context("CoreML 模型加载失败")?;
-    tracing::info!(secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "coreml ready");
-
-    let pb = indicatif::ProgressBar::new(segs.len() as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::with_template(
-            "{spinner:.green} asr {pos}/{len} [{bar:32.cyan/blue}] {elapsed} {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
+    tracing::info!(
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "coreml ready"
     );
 
-    for (i, seg) in segs.iter().copied().enumerate() {
-        let (start, end) = (seg.start, seg.end);
-        if cp.is_done(start, end) {
-            pb.inc(1);
-            continue; // 断点续跑
-        }
-        let chunk = tmp_dir.join(format!("c{i:04}.wav"));
-        cut(wav, seg.cut_start, seg.cut_end, &chunk)?;
-        match asr.transcribe(&chunk) {
-            Ok(Some(text)) => {
-                let text = crate::asr::sanitize_qwen_text(&text);
-                if !text.is_empty() {
-                    // 只写 checkpoint：事件统一从 cp.events() 出（避免双份）
-                    cp.record(start, end, &text);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = std::fs::remove_file(&chunk);
-                pb.finish_and_clear();
-                return Err(e);
-            }
-        }
-        let _ = std::fs::remove_file(&chunk);
-        pb.inc(1);
-    }
-    pb.finish_and_clear();
-    // 事件统一来自 checkpoint（历史 + 本次），按时间排序
-    let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
-    all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    tracing::info!(n = all.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
-    Ok(all)
+    let r = crate::asr::run_chunks(wav, &segs, cp, tmp_dir, "asr", |_i, _seg, chunk| {
+        asr.transcribe(chunk).map(|t| {
+            let t = t.map(|s| crate::asr::sanitize_qwen_text(&s));
+            t.filter(|s| !s.is_empty())
+        })
+    })?;
+    tracing::info!(
+        n = r.len(),
+        secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+        "asr done"
+    );
+    Ok(r)
 }

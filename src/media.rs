@@ -127,4 +127,3 @@ pub fn probe_duration_blocking(media: &Path) -> Option<f64> {
         .parse::<f64>()
         .ok()
 }
-

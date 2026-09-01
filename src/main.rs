@@ -1,6 +1,6 @@
 use clap::FromArgMatches;
 use course2md::cli::{Cli, Command, ConfigCmd, LlmCmd, ModelsCmd, RunOpts};
-use course2md::{config, llm, models, pipeline, settings};
+use course2md::{config, doctor, llm, models, pipeline, settings};
 use tracing_subscriber::EnvFilter;
 
 fn init_logging(verbose: u8, quiet: bool) {
@@ -17,23 +17,6 @@ fn init_logging(verbose: u8, quiet: bool) {
         .with_target(verbose >= 2)
         .compact()
         .init();
-}
-
-/// 默认识别后端：
-/// - macOS Apple Silicon: 优先 coreml
-/// - Linux: 若存在 Intel NPU (/dev/accel/accel0) 且未安装 llama-server，优先 npu
-/// - 其余平台/配置: gpu (llama.cpp)
-fn default_provider() -> String {
-    if cfg!(apple_native) {
-        "coreml".into()
-    } else if cfg!(target_os = "linux")
-        && std::path::Path::new("/dev/accel/accel0").exists()
-        && course2md::error::require_cmd("llama-server").is_err()
-    {
-        "npu".into()
-    } else {
-        "gpu".into()
-    }
 }
 
 /// 配置文件 + CLI 覆盖 -> 生效 LLM 设置。
@@ -69,40 +52,38 @@ fn run_opts_to_cfg(
     file: &settings::ConfigFile,
 ) -> anyhow::Result<config::PipelineConfig> {
     let d = &file.defaults;
-    if let Some(p) = &d.provider {
-        anyhow::ensure!(
-            matches!(p.as_str(), "coreml" | "gpu" | "cpu" | "api"),
-            "配置文件 provider 无效：{p:?}（可选 coreml/gpu/cpu/api）"
-        );
-    }
-    if let Some(m) = &d.slide_mode {
-        anyhow::ensure!(
-            matches!(m.as_str(), "first" | "stable"),
-            "配置文件 slide_mode 无效：{m:?}（可选 first/stable）"
-        );
-    }
+    use config::{OutputFormat, SlideMode};
     Ok(config::PipelineConfig {
         url: source,
         out_root: opts
             .out
             .clone()
             .or_else(|| d.out.clone())
+            .map(config::expand_tilde)
             .unwrap_or_else(|| "out".into()),
-        out_dir: opts.out.clone().or_else(|| d.out.clone()).unwrap_or_else(|| "out".into()),
+        out_dir: opts
+            .out
+            .clone()
+            .or_else(|| d.out.clone())
+            .map(config::expand_tilde)
+            .unwrap_or_else(|| "out".into()),
         similarity: opts.similarity.or(d.similarity).unwrap_or(0.85),
         sample_interval: opts.sample_interval.or(d.sample_interval).unwrap_or(1.0),
         cooldown: opts.cooldown.or(d.cooldown).unwrap_or(10.0),
-        max_height: opts.max_height.or(d.max_height).unwrap_or(1080).clamp(240, 2160),
-        slide_mode: match opts.slide_mode.clone() {
-            Some(course2md::cli::SlideModeArg::First) => "first".into(),
-            Some(course2md::cli::SlideModeArg::Stable) => "stable".into(),
-            None => d
-                .slide_mode
-                .clone()
-                .unwrap_or_else(|| "stable".into())
-                .to_ascii_lowercase(),
-        },
-        stable_secs: opts.stable_secs.or(d.stable_secs).unwrap_or(0.8).clamp(0.0, 10.0),
+        max_height: opts
+            .max_height
+            .or(d.max_height)
+            .unwrap_or(1080)
+            .clamp(240, 2160),
+        slide_mode: opts
+            .slide_mode
+            .or(d.slide_mode)
+            .unwrap_or(SlideMode::Stable),
+        stable_secs: opts
+            .stable_secs
+            .or(d.stable_secs)
+            .unwrap_or(0.8)
+            .clamp(0.0, 10.0),
         roi: match &opts.roi {
             Some(s) => Some(config::Roi::parse(s)?),
             None => match &d.roi {
@@ -111,34 +92,27 @@ fn run_opts_to_cfg(
             },
         },
         threads: opts.threads.or(d.threads).unwrap_or(4),
-        provider: match opts.provider.clone() {
-            Some(p) => match p {
-                course2md::cli::ProviderArg::Coreml => "coreml",
-                course2md::cli::ProviderArg::Gpu => "gpu",
-                course2md::cli::ProviderArg::Cpu => "cpu",
-                course2md::cli::ProviderArg::Api => "api",
-                course2md::cli::ProviderArg::Npu => "npu",
-            }
-            .to_string(),
-            None => d.provider.clone().unwrap_or_else(default_provider),
-        },
+        provider: opts
+            .provider
+            .or(d.provider)
+            .unwrap_or_else(config::default_provider_hint),
         max_speech: opts.max_speech.or(d.max_speech).unwrap_or(20.0),
         formats: opts
             .formats
             .clone()
             .or_else(|| d.formats.clone())
-            .unwrap_or_else(|| vec!["md".into(), "html".into()]),
-        model_dir: config::model_dir_from(
-            opts.model_dir
-                .as_deref()
-                .or(d.model_dir.as_deref()),
-        ),
+            .unwrap_or_else(|| vec![OutputFormat::Md, OutputFormat::Html]),
+        model_dir: config::model_dir_from(opts.model_dir.as_deref().or(d.model_dir.as_deref())),
         keep_video: opts.keep_video || d.keep_video.unwrap_or(false),
         no_download: opts.no_download || d.no_download.unwrap_or(false),
-        resume: opts.resume || d.resume.unwrap_or(false),
+        resume: config::resolve_resume(opts.resume, opts.no_resume, d.resume),
         llm: resolve_llm(opts, file),
         asr_api: resolve_asr_api(opts, file),
         asr_model: opts.asr_model.clone().or_else(|| d.asr_model.clone()),
+        transcript_source: opts
+            .transcript_source
+            .or(d.transcript_source)
+            .unwrap_or_default(),
     })
 }
 
@@ -215,6 +189,10 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Some(Command::Doctor) => {
+            init_logging(0, false);
+            doctor::run()
+        }
         Some(Command::Config { cmd }) => {
             init_logging(0, false);
             match cmd {
@@ -289,6 +267,8 @@ fn main() -> anyhow::Result<()> {
             init_logging(cli.opts.verbose, cli.opts.quiet);
             let file = settings::load()?;
             let cfg = run_opts_to_cfg(source, &cli.opts, &file)?;
+            // 预检：所有配置错误在下载/抽帧/模型加载之前暴露（毫秒级失败）
+            cfg.validate()?;
             tracing::info!(out = %cfg.out_dir.display(), provider = %cfg.provider, "start");
             tokio::runtime::Runtime::new()?.block_on(pipeline::run(&cfg))
         }
