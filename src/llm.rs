@@ -55,9 +55,14 @@ pub fn validate(s: &LlmSettings) -> Result<()> {
     Ok(())
 }
 
+/// LLM 润色并发数（批次相互独立；过高易触发上游限流）。
+const CONCURRENCY: usize = 4;
+
 /// 用 LLM 批量润色字幕；失败批次保留原文（润色失败不阻断转换）。
+/// 批次间并发执行（波次式，每波 CONCURRENCY 路），显著缩短长视频润色耗时。
 pub fn polish(mut events: Vec<TranscriptEvent>, s: &LlmSettings) -> Vec<TranscriptEvent> {
-    let batches = events.chunks_mut(BATCH).len();
+    let mut chunks: Vec<Vec<TranscriptEvent>> = events.chunks(BATCH).map(|c| c.to_vec()).collect();
+    let batches = chunks.len();
     let pb = indicatif::ProgressBar::new(batches as u64);
     pb.set_style(
         indicatif::ProgressStyle::with_template(
@@ -66,17 +71,32 @@ pub fn polish(mut events: Vec<TranscriptEvent>, s: &LlmSettings) -> Vec<Transcri
         .unwrap()
         .progress_chars("##-"),
     );
-    let mut warned = false;
-    for chunk in events.chunks_mut(BATCH) {
-        pb.inc(1);
-        polish_chunk(s, chunk, &mut warned);
+    let warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for wave in chunks.chunks_mut(CONCURRENCY) {
+        std::thread::scope(|scope| {
+            for chunk in wave {
+                let s = s.clone();
+                let pb = pb.clone();
+                let warned = std::sync::Arc::clone(&warned);
+                scope.spawn(move || {
+                    polish_chunk(&s, chunk, &warned);
+                    pb.inc(1);
+                });
+            }
+        });
     }
     pb.finish_and_clear();
+    // 按原顺序拼回（并发结果已写回各自 chunk）
+    events = chunks.into_iter().flatten().collect();
     events
 }
 
 /// 递归润色一个分块；整块失败（如推理模型 token 耗尽返回空）时拆半重试，保证尽力而为。
-fn polish_chunk(s: &LlmSettings, chunk: &mut [TranscriptEvent], warned: &mut bool) {
+fn polish_chunk(
+    s: &LlmSettings,
+    chunk: &mut [TranscriptEvent],
+    warned: &std::sync::atomic::AtomicBool,
+) {
     if chunk.is_empty() {
         return;
     }
@@ -127,10 +147,10 @@ fn polish_chunk(s: &LlmSettings, chunk: &mut [TranscriptEvent], warned: &mut boo
     }
 }
 
-fn warn_once(warned: &mut bool, msg: &str) {
-    if !*warned {
+fn warn_once(warned: &std::sync::atomic::AtomicBool, msg: &str) {
+    use std::sync::atomic::Ordering;
+    if !warned.swap(true, Ordering::Relaxed) {
         tracing::warn!("{msg}（后续同类问题不再重复提示）");
-        *warned = true;
     } else {
         tracing::debug!("{msg}");
     }
