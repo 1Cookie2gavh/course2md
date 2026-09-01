@@ -420,6 +420,8 @@ Model dir: /Users/username/.cache/course2md/models
 | `--no-download` | Skip downloading (when `media.mp4` exists in directory) | Disabled |
 | `--llm` | Force enable LLM subtitle polishing for this run | Disabled |
 | `--no-llm` | Force disable LLM subtitle polishing for this run | Disabled |
+| `--llm-vision` | Vision-assisted polish: attach the section slide to correct technical terms (multimodal model required) | Disabled |
+| `--no-llm-vision` | Disable vision-assisted polish for this run | Disabled |
 | `--no-llm-hint` | Suppress post-run LLM suggestion hint | Disabled |
 | `--resume` | Resume unfinished ASR chunks from the output dir | Disabled |
 | `--no-resume` | Discard existing checkpoints and redo everything | Disabled |

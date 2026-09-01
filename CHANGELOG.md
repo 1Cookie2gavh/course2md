@@ -3,6 +3,29 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] — 2026-09-01
+
+### 新增
+
+- **LLM 视觉润色** `--llm-vision` / 配置 `vision = true`：按节附幻灯片截图，
+  模型参照画面纠正技术词汇拼写；端点不支持图片时该批自动降级纯文本。
+  `llm setup` 交互式询问模型视觉能力（脚本化调用不阻塞）。
+  （Implements #5，感谢 @mizorewww）
+- **纯语气词条目删除**：默认提示词允许对纯语气词/口头禅条目返回空文本，
+  该条将被删除且原文保留在 `raw` 字段溯源。（Implements #5）
+- `run.json` 记录 `llm_vision`。
+
+### 修复
+
+- **ASR 进度条不再被 llama-server 日志打穿**：llama-server stderr 此前直接
+  继承终端，其每 chunk 的 slot timing 日志插在进度条重绘之间，导致进度条
+  每次更新都新起一行。改为 piped + 后台 drain（尾部缓存进错误信息，debug
+  可转发）；顺带修复 scene 采样 ffmpeg stderr 未 drain 的死锁隐患。
+  （Fixes #4，感谢 @mizorewww）
+- **`llm setup` / CoreML 模型选择支持方向键编辑**：裸 `read_line` 不处理
+  方向键转义序列（←/→/Home/End 变字面字符）。改用 dialoguer。
+  （Fixes #3，感谢 @mizorewww）
+
 ## [1.0.0] — 2026-09-01
 
 首个正式版。本轮以「正确性审计 + 架构收敛」为主题：修复全部已知的
