@@ -149,7 +149,6 @@ fn run_blocking(
         .progress_chars("##-"),
     );
 
-    let mut events = vec![];
     let mut err: Option<anyhow::Error> = None;
     for (i, seg) in segs.iter().copied().enumerate() {
         let (start, end) = (seg.start, seg.end);
@@ -166,8 +165,8 @@ fn run_blocking(
             Ok(raw) => {
                 let text = sanitize_qwen_text(&raw);
                 if !text.is_empty() {
+                    // 只写 checkpoint：事件统一从 cp.events() 出（避免双份）
                     cp.record(start, end, &text);
-                    events.push(TranscriptEvent { start, end, text, raw: None });
                 }
             }
             Err(e) => {
@@ -185,9 +184,8 @@ fn run_blocking(
     if let Some(e) = err {
         return Err(e);
     }
-    // resume 场景：合并历史 + 本次事件，按时间排序
+    // 事件统一来自 checkpoint（历史 + 本次），按时间排序
     let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
-    all.extend(events);
     all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
     tracing::info!(n = all.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
     Ok(all)
@@ -317,21 +315,8 @@ fn run_api(
     if let Some(e) = err {
         return Err(e);
     }
-    let new_events: Vec<TranscriptEvent> = segs
-        .iter()
-        .zip(results)
-        .filter_map(|(seg, text)| {
-            text.flatten().map(|t| TranscriptEvent {
-                start: seg.start,
-                end: seg.end,
-                text: t,
-                raw: None,
-            })
-        })
-        .collect();
-    // resume：合并历史 + 本次
+    // 事件统一来自 checkpoint（收集循环里已 record），按时间排序
     let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
-    all.extend(new_events);
     all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
     let events = all;
     tracing::info!(n = events.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");

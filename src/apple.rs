@@ -235,7 +235,6 @@ pub fn run_coreml(
         .progress_chars("##-"),
     );
 
-    let mut events = vec![];
     for (i, seg) in segs.iter().copied().enumerate() {
         let (start, end) = (seg.start, seg.end);
         if cp.is_done(start, end) {
@@ -248,8 +247,8 @@ pub fn run_coreml(
             Ok(Some(text)) => {
                 let text = crate::asr::sanitize_qwen_text(&text);
                 if !text.is_empty() {
+                    // 只写 checkpoint：事件统一从 cp.events() 出（避免双份）
                     cp.record(start, end, &text);
-                    events.push(TranscriptEvent { start, end, text, raw: None });
                 }
             }
             Ok(None) => {}
@@ -263,9 +262,8 @@ pub fn run_coreml(
         pb.inc(1);
     }
     pb.finish_and_clear();
-    // resume：合并历史 + 本次
+    // 事件统一来自 checkpoint（历史 + 本次），按时间排序
     let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
-    all.extend(events);
     all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
     tracing::info!(n = all.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
     Ok(all)
