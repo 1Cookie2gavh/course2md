@@ -3,9 +3,23 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [1.1.1] — 未发布
+## [1.2.0] — 未发布
 
-### 新增（来自 #6，感谢 @QiuShunan 的首个贡献）
+### 新增：视频总结与凭据清理（来自 #7，感谢 @1Cookie2gavh）
+
+- **`course2md summarize`**：为已有输出生成 TL;DR / 核心要点 / 带时间戳
+  大纲，就地写入 course.md/html（幂等，`--force` 覆盖，`-o` 导出独立文件）；
+  `[llm] summarize = true` 转换后自动总结；超长视频 map-reduce；
+  幻觉防护（仅字幕输入 / temperature 0 / JSON 结构化 / 时间戳可溯源）
+- **`course2md remove [--asr]`**：清除 LLM/STT API 凭据（分享/提交前）
+- **推理模型润色兼容**：json_object 响应格式（端点不支持时自动降级重试）、
+  max_tokens 16384、解析三级容错（严格 → 尾逗号清理 → 逐对象扫描跳坏项）、
+  失败批次拆半递归重试、Section 级 4 路并发润色、超时 300s
+- 移植时修复：宽容扫描方向反了会漏掉首对象；严格解析成功但含坏项时
+  早退跳过降级；json_object 无降级路径；测试初始化器缺字段（CI 编译失败）；
+  contains_summary 误判（标题含「视频总结」）
+
+### 段落组织（来自 #6，感谢 @QiuShunan）
 
 - **段落组织**：同一截图下、短停顿（<3.5s）内的连续 ASR 片段合并为自然段
   （上限 420 字），文稿不再是 VAD 碎片流水账；LLM 校对的单位改为组织好的段落

@@ -246,6 +246,13 @@ pub fn print_effective(cfg: &ConfigFile) {
     );
     println!("[llm]");
     println!("  enabled        : {}", cfg.llm.enabled);
-    println!("  model          : {}", if cfg.llm.model.is_empty() { "-" } else { &cfg.llm.model });
+    println!(
+        "  model          : {}",
+        if cfg.llm.model.is_empty() {
+            "-"
+        } else {
+            &cfg.llm.model
+        }
+    );
     println!("  summarize      : {}", cfg.llm.summarize);
 }
