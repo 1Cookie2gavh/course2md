@@ -88,10 +88,16 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     );
 
     let dest = cfg.media_path();
+    // 文件所有权：只有本次运行真正下载的文件才允许结束时清理。
+    // --no-download 复用的既有 media.mp4 属于用户资产，永远不删。
+    let media_existed = !is_local && dest.is_file();
     // 本地文件直接原地处理，不拷贝；下载类输入落到 dest。
     let media: std::path::PathBuf = if is_local {
         tracing::info!(path = %local.display(), "local video");
         local.to_path_buf()
+    } else if media_existed {
+        tracing::info!(path = %dest.display(), "media exists, skip download");
+        dest
     } else if !cfg.no_download {
         tracing::info!("download video");
         fetch::download(
@@ -136,8 +142,10 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     tracing::info!(sections = sections.len(), "merged");
 
     render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats).await?;
-    // 只删自己下载的视频；本地输入文件不动。
-    if !cfg.keep_video && media != local {
+    // 只删自己下载的视频；本地输入与既有工作区文件不动。
+    let media_deleted =
+        should_delete_media(is_local, cfg.no_download, media_existed, cfg.keep_video);
+    if media_deleted {
         let _ = tokio::fs::remove_file(&media).await;
     }
 
@@ -153,7 +161,15 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         peak_mb,
         child_peak_mb,
     };
-    print_summary(&cfg, &meta, &sections, &stats, &media, is_local);
+    print_summary(
+        &cfg,
+        &meta,
+        &sections,
+        &stats,
+        &media,
+        is_local,
+        media_deleted,
+    );
     Ok(())
 }
 
@@ -170,6 +186,7 @@ fn print_summary(
     stats: &RunStats,
     media: &Path,
     is_local: bool,
+    media_deleted: bool,
 ) {
     let out = &cfg.out_dir;
     let speech_n: usize = sections.iter().map(|s| s.speech.len()).sum();
@@ -222,18 +239,19 @@ fn print_summary(
             media.display(),
             crate::i18n::tr("local input, untouched", "本地输入，未改动")
         );
-    } else if cfg.keep_video {
+    } else if media_deleted {
+        eprintln!(
+            "{}: {} ({})",
+            crate::i18n::tr("Video", "视频"),
+            crate::i18n::tr("downloaded this run, deleted", "本次下载，已删除"),
+            crate::i18n::tr("use --keep-video to keep", "用 --keep-video 可保留")
+        );
+    } else {
         eprintln!(
             "{}: {}  ({})",
             crate::i18n::tr("Video", "视频"),
             media.display(),
             crate::i18n::tr("kept", "已保留")
-        );
-    } else {
-        eprintln!(
-            "{}: {} (--keep-video)",
-            crate::i18n::tr("Video", "视频"),
-            crate::i18n::tr("deleted", "已删除")
         );
     }
     eprintln!(
@@ -322,6 +340,17 @@ fn local_fingerprint(p: &Path) -> String {
     format!("{h:016x}")[..8].to_string()
 }
 
+/// 结束时是否允许删除媒体文件：仅当「本次运行下载的」且未要求保留。
+/// --no-download 复用的既有文件、本地输入永远不删。
+fn should_delete_media(
+    is_local: bool,
+    no_download: bool,
+    media_existed: bool,
+    keep_video: bool,
+) -> bool {
+    !is_local && !no_download && !media_existed && !keep_video
+}
+
 fn fmt_duration(secs: f64) -> String {
     let s = secs.max(0.0).round() as u64;
     if s < 60 {
@@ -356,4 +385,23 @@ fn peak_rss_mb(who: libc::c_int) -> Option<f64> {
 #[cfg(not(unix))]
 fn peak_rss_mb(_who: i32) -> Option<f64> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_delete_media;
+
+    #[test]
+    fn never_delete_files_we_did_not_download() {
+        // --no-download 复用既有文件：不删（旧行为会删！）
+        assert!(!should_delete_media(false, true, true, false));
+        // 上次运行已存在的文件（resume 场景）：不删
+        assert!(!should_delete_media(false, false, true, false));
+        // 本地输入：不删
+        assert!(!should_delete_media(true, false, false, false));
+        // 本次真下载 + keep_video：不删
+        assert!(!should_delete_media(false, false, false, true));
+        // 本次真下载 + 未要求保留：删
+        assert!(should_delete_media(false, false, false, false));
+    }
 }
