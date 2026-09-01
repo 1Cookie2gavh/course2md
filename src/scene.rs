@@ -56,7 +56,7 @@ async fn extract_frame(media: &Path, t: f64, dest: &Path) -> Result<()> {
 }
 
 /// 1fps（或 sample_interval）灰度流 + SSIM，得到新幻灯片时间点。
-async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<f64>> {
+async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<(f64, f64)>> {
     let info = media::probe_video(media)
         .await
         .context("ffprobe 无法读取视频宽高")?;
@@ -100,10 +100,11 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<f64
     //   candidate     正在观察的候选画面（含首次出现时间，用于真实时间戳）
     // 发射条件：候选与上一输出差异显著 + 稳定时长足够 + 距上次发射 >= cooldown。
     let stable_for = if cfg.slide_mode == "stable" { cfg.stable_secs } else { 0.0 };
-    let mut times = vec![];
+    let mut times: Vec<(f64, f64)> = vec![];
     let mut last_emitted: Option<GrayImage> = None;
     let mut candidate: Option<GrayImage> = None;
     let mut candidate_first_t: Option<f64> = None;
+    let mut candidate_last_t: Option<f64> = None;
     let mut last_emit_t: f64 = -f64::INFINITY;
     let mut i: u64 = 0;
     loop {
@@ -139,21 +140,39 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<f64
         if candidate_changed {
             candidate = Some(cmp);
             candidate_first_t = Some(t);
+            candidate_last_t = Some(t);
+        } else if candidate_last_t.is_some() {
+            // 同一视觉状态的后续采样：更新代表帧时间（取稳定后的最后一帧）
+            candidate_last_t = Some(t);
         }
-        let first_t = candidate_first_t.unwrap_or(t);
-        let stable = t - first_t >= stable_for;
+        let onset_t = candidate_first_t.unwrap_or(t);
+        let capture_t = candidate_last_t.unwrap_or(t);
+        let stable = t - onset_t >= stable_for;
         let gap_ok = t - last_emit_t >= cfg.cooldown;
         if stable && gap_ok {
-            // 用候选首次出现的时间戳，而不是 cooldown 到期时间
-            times.push(first_t);
+            // 发射两个时间戳：onset 用于时间线对齐，capture 用于全分辨率截帧
+            // （stable 模式下 capture 取确认稳定时的代表帧，避开 transition 早期态）
+            times.push((onset_t, capture_t));
             last_emitted = candidate.take();
             candidate_first_t = None;
+            candidate_last_t = None;
             last_emit_t = t;
-            pb.set_message(format!("slides={} t={first_t:.1}s", times.len()));
+            pb.set_message(format!("slides={} t={onset_t:.1}s", times.len()));
+        }
+    }
+    // EOF 冲刷：最后一个已稳定的候选即使还没过 cooldown 也补发（否则尾页永远丢失）
+    if let (Some(_), Some(onset), Some(capture)) = (&candidate, candidate_first_t, candidate_last_t)
+    {
+        let stable = capture - onset >= stable_for;
+        if stable {
+            times.push((onset, capture));
         }
     }
     pb.finish_and_clear();
-    let _ = child.wait().await;
+    let status = child.wait().await?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg 采样进程异常退出（{status}）");
+    }
     tracing::info!(slides = times.len(), frames = i, mode = %cfg.slide_mode, "ssim scan done");
     Ok(times)
 }
@@ -173,15 +192,16 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
             .progress_chars("##-"),
     );
     let mut frames = vec![];
-    for (i, &t) in times.iter().enumerate() {
+    for (i, &(onset_t, capture_t)) in times.iter().enumerate() {
         let name = format!("slide_{:04}.jpg", i + 1);
         let path = frames_dir.join(&name);
-        extract_frame(media, t, &path).await?;
+        // 截帧用代表帧时间（稳定后），时间线用 onset（首次出现）
+        extract_frame(media, capture_t, &path).await?;
         frames.push(FrameEvent {
-            t,
+            t: onset_t,
             image: format!("frames/{name}"),
         });
-        pb.set_message(format!("t={t:.1}s"));
+        pb.set_message(format!("t={onset_t:.1}s"));
         pb.inc(1);
     }
     pb.finish_and_clear();

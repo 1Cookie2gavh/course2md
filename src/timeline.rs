@@ -85,25 +85,34 @@ fn split_at_boundaries(ev: TranscriptEvent, boundaries: &[f64]) -> Vec<Transcrip
     points.extend(inner);
     points.push(ev.end);
     let total = ev.end - ev.start;
-    let total_chars = ev.text.chars().count().max(1);
+    let chars: Vec<char> = ev.text.chars().collect();
+    let total_chars = chars.len();
+    // 累计端点法：每段末字符位置 = 按时间比例的累计进度（最后一段固定取到末尾），
+    // 数学上保证拆分后字符总数守恒（不丢字、不重复）。
     let mut char_pos = 0usize;
     points
         .windows(2)
-        .map(|w| {
+        .enumerate()
+        .map(|(i, w)| {
             let (s, e) = (w[0], w[1]);
-            let frac = ((e - s) / total).clamp(0.0, 1.0);
-            let take = ((total_chars as f64 * frac).round() as usize).clamp(1, total_chars);
-            let text: String = ev.text.chars().skip(char_pos).take(take).collect();
-            char_pos += take;
+            let end_char = if i + 2 == points.len() {
+                total_chars
+            } else {
+                let cumulative = ((e - ev.start) / total).clamp(0.0, 1.0);
+                ((total_chars as f64 * cumulative).round() as usize).clamp(char_pos, total_chars)
+            };
+            let text: String = chars[char_pos..end_char].iter().collect();
+            char_pos = end_char;
             TranscriptEvent {
                 start: s,
                 end: e,
-                raw: ev.raw.clone(),
                 text,
+                raw: ev.raw.clone(),
             }
         })
         .collect()
 }
+
 
 pub fn write_jsonl(path: &Path, frames: &[FrameEvent], speech: &[TranscriptEvent]) -> Result<()> {
     use std::io::Write;
@@ -187,5 +196,40 @@ mod tests {
         // 边界太靠近端点（<0.3s）不拆
         let ev2 = TranscriptEvent { start: 0.0, end: 1.0, text: "abc".into(), raw: None };
         assert_eq!(split_at_boundaries(ev2, &[0.1]).len(), 1);
+    }
+
+    #[test]
+    fn split_never_loses_or_duplicates_chars() {
+        // 10 字符、3 等分：逐段 round 会得 3+3+3=9（丢字），累计端点法必须守恒
+        let ev = TranscriptEvent {
+            start: 0.0,
+            end: 30.0,
+            text: "零一二三四五六七八九".into(),
+            raw: None,
+        };
+        let parts = split_at_boundaries(ev.clone(), &[10.0, 20.0]);
+        assert_eq!(parts.len(), 3);
+        let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(joined, ev.text, "拆分必须字符守恒");
+
+        // 不等分 + 非整比例
+        let ev2 = TranscriptEvent {
+            start: 0.0,
+            end: 10.0,
+            text: "零一二三四五六七八九".into(),
+            raw: None,
+        };
+        let cases: [&[f64]; 5] = [
+            &[3.0, 4.0],
+            &[1.7],
+            &[9.9],
+            &[0.1, 0.2, 9.8, 9.9],
+            &[5.0, 5.5, 6.0, 9.0],
+        ];
+        for bounds in cases {
+            let parts = split_at_boundaries(ev2.clone(), bounds);
+            let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
+            assert_eq!(joined, ev2.text, "bounds={bounds:?} 必须字符守恒");
+        }
     }
 }

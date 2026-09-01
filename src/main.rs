@@ -61,6 +61,18 @@ fn run_opts_to_cfg(
     file: &settings::ConfigFile,
 ) -> anyhow::Result<config::PipelineConfig> {
     let d = &file.defaults;
+    if let Some(p) = &d.provider {
+        anyhow::ensure!(
+            matches!(p.as_str(), "coreml" | "gpu" | "cpu" | "api"),
+            "配置文件 provider 无效：{p:?}（可选 coreml/gpu/cpu/api）"
+        );
+    }
+    if let Some(m) = &d.slide_mode {
+        anyhow::ensure!(
+            matches!(m.as_str(), "first" | "stable"),
+            "配置文件 slide_mode 无效：{m:?}（可选 first/stable）"
+        );
+    }
     Ok(config::PipelineConfig {
         url: source,
         out_root: opts
@@ -73,12 +85,15 @@ fn run_opts_to_cfg(
         sample_interval: opts.sample_interval.or(d.sample_interval).unwrap_or(1.0),
         cooldown: opts.cooldown.or(d.cooldown).unwrap_or(10.0),
         max_height: opts.max_height.or(d.max_height).unwrap_or(1080).clamp(240, 2160),
-        slide_mode: opts
-            .slide_mode
-            .clone()
-            .or_else(|| d.slide_mode.clone())
-            .unwrap_or_else(|| "stable".into())
-            .to_ascii_lowercase(),
+        slide_mode: match opts.slide_mode.clone() {
+            Some(course2md::cli::SlideModeArg::First) => "first".into(),
+            Some(course2md::cli::SlideModeArg::Stable) => "stable".into(),
+            None => d
+                .slide_mode
+                .clone()
+                .unwrap_or_else(|| "stable".into())
+                .to_ascii_lowercase(),
+        },
         stable_secs: opts.stable_secs.or(d.stable_secs).unwrap_or(0.8).clamp(0.0, 10.0),
         roi: match &opts.roi {
             Some(s) => Some(config::Roi::parse(s)?),
@@ -88,11 +103,16 @@ fn run_opts_to_cfg(
             },
         },
         threads: opts.threads.or(d.threads).unwrap_or(4),
-        provider: opts
-            .provider
-            .clone()
-            .or_else(|| d.provider.clone())
-            .unwrap_or_else(default_provider),
+        provider: match opts.provider.clone() {
+            Some(p) => match p {
+                course2md::cli::ProviderArg::Coreml => "coreml",
+                course2md::cli::ProviderArg::Gpu => "gpu",
+                course2md::cli::ProviderArg::Cpu => "cpu",
+                course2md::cli::ProviderArg::Api => "api",
+            }
+            .to_string(),
+            None => d.provider.clone().unwrap_or_else(default_provider),
+        },
         max_speech: opts.max_speech.or(d.max_speech).unwrap_or(20.0),
         formats: opts
             .formats

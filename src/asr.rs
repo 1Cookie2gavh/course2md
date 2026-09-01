@@ -65,8 +65,7 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
             .await
             .context("ASR 线程 join 失败")?;
             match joined {
-                Ok(events) if !events.is_empty() => return Ok(events),
-                Ok(_) => tracing::warn!("CoreML 未识别到语音，回落 llama-server"),
+                Ok(events) => return Ok(events), // 空 = VAD 无语音（终态，不再回落）
                 Err(e) => tracing::warn!("CoreML 后端失败（{e:#}），回落 llama-server"),
             }
         }
@@ -105,7 +104,8 @@ fn run_blocking(
     let segs = ffmpeg_vad(&input.wav, max_speech)?;
     tracing::info!(segs = segs.len(), "vad");
     if segs.is_empty() {
-        anyhow::bail!("没有检测到语音");
+        tracing::warn!("未检测到语音（VAD 结果为空），跳过识别");
+        return Ok(vec![]);
     }
 
     let bin = find_llama_server()?;
@@ -168,19 +168,22 @@ fn run_blocking(
 /// 云端 STT：ffmpeg VAD 分段 + 逐段 POST /audio/transcriptions（OpenAI 兼容 / OpenRouter）。
 fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result<Vec<TranscriptEvent>> {
     let t0 = Instant::now();
-    if api.api_key.trim().is_empty() {
-        // 约定俗成的环境变量兜底
-        if let Ok(k) = std::env::var("OPENROUTER_API_KEY") {
-            let mut api = api.clone();
-            api.api_key = k;
-            return run_api(&api, wav, max_speech);
-        }
-        anyhow::bail!("云端 STT 未配置 API Key：在配置文件 [asr_api] 设置 api_key，或用 --asr-api-key / OPENROUTER_API_KEY");
-    }
+    // key 解析（非递归）：配置 > 非空环境变量；空值不覆盖（防无限递归）
+    let api_key = if !api.api_key.trim().is_empty() {
+        api.api_key.clone()
+    } else {
+        std::env::var("OPENROUTER_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .context("云端 STT 未配置 API Key：在配置文件 [asr_api] 设置 api_key，或用 --asr-api-key / OPENROUTER_API_KEY")?
+    };
+    let api = crate::settings::AsrApi { api_key, ..api.clone() };
+    let api = &api;
     let segs = ffmpeg_vad(wav, max_speech as f32)?;
     tracing::info!(segs = segs.len(), endpoint = %api.base_url, model = %api.model, "api vad");
     if segs.is_empty() {
-        anyhow::bail!("没有检测到语音");
+        tracing::warn!("未检测到语音（VAD 结果为空），跳过识别");
+        return Ok(vec![]);
     }
 
     let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
@@ -423,6 +426,13 @@ fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<Seg>> {
         .args(["-af", "silencedetect=noise=-28dB:d=0.4", "-f", "null", "-"])
         .output()
         .context("ffmpeg silencedetect")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "ffmpeg silencedetect 失败（{}）：{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+        );
+    }
     let log = String::from_utf8_lossy(&out.stderr);
     let dur = crate::media::probe_duration_blocking(wav).unwrap_or(0.0);
     let mut silences: Vec<(f64, f64)> = vec![];
@@ -536,14 +546,12 @@ pub fn normalize_segments(
 ) -> Result<Vec<Seg>> {
     let energy = Energy::load(wav).ok();
     let dur = crate::media::probe_duration_blocking(wav).unwrap_or(0.0);
+    // VAD 成功但无语音（或全被短段过滤）→ 空分段。
+    // 不再把整段音频当语音兜底：静音课件会诱发 ASR 幻觉。
     let mut raw = speech;
     raw.retain(|(a, b)| b - a >= 0.2);
     if raw.is_empty() {
-        if dur > 0.2 {
-            raw = vec![(0.0, dur)];
-        } else {
-            return Ok(vec![]);
-        }
+        return Ok(vec![]);
     }
 
     let mut pieces: Vec<(f64, f64)> = vec![];
@@ -551,26 +559,49 @@ pub fn normalize_segments(
         split_smart(s, e, max_speech, energy.as_ref(), &mut pieces);
     }
 
-    // 填充：向静音延展，但不越过相邻语音段
+    // 填充：VAD 外边界向真实静音扩展 0.25s（限制来自相邻原始语音段，而非本段自身）；
+    // max_speech 内部切点已在能量最低点，不额外填充（避免相邻 chunk 重复文本）。
     let segs = pieces
         .iter()
-        .enumerate()
-        .map(|(i, &(s, e))| {
-            // 该 piece 所在原始 VAD 段的边界
-            let host = raw
+        .map(|&(s, e)| {
+            let host_idx = raw
                 .iter()
-                .find(|&&(rs, re)| s >= rs - 1e-6 && e <= re + 1e-6)
-                .copied()
-                .unwrap_or((s, e));
-            let prev_end = if i > 0 { pieces[i - 1].1 } else { 0.0 };
-            let next_start = if i + 1 < pieces.len() { pieces[i + 1].0 } else { dur };
-            let lo = (host.0.max(prev_end)).max(0.0);
-            let hi = (host.1.min(next_start)).min(if dur > 0.0 { dur } else { e + PAD });
+                .position(|&(rs, re)| s >= rs - 1e-6 && e <= re + 1e-6);
+            // 该 piece 是否是其所在 raw 段的第一片/最后一片（外边界才能 pad）
+            let (is_first_of_host, is_last_of_host) = match host_idx {
+                Some(h) => {
+                    let (rs, re) = raw[h];
+                    let first = (s - rs).abs() < 1e-6;
+                    let last = (re - e).abs() < 1e-6;
+                    (first, last)
+                }
+                None => (true, true),
+            };
+            // 前一个原始语音段的终点（跨段静音的上限）
+            let speech_lo = match host_idx {
+                Some(h) if h > 0 => raw[h - 1].1,
+                _ => 0.0,
+            };
+            let speech_hi = match host_idx {
+                Some(h) if h + 1 < raw.len() => raw[h + 1].0,
+                _ => dur,
+            };
+            let cut_start = if is_first_of_host {
+                (s - PAD).max(speech_lo).max(0.0)
+            } else {
+                s
+            };
+            let cut_end = if is_last_of_host {
+                let hi = if dur > 0.0 { speech_hi } else { e + PAD };
+                (e + PAD).min(hi)
+            } else {
+                e
+            };
             Seg {
                 start: s,
                 end: e,
-                cut_start: (s - PAD).max(lo),
-                cut_end: (e + PAD).min(hi.max(e)),
+                cut_start,
+                cut_end: cut_end.max(e),
             }
         })
         .collect();
@@ -584,10 +615,12 @@ fn split_smart(s: f64, e: f64, max: f64, energy: Option<&Energy>, out: &mut Vec<
         return;
     }
     let target = s + max;
+    // 只在 [target-3s, target] 内找静音最低点：任何 piece 都不超过 max（硬上限，
+    // ASR 后端常有上下文长度限制）
     let w0 = (target - SPLIT_WINDOW).max(s + MIN_PIECE.min(max / 2.0));
-    let w1 = (target + SPLIT_WINDOW).min(e - MIN_PIECE.min(max / 2.0));
-    let cut = energy.and_then(|en| en.quietest(w0.max(s), w1.min(e))).unwrap_or(target);
-    let cut = cut.clamp(s + 0.5, e - 0.5);
+    let w1 = target;
+    let cut = energy.and_then(|en| en.quietest(w0.max(s), w1)).unwrap_or(target);
+    let cut = cut.clamp(s + 0.5, target);
     out.push((s, cut));
     split_smart(cut, e, max, energy, out);
 }

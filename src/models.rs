@@ -99,9 +99,15 @@ pub async fn download_models(root: &Path) -> Result<()> {
 }
 
 async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
-    if dest.is_file() && fs::metadata(dest)?.len() > 0 {
+    if dest.is_file() && file_complete(dest) {
         tracing::info!(label, "skip existing");
         return Ok(());
+    }
+    if dest.is_file() {
+        // 校验不过的残留文件（截断/损坏）直接移除，避免"发现坏了却重下不了"
+        tracing::warn!(label, "existing file failed integrity check, re-downloading");
+        let _ = fs::remove_file(dest);
+        let _ = fs::remove_file(dest.with_extension("manifest.json"));
     }
     if let Some(p) = dest.parent() {
         fs::create_dir_all(p)?;
@@ -141,11 +147,18 @@ async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
         }
         out.sync_all()?;
         drop(out);
+        // 完整性：以服务器 Content-Length 为准（而非"实际收到多少"——截断响应会伪装成功）
+        if total > 0 && done != total {
+            let _ = fs::remove_file(&tmp);
+            anyhow::bail!(
+                "下载不完整：期望 {total} 字节，实际收到 {done}（请重试）"
+            );
+        }
         fs::rename(&tmp, &dest)?;
-        // 记录精确字节数，供后续完整性校验（防止半截文件被当成有效模型）
+        // manifest 记录 authoritative Content-Length，供后续启动校验
         let _ = fs::write(
             dest.with_extension("manifest.json"),
-            serde_json::json!({"size": done}).to_string(),
+            serde_json::json!({"size": if total > 0 { total } else { done }}).to_string(),
         );
         pb.finish_and_clear();
         tracing::info!(label = %label, bytes = done, "downloaded");

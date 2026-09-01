@@ -216,7 +216,8 @@ pub fn run_coreml(
     let segs = crate::asr::normalize_segments(raw, max_speech, wav)?;
     tracing::info!(segs = segs.len(), engine = "silero-coreml", "vad");
     if segs.is_empty() {
-        anyhow::bail!("没有检测到语音");
+        tracing::warn!("未检测到语音（VAD 结果为空），跳过识别");
+        return Ok(vec![]);
     }
 
     ensure_metallib()?;

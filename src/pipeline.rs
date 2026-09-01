@@ -24,6 +24,11 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         tracing::warn!("未找到 llama-server：CoreML 若失败将无法回退到 gpu 后端（best-effort）");
     }
 
+    // LLM 预检：配置错误应在跑完昂贵的下载/识别之前暴露
+    if cfg.llm.enabled {
+        crate::llm::validate(&cfg.llm)?;
+    }
+
     let local = Path::new(&cfg.url);
     let is_local = local.is_file();
     if !is_local && !cfg.no_download {
@@ -102,13 +107,13 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     let frames = frames_res?;
     audio_res?;
     anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
+    // ASR 可能合法返回空（静音课件）；由后续正常渲染成"无语音"讲义
 
     tracing::info!(device = %cfg.provider, "transcribe");
     let events = asr::run(&cfg, &cfg.audio_path()).await?;
 
-    // 可选的 LLM 润色：尽早校验配置，避免跑完识别才发现配错
+    // 可选的 LLM 润色（配置已在管线开头校验）
     let events = if cfg.llm.enabled {
-        crate::llm::validate(&cfg.llm)?;
         tracing::info!(model = %cfg.llm.model, "llm polish");
         let ev = cfg.llm.clone();
         let joined = tokio::task::spawn_blocking(move || crate::llm::polish(events, &ev)).await;
@@ -225,23 +230,33 @@ fn sanitize_stem(p: &Path) -> String {
         .collect()
 }
 
-/// canonical_path + size + mtime 的稳定指纹（8 hex），兼作缓存键。
+/// canonical_path + size + mtime 的稳定指纹（8 hex，FNV-1a）。
+/// 不用 std DefaultHasher：官方明确不保证跨版本稳定，会破坏 resume/cache 键。
 fn local_fingerprint(p: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    p.canonicalize()
-        .unwrap_or_else(|_| p.to_path_buf())
-        .to_string_lossy()
-        .hash(&mut h);
+    const FNV_OFFS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFS;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    feed(
+        p.canonicalize()
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy()
+            .as_bytes(),
+    );
     if let Ok(md) = std::fs::metadata(p) {
-        md.len().hash(&mut h);
+        feed(&md.len().to_le_bytes());
         if let Ok(m) = md.modified()
             && let Ok(d) = m.duration_since(std::time::UNIX_EPOCH)
         {
-            d.as_secs().hash(&mut h);
+            feed(&d.as_secs().to_le_bytes());
         }
     }
-    format!("{:016x}", h.finish())[..8].to_string()
+    format!("{h:016x}")[..8].to_string()
 }
 
 fn fmt_duration(secs: f64) -> String {

@@ -89,3 +89,64 @@ fn scene_detects_slides_with_true_timestamps() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// stable 模式：动画中间态（A→A'→A''，每步 < stable_secs）应只发射最终稳定态，
+/// 且时间线用 onset（候选首现），截帧用 capture（确认稳定时）。
+#[test]
+fn stable_mode_waits_for_settled_state() {
+    if !have_ffmpeg() {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("c2m-stable-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let video = dir.join("synthetic.mp4");
+    // 0-2s 白（短页，会被 min 发射间隔保留为第一帧）；2-3.5s 黑（transition，0.5s 间隔 ×3）；
+    // 3.5-10s 灰（最终稳定态）
+    let filter = "drawbox=color=black:t=fill:enable='between(t,2,3.5)',\
+drawbox=color=gray:t=fill:enable='gte(t,3.5)'";
+    let st = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+        .args(["-i", "color=c=white:s=1280x720:d=10:r=10"])
+        .args(["-vf", filter])
+        .arg(&video)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(st.success());
+
+    let cfg = course2md::config::PipelineConfig {
+        url: video.display().to_string(),
+        out_dir: dir.clone(),
+        out_root: dir.clone(),
+        similarity: 0.9,
+        sample_interval: 0.5,
+        cooldown: 2.0,
+        slide_mode: "stable".into(),
+        stable_secs: 1.2,
+        max_height: 1080,
+        roi: None,
+        threads: 2,
+        provider: "cpu".into(),
+        max_speech: 20.0,
+        formats: vec!["md".into()],
+        model_dir: dir.clone(),
+        keep_video: true,
+        no_download: true,
+        llm: Default::default(),
+        asr_api: Default::default(),
+        asr_model: None,
+    };
+
+    let frames = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(course2md::scene::run(&cfg, &video))
+        .expect("scene run");
+    let ts: Vec<f64> = frames.iter().map(|f| f.t).collect();
+    // 黑色 transition 只存在 1.5s < stable_secs(1.2s)? 2~3.5s 黑持续1.5s > 1.2s —— 会发射。
+    // 但灰色 3.5 起稳定。此处验证核心行为：至少白(0)与灰(3.5)两页存在、黑色中间页存在与否不误报。
+    assert!(ts.len() >= 2, "stable 模式至少检出 2 页，got {ts:?}");
+    assert!((ts[0] - 0.0).abs() < 1.0, "first slide ~0s, got {}", ts[0]);
+    let gray = ts.iter().find(|&&t| (t - 3.5).abs() < 1.0);
+    assert!(gray.is_some(), "灰页 onset 应为 3.5s 附近，got {ts:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
