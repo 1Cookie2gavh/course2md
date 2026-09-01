@@ -13,6 +13,7 @@ use std::time::Instant;
 
 pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     let t_total = Instant::now();
+    cfg.validate().context("配置预检失败")?;
     crate::error::require_cmd("ffmpeg")?;
     crate::error::require_cmd("ffprobe")?;
     use config::AsrProvider;

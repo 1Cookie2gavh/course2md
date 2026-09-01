@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// `[defaults]`：命令行参数的默认值。全部可选，未设置的项回落内置默认。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Defaults {
     pub out: Option<PathBuf>,
     pub similarity: Option<f64>,
@@ -31,7 +31,7 @@ pub struct Defaults {
 
 /// 云端 STT（provider = "api"，OpenAI 兼容 /audio/transcriptions，如 OpenRouter）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AsrApi {
     pub base_url: String,
     pub api_key: String,
@@ -49,7 +49,7 @@ impl Default for AsrApi {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ConfigFile {
     pub defaults: Defaults,
     pub llm: crate::llm::LlmSettings,

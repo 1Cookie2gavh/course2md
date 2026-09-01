@@ -77,11 +77,13 @@ fn run_opts_to_cfg(
             .out
             .clone()
             .or_else(|| d.out.clone())
+            .map(config::expand_tilde)
             .unwrap_or_else(|| "out".into()),
         out_dir: opts
             .out
             .clone()
             .or_else(|| d.out.clone())
+            .map(config::expand_tilde)
             .unwrap_or_else(|| "out".into()),
         similarity: opts.similarity.or(d.similarity).unwrap_or(0.85),
         sample_interval: opts.sample_interval.or(d.sample_interval).unwrap_or(1.0),
@@ -233,6 +235,8 @@ fn main() -> anyhow::Result<()> {
             init_logging(cli.opts.verbose, cli.opts.quiet);
             let file = settings::load()?;
             let cfg = run_opts_to_cfg(source, &cli.opts, &file)?;
+            // 预检：所有配置错误在下载/抽帧/模型加载之前暴露（毫秒级失败）
+            cfg.validate()?;
             tracing::info!(out = %cfg.out_dir.display(), provider = %cfg.provider, "start");
             tokio::runtime::Runtime::new()?.block_on(pipeline::run(&cfg))
         }

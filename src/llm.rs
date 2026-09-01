@@ -19,7 +19,7 @@ pub const DEFAULT_PROMPT: &str = "你是字幕校对器。修正语音识别文�
 const BATCH: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LlmSettings {
     pub enabled: bool,
     /// OpenAI 兼容 base URL，如 https://api.deepseek.com/v1

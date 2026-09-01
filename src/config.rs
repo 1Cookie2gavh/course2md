@@ -1,3 +1,4 @@
+use anyhow::Result as AnyhowResult;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -183,6 +184,125 @@ fn parse_coord(s: &str) -> anyhow::Result<f64> {
 }
 
 impl PipelineConfig {
+    /// 全量预检：所有配置错误必须在任何昂贵操作（下载/抽帧/模型加载）之前暴露。
+    /// 返回 Err 的送进 main 后直接退出，不会碰网络与模型。
+    pub fn validate(&self) -> AnyhowResult<()> {
+        let finite = |name: &str, v: f64| -> AnyhowResult<()> {
+            anyhow::ensure!(v.is_finite(), "{name} 必须是有限数值（收到 {v}）");
+            Ok(())
+        };
+        finite("similarity", self.similarity)?;
+        finite("sample_interval", self.sample_interval)?;
+        finite("cooldown", self.cooldown)?;
+        finite("stable_secs", self.stable_secs)?;
+        finite("max_speech", self.max_speech as f64)?;
+
+        anyhow::ensure!(
+            self.similarity > 0.0 && self.similarity <= 1.0,
+            "similarity 必须在 (0, 1]：SSIM 阈值越高越敏感（截图更多），收到 {}",
+            self.similarity
+        );
+        anyhow::ensure!(
+            self.sample_interval > 0.0,
+            "sample_interval 必须 > 0 秒（收到 {}）",
+            self.sample_interval
+        );
+        anyhow::ensure!(
+            self.cooldown >= 0.0,
+            "cooldown 必须 >= 0 秒（收到 {}）",
+            self.cooldown
+        );
+        anyhow::ensure!(
+            self.stable_secs >= 0.0,
+            "stable_secs 必须 >= 0 秒（收到 {}）",
+            self.stable_secs
+        );
+        // 上限防御 split_smart 的 clamp panic（0 会让 clamp(min>max) abort）
+        anyhow::ensure!(
+            self.max_speech >= 1.0 && self.max_speech <= 600.0,
+            "max_speech 必须在 1..=600 秒（收到 {}）；切分算法不允许 0/负值",
+            self.max_speech
+        );
+        anyhow::ensure!(
+            self.threads >= 1,
+            "threads 必须 >= 1（收到 {}）",
+            self.threads
+        );
+        anyhow::ensure!(
+            self.max_height >= 144,
+            "max_height 必须 >= 144（收到 {}）",
+            self.max_height
+        );
+        anyhow::ensure!(
+            !self.formats.is_empty(),
+            "formats 不能为空（至少 md/html/json 之一）"
+        );
+
+        // provider × 模型兼容性：静默忽略用户指定的模型属于静默错误结果
+        if let Some(m) = self
+            .asr_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let lower = m.to_ascii_lowercase();
+            match self.provider {
+                AsrProvider::Gpu | AsrProvider::Cpu => {
+                    anyhow::ensure!(
+                        lower.contains("qwen"),
+                        "provider {:?} 只支持 qwen3 系模型（当前缓存仅有 Qwen3-ASR GGUF）；
+                         要用 Whisper 请选 --provider coreml / npu / api",
+                        self.provider
+                    );
+                }
+                AsrProvider::Coreml => {
+                    anyhow::ensure!(
+                        lower.contains("qwen") || lower.contains("whisper"),
+                        "provider coreml 只支持 qwen3 / whisper（收到 {m:?}）"
+                    );
+                }
+                AsrProvider::Npu => {
+                    let known = [
+                        "qwen3",
+                        "qwen3-1.7b",
+                        "qwen3-0.6b",
+                        "1.7b",
+                        "0.6b",
+                        "whisper",
+                        "turbo",
+                        "whisper-turbo",
+                        "whisper-large",
+                        "large",
+                        "tiny",
+                        "whisper-tiny",
+                        "base",
+                        "whisper-base",
+                        "small",
+                        "whisper-small",
+                    ];
+                    anyhow::ensure!(
+                        known.contains(&lower.as_str()) || lower.contains('/'),
+                        "provider npu 的 asr_model 需是已知别名或 HuggingFace 仓库 id（含 /，收到 {m:?}）"
+                    );
+                }
+                AsrProvider::Api => {}
+            }
+        }
+
+        // api 后端：key 缺失时立即报错，而不是切完音频才发现
+        if self.provider == AsrProvider::Api {
+            let env_key = std::env::var("OPENROUTER_API_KEY")
+                .ok()
+                .is_some_and(|k| !k.trim().is_empty());
+            anyhow::ensure!(
+                !self.asr_api.api_key.trim().is_empty() || env_key,
+                "provider api 需要 API key：配置文件 [asr_api].api_key、--asr-api-key 或环境变量 OPENROUTER_API_KEY"
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn media_path(&self) -> PathBuf {
         self.out_dir.join("media.mp4")
     }
@@ -237,8 +357,24 @@ pub fn cache_dir() -> PathBuf {
 }
 
 pub fn model_dir_from(opt: Option<&Path>) -> PathBuf {
-    opt.map(|p| p.to_path_buf())
+    opt.map(|p| expand_tilde(p.to_path_buf()))
         .unwrap_or_else(|| cache_dir().join("models"))
+}
+
+/// 展开 `~` / `~/...`（仅 Unix 主目录约定；无 HOME 时原样返回）。
+/// 防止配置里的 "~/cache" 真的在当前目录创建名为 `~` 的子目录。
+pub fn expand_tilde(p: PathBuf) -> PathBuf {
+    let Some(s) = p.to_str() else { return p };
+    if s == "~" {
+        if let Some(h) = std::env::var_os("HOME") {
+            return PathBuf::from(h);
+        }
+    } else if let Some(rest) = s.strip_prefix("~/")
+        && let Some(h) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(h).join(rest);
+    }
+    p
 }
 
 /// resume 三态解析：`--no-resume` > `--resume` > 配置文件 > 默认关闭。
@@ -378,6 +514,92 @@ mod tests {
         assert_eq!(infer_slug("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
         let p = course_dir(Path::new("out"), "bilibili", "欢迎来到未来", "BV1pb8o6yE8f");
         assert_eq!(p, PathBuf::from("out/bilibili/欢迎来到未来/BV1pb8o6yE8f"));
+    }
+
+    #[test]
+    fn expand_tilde_paths() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert_eq!(expand_tilde("~/m".into()), PathBuf::from(&home).join("m"));
+            assert_eq!(expand_tilde("~".into()), PathBuf::from(&home));
+        }
+        assert_eq!(expand_tilde("rel/x".into()), PathBuf::from("rel/x"));
+        assert_eq!(expand_tilde("/abs/x".into()), PathBuf::from("/abs/x"));
+    }
+
+    fn valid_cfg() -> PipelineConfig {
+        PipelineConfig {
+            url: "https://youtu.be/x".into(),
+            out_dir: "out".into(),
+            out_root: "out".into(),
+            similarity: 0.85,
+            sample_interval: 1.0,
+            cooldown: 10.0,
+            max_height: 1080,
+            slide_mode: SlideMode::Stable,
+            stable_secs: 0.8,
+            roi: None,
+            threads: 4,
+            provider: AsrProvider::Gpu,
+            max_speech: 20.0,
+            formats: vec![OutputFormat::Md],
+            model_dir: "/tmp/m".into(),
+            keep_video: false,
+            no_download: false,
+            resume: false,
+            llm: Default::default(),
+            asr_api: Default::default(),
+            asr_model: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        valid_cfg().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range() {
+        let mut c = valid_cfg();
+        // max_speech=0 曾导致 split_smart 中 clamp(min>max) panic
+        c.max_speech = 0.0;
+        assert!(c.validate().is_err());
+        c.max_speech = f32::INFINITY;
+        assert!(c.validate().is_err());
+        c.max_speech = 20.0;
+
+        c.similarity = 0.0;
+        assert!(c.validate().is_err());
+        c.similarity = 1.5;
+        assert!(c.validate().is_err());
+        c.similarity = 0.85;
+
+        c.sample_interval = 0.0;
+        assert!(c.validate().is_err());
+        c.sample_interval = 1.0;
+
+        c.threads = 0;
+        assert!(c.validate().is_err());
+        c.threads = 4;
+
+        c.formats = vec![];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_model_provider_mismatch() {
+        // gpu/cpu 只有 Qwen3 GGUF：显式要 whisper 必须报错而不是静默用 qwen
+        let mut c = valid_cfg();
+        c.asr_model = Some("whisper".into());
+        assert!(c.validate().is_err());
+        c.provider = AsrProvider::Coreml;
+        c.asr_model = Some("whisper".into());
+        c.validate().unwrap();
+        c.provider = AsrProvider::Npu;
+        c.asr_model = Some("org/custom-ov-model".into());
+        c.validate().unwrap();
+        c.asr_model = Some("not-a-repo-id".into());
+        assert!(c.validate().is_err());
     }
 
     #[test]
