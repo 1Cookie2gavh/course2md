@@ -181,8 +181,14 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     anyhow::ensure!(!frames.is_empty(), "没有截到任何画面");
     // 转写可能合法返回空（静音课件）；由后续正常渲染成"无语音"讲义
 
-    // 合并先行：LLM 润色需要 section 上下文（视觉润色按节附对应截图，issue #5）
-    let mut sections = timeline::merge(frames.clone(), events.clone(), meta.duration);
+    // timeline.jsonl 始终保存 ASR/字幕的原始细粒度事件（段落组织之前），
+    // 供追溯、调试或二次处理。
+    timeline::write_jsonl(&cfg.timeline_path(), &frames, &events)?;
+
+    // 合并 → 段落组织：同一截图内短停顿间的连续片段合并为自然段；
+    // LLM 校对与渲染都作用于组织好的段落（issue #6 的可读性改进）
+    let mut sections = timeline::merge(frames.clone(), events, meta.duration);
+    timeline::coalesce_sections(&mut sections);
     if cfg.llm.enabled {
         tracing::info!(model = %cfg.llm.model, vision = cfg.llm.vision, "llm polish");
         let ev = cfg.llm.clone();
@@ -194,11 +200,6 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         .await;
         sections = joined.context("LLM 线程 join 失败")?;
     }
-    let speech: Vec<timeline::TranscriptEvent> = sections
-        .iter()
-        .flat_map(|sec| sec.speech.iter().cloned())
-        .collect();
-    timeline::write_jsonl(&cfg.timeline_path(), &frames, &speech)?;
     tracing::info!(sections = sections.len(), "merged");
 
     render::write_outputs(&cfg.out_dir, &meta, &sections, &cfg.formats).await?;

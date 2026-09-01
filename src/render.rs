@@ -78,7 +78,7 @@ pub fn render_html(meta: &VideoMeta, sections: &[Section]) -> String {
             body.push_str("<p class=\"mute\">（本段无语音）</p>\n");
         } else {
             for ev in &s.speech {
-                body.push_str(&format!("<p>「{}」</p>\n", esc(&ev.text)));
+                body.push_str(&format!("<p>{}</p>\n", esc(&ev.text)));
             }
         }
         body.push_str("</section>\n");
@@ -170,6 +170,12 @@ mod tests {
         }];
         let md = render_markdown(&m, &s);
         assert!(md.contains("你好") && md.contains("frames/slide_0001.jpg"));
-        assert!(render_html(&m, &[]).contains("&lt;课&gt;"));
+        let html = render_html(&m, &s);
+        assert!(html.contains("&lt;课&gt;"));
+        assert!(
+            html.contains("<p>你好</p>"),
+            "正文直接成段，不再用「」对话包裹"
+        );
+        assert!(!html.contains("「你好」"));
     }
 }
