@@ -27,7 +27,7 @@ try:
     import openvino_genai as ov_genai
     import numpy as np
 except ImportError as e:
-    sys.stderr.write(f"Error: 缺少 openvino_genai 或 numpy: {e}\n请安装: pip install openvino-genai numpy 或使用 uv\n")
+    sys.stderr.write("Error: 缺少 openvino_genai 或 numpy: " + str(e) + "\n请安装: pip install openvino-genai numpy 或使用 uv\n")
     sys.exit(1)
 
 model_arg = sys.argv[1] if len(sys.argv) > 1 else "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO"
@@ -38,22 +38,14 @@ model_path = model_arg
 if not os.path.isdir(model_path):
     try:
         from huggingface_hub import snapshot_download
-        print(f"[NPU] 正在下载/加载 ASR 模型 {model_arg}...", flush=True)
-        try:
-            model_path = snapshot_download(model_arg)
-        except Exception as e_dl:
-            if "qwen" in str(model_arg).lower():
-                print(f"[NPU] Qwen3-ASR 模型下载受限 ({e_dl})，回退预备的 Whisper Large-v3 Turbo...", flush=True)
-                model_arg = "OpenVINO/whisper-large-v3-turbo-int8-ov"
-                model_path = snapshot_download(model_arg)
-            else:
-                raise e_dl
+        print("[NPU] 正在下载/加载 ASR 模型 " + model_arg + "...", flush=True)
+        model_path = snapshot_download(model_arg)
     except Exception as e:
-        sys.stderr.write(f"Error 下载模型失败 {model_arg}: {e}
-")
+        # 不静默更换模型：请求什么模型就报什么错（换模型须用户显式 --asr-model）
+        sys.stderr.write("Error: 模型下载失败 " + model_arg + ": " + str(e) + "\n（可显式指定 --asr-model whisper 使用 Whisper）\n")
         sys.exit(1)
 
-print(f"[NPU] 正在将模型加载/编译至 {device}（首次编译可能需要 1~2 分钟）...", flush=True)
+print("[NPU] 正在将模型加载/编译至 " + device + "（首次编译可能需要 1~2 分钟）...", flush=True)
 t0 = time.time()
 is_qwen = "qwen" in str(model_arg).lower() or "qwen" in str(model_path).lower()
 
@@ -62,13 +54,9 @@ if is_qwen and hasattr(ov_genai, "ASRPipeline"):
         pipe = ov_genai.ASRPipeline(model_path, device)
         gen_cfg = getattr(ov_genai, "ASRGenerationConfig", lambda: None)()
     except Exception as e_qwen:
-        sys.stderr.write(f"[NPU] Qwen3 ASR 加载异常 ({e_qwen})，自动回退 WhisperPipeline
-")
-        from huggingface_hub import snapshot_download
-        fallback_path = snapshot_download("OpenVINO/whisper-large-v3-turbo-int8-ov")
-        pipe = ov_genai.WhisperPipeline(fallback_path, device)
-        gen_cfg = ov_genai.WhisperGenerationConfig(os.path.join(fallback_path, "generation_config.json"))
-        gen_cfg.language = "<|zh|>"
+        # 加载失败直接报错退出，不回退到 Whisper（静默换模型会让转写来源不可追溯）
+        sys.stderr.write("Error: Qwen3 ASR 加载失败: " + str(e_qwen) + "\n（如需 Whisper 请显式指定 --asr-model whisper）\n")
+        sys.exit(1)
 else:
     pipe = ov_genai.WhisperPipeline(model_path, device)
     gen_cfg_path = os.path.join(model_path, "generation_config.json")
@@ -76,9 +64,9 @@ else:
         gen_cfg = ov_genai.WhisperGenerationConfig(gen_cfg_path)
     else:
         gen_cfg = ov_genai.WhisperGenerationConfig()
-    gen_cfg.language = "<|zh|>"
+    # 语言由模型自动检测，不强制中文（硬编码 <|zh|> 会把英文课转成中文幻觉输出）
 
-print(f"[NPU] 模型在 {device} 就绪（耗时 {time.time()-t0:.2f}s）", flush=True)
+print("[NPU] 模型在 " + device + " 就绪（耗时 " + f"{time.time()-t0:.2f}" + "s）", flush=True)
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -89,7 +77,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b"{\"status\":\"ok\"}")
+            self.wfile.write(b'{"status":"ok"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -135,7 +123,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(err_resp)
 
 server = http.server.HTTPServer(("127.0.0.1", port), Handler)
-print(f"[NPU] 监听 http://127.0.0.1:{port}", flush=True)
+print("[NPU] 监听 http://127.0.0.1:" + str(port), flush=True)
 server.serve_forever()
 "#;
 
@@ -282,6 +270,54 @@ fn write_worker_script(out_dir: &Path) -> Result<PathBuf> {
     let p = dir.join("npu_worker.py");
     std::fs::write(&p, NPU_WORKER_SCRIPT)?;
     Ok(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 内嵌脚本必须能被 Python 解析。0.8.x 曾因 f-string 内嵌字面换行导致
+    /// 整个 NPU 后端无法启动（SyntaxError 在编译期拦截，任何路径都跑不到）。
+    /// 无 python3 的环境下跳过。
+    #[test]
+    fn worker_script_is_valid_python() {
+        let Some(py) = crate::runtime::which("python3") else {
+            eprintln!("skip: python3 not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("c2m-npu-py-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("npu_worker.py");
+        std::fs::write(&script, NPU_WORKER_SCRIPT).unwrap();
+        let out = std::process::Command::new(py)
+            .arg("-m")
+            .arg("py_compile")
+            .arg(&script)
+            .output()
+            .expect("spawn python3");
+        assert!(
+            out.status.success(),
+            "NPU worker 脚本存在语法错误：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn npu_model_aliases() {
+        assert_eq!(
+            resolve_npu_model(Some("whisper")),
+            "OpenVINO/whisper-large-v3-turbo-int8-ov"
+        );
+        assert_eq!(
+            resolve_npu_model(None),
+            "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO"
+        );
+        assert_eq!(
+            resolve_npu_model(Some("org/custom-model")),
+            "org/custom-model"
+        );
+    }
 }
 
 fn spawn_npu_worker(script: &Path, model: &str, port: u16) -> Result<crate::runtime::ManagedChild> {
