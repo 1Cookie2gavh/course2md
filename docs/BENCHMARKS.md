@@ -13,16 +13,16 @@ Reproduce with `packaging/bench-mac.sh` (speed + power via `powermetrics`). 复�
 
 | Backend / 后端 | Wall / 总耗时 | ASR only / 纯识别 | CPU | GPU | ANE | Peak memory / 峰值内存 |
 |---|---:|---:|---:|---:|---:|---|
-| `coreml` + qwen3 0.6B **(default / 默认)** | 48 s | 45.9 s | 4.0 W | 0.2 W | 3.6 W | 1.41 GB (in-process / 进程内) |
-| `coreml` + whisper large-v3-turbo | 86 s | 85.2 s | 13.2 W | 0.2 W | 0.4 W | 1.51 GB (in-process / 进程内) |
-| `gpu` (llama.cpp Metal, Qwen3-ASR 1.7B Q8) | **12 s** | 10.5 s | 4.2 W | **17.6 W** | — | 26 MB + 3.3 GB child / 子进程 |
-| `cpu` (llama.cpp, same model) | 27 s | 25.6 s | **20.6 W** | 0.9 W | — | 26 MB + 4.8 GB child / 子进程 |
+| `coreml` + qwen3 0.6B **(default / 默认)** | 47 s | 46.4 s | 6.7 W | 0.2 W | 3.5 W | 1.41 GB (in-process / 进程内) |
+| `coreml` + whisper large-v3-turbo | 87 s | 85.3 s | 15.3 W | 0.3 W | 0.4 W | 1.51 GB (in-process / 进程内) |
+| `gpu` (llama.cpp Metal, Qwen3-ASR 1.7B Q8) | **13 s** | 11.2 s | 4.7 W | **16.0 W** | — | 26 MB + 3.3 GB child / 子进程 |
+| `cpu` (llama.cpp, same model) | 26 s | 25.6 s | **21.2 W** | 0.6 W | — | 26 MB + 4.8 GB child / 子进程 |
 | `api` (cloud STT / 云端) | ~10 s† | — | < 1 W | — | — | negligible / 可忽略 |
 
 † Network-bound, provider-dependent. Audio leaves the machine / 取决于网络与提供商；音频会上传。
 
 Derived totals over the run (power × time, for reference only) / 全程能量参考值（功率×时间）：
-coreml-qwen3 ≈ 375 J · gpu-llama ≈ 263 J · cpu-llama ≈ 581 J · coreml-whisper ≈ 1194 J（含 ~2 W 空闲基线）。
+coreml-qwen3 ≈ 493 J · gpu-llama ≈ 269 J · cpu-llama ≈ 567 J · coreml-whisper ≈ 1387 J（含 ~2 W 空闲基线）。
 
 ## Takeaways / 结论
 

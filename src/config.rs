@@ -8,6 +8,12 @@ pub struct PipelineConfig {
     pub similarity: f64,
     pub sample_interval: f64,
     pub cooldown: f64,
+    /// 下载视频的高度上限（默认 1080；讲义截图质量优先）
+    pub max_height: u32,
+    /// 截图发射模式：first（首个不同帧）| stable（等待画面稳定，适合动画课件）
+    pub slide_mode: String,
+    /// stable 模式下画面需保持不变的秒数
+    pub stable_secs: f64,
     pub roi: Option<Roi>,
     pub threads: i32,
     pub provider: String,

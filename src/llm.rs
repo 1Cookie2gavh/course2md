@@ -67,16 +67,34 @@ pub fn polish(mut events: Vec<TranscriptEvent>, s: &LlmSettings) -> Vec<Transcri
     let mut warned = false;
     for chunk in events.chunks_mut(BATCH) {
         pb.inc(1);
-        let texts: Vec<&str> = chunk.iter().map(|e| e.text.as_str()).collect();
-        match chat(s, &texts) {
-            Ok(polished) if polished.len() == chunk.len() => {
-                for (ev, t) in chunk.iter_mut().zip(polished) {
-                    if !t.is_empty() {
-                        ev.text = t;
+        // 带分段下标请求/校验：防止模型重排或漏项导致的静默错位
+        let items: Vec<(usize, &str)> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, e.text.as_str()))
+            .collect();
+        match chat(s, &items) {
+            Ok(polished) => {
+                let mut by_id: Vec<Option<String>> = vec![None; chunk.len()];
+                let mut bad = false;
+                for (id, text) in polished {
+                    if id >= chunk.len() || by_id[id].is_some() {
+                        bad = true;
+                        break;
+                    }
+                    by_id[id] = Some(text);
+                }
+                if bad || by_id.iter().any(|v| v.is_none()) {
+                    warn_once(&mut warned, "LLM 返回 id 集与输入不符，该批保留原文");
+                    continue;
+                }
+                for (ev, new_text) in chunk.iter_mut().zip(by_id.into_iter().map(|v| v.unwrap())) {
+                    if !new_text.is_empty() && new_text != ev.text {
+                        ev.raw.get_or_insert_with(|| ev.text.clone());
+                        ev.text = new_text;
                     }
                 }
             }
-            Ok(_) => warn_once(&mut warned, "LLM 返回条数与输入不符，该批保留原文"),
             Err(e) => warn_once(&mut warned, &format!("LLM 润色失败（{e:#}），保留原文")),
         }
     }
@@ -93,16 +111,20 @@ fn warn_once(warned: &mut bool, msg: &str) {
     }
 }
 
-/// 发一批文本给 LLM，返回润色后的文本数组。
-fn chat(s: &LlmSettings, texts: &[&str]) -> Result<Vec<String>> {
+/// 发一批（id, 文本）给 LLM，返回润色后的 (id, 文本) 列表。
+fn chat(s: &LlmSettings, items: &[(usize, &str)]) -> Result<Vec<(usize, String)>> {
     validate(s)?;
+    let payload: Vec<serde_json::Value> = items
+        .iter()
+        .map(|(i, t)| serde_json::json!({"id": i, "text": t}))
+        .collect();
     let body = serde_json::json!({
         "model": s.model,
         "temperature": 0.0,
         "max_tokens": 4096,
         "messages": [
-            {"role": "system", "content": effective_prompt(s)},
-            {"role": "user", "content": serde_json::to_string(texts)?},
+            {"role": "system", "content": format!("{} 输出为 JSON 数组，每项形如 {{\"id\":序号,\"text\":润色后的文本}}，id 必须与输入一一对应。", effective_prompt(s))},
+            {"role": "user", "content": serde_json::to_string(&payload)?},
         ],
     });
     let resp = ureq::post(&endpoint(&s.base_url))
@@ -116,7 +138,29 @@ fn chat(s: &LlmSettings, texts: &[&str]) -> Result<Vec<String>> {
         .as_str()
         .unwrap_or("")
         .to_string();
-    parse_text_array(&content).with_context(|| format!("LLM 响应不是 JSON 数组: {content:.200}"))
+    parse_id_text_pairs(&content)
+        .with_context(|| format!("LLM 响应不是 id/text JSON 数组: {:.200}", content))
+}
+
+/// 从模型输出提取 [{"id":n,"text":"..."}]（容忍代码围栏与前后杂文）。
+pub fn parse_id_text_pairs(content: &str) -> Option<Vec<(usize, String)>> {
+    let start = content.find('[')?;
+    let end = content.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    let v: Vec<serde_json::Value> = serde_json::from_str(&content[start..=end]).ok()?;
+    let mut out = vec![];
+    for item in v {
+        let id = item.get("id")?.as_u64()? as usize;
+        let text = item.get("text")?.as_str()?.to_string();
+        out.push((id, text));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// 从模型输出中提取 JSON 字符串数组（容忍 ```json 围栏与前后杂文）。
@@ -261,12 +305,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_array_tolerates_fences() {
-        assert_eq!(
-            parse_text_array("```json\n[\"a\",\"b\"]\n```").unwrap(),
-            vec!["a".to_string(), "b".to_string()]
-        );
-        assert_eq!(parse_text_array("结果：[\"你奸\"]").unwrap(), vec!["你奸"]);
-        assert!(parse_text_array("没有数组").is_none());
+    fn parse_id_pairs_tolerates_fences() {
+        let got = parse_id_text_pairs(
+            "```json\n[{\"id\":0,\"text\":\"a\"},{\"id\":1,\"text\":\"b\"}]\n```",
+        )
+        .unwrap();
+        assert_eq!(got, vec![(0, "a".into()), (1, "b".into())]);
+        assert!(parse_id_text_pairs("没有数组").is_none());
+        assert!(parse_id_text_pairs("[]").is_none());
     }
 }

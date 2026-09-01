@@ -17,7 +17,11 @@ pub struct FrameEvent {
 pub struct TranscriptEvent {
     pub start: f64,
     pub end: f64,
+    /// 展示文本（LLM 润色后的）；未润色时与 raw 相同
     pub text: String,
+    /// ASR 原始文本（provenance；润色后保留）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
 }
 
 /// 一张截图 + 展示期间的语音。
@@ -38,6 +42,8 @@ pub enum TimelineEvent {
 
 /// 合并算法（见 docs/DESIGN.md §3.2）：
 /// 每条语音按中点归属「时间 ≤ 中点的最后一张截图」；首张之前的归首张。
+/// 跨越截图边界的语音段先按边界拆开（文本按时间比例近似分割），
+/// 避免整段被错误塞进后一张截图（图文错页）。
 pub fn merge(frames: Vec<FrameEvent>, speech: Vec<TranscriptEvent>) -> Vec<Section> {
     if frames.is_empty() {
         return vec![];
@@ -50,17 +56,53 @@ pub fn merge(frames: Vec<FrameEvent>, speech: Vec<TranscriptEvent>) -> Vec<Secti
             speech: vec![],
         })
         .collect();
-    // frames 已按 t 升序；二分找最后一个 t <= mid 的段
+    let boundaries: Vec<f64> = sections.iter().map(|s| s.t).collect();
     for ev in speech {
-        let mid = (ev.start + ev.end) / 2.0;
-        let idx = match sections[..].binary_search_by(|s| s.t.partial_cmp(&mid).unwrap()) {
-            Ok(i) => i,
-            Err(0) => 0, // 首张截图之前
-            Err(i) => i - 1,
-        };
-        sections[idx].speech.push(ev);
+        for piece in split_at_boundaries(ev, &boundaries) {
+            let mid = (piece.start + piece.end) / 2.0;
+            let idx = match sections[..].binary_search_by(|s| s.t.partial_cmp(&mid).unwrap()) {
+                Ok(i) => i,
+                Err(0) => 0, // 首张截图之前
+                Err(i) => i - 1,
+            };
+            sections[idx].speech.push(piece);
+        }
     }
     sections
+}
+
+/// 把一条语音事件在截图边界处拆成多段；文本按时间比例在字符维度近似分割。
+fn split_at_boundaries(ev: TranscriptEvent, boundaries: &[f64]) -> Vec<TranscriptEvent> {
+    let inner: Vec<f64> = boundaries
+        .iter()
+        .copied()
+        .filter(|&b| b > ev.start + 0.3 && b < ev.end - 0.3)
+        .collect();
+    if inner.is_empty() {
+        return vec![ev];
+    }
+    let mut points = vec![ev.start];
+    points.extend(inner);
+    points.push(ev.end);
+    let total = ev.end - ev.start;
+    let total_chars = ev.text.chars().count().max(1);
+    let mut char_pos = 0usize;
+    points
+        .windows(2)
+        .map(|w| {
+            let (s, e) = (w[0], w[1]);
+            let frac = ((e - s) / total).clamp(0.0, 1.0);
+            let take = ((total_chars as f64 * frac).round() as usize).clamp(1, total_chars);
+            let text: String = ev.text.chars().skip(char_pos).take(take).collect();
+            char_pos += take;
+            TranscriptEvent {
+                start: s,
+                end: e,
+                raw: ev.raw.clone(),
+                text,
+            }
+        })
+        .collect()
 }
 
 pub fn write_jsonl(path: &Path, frames: &[FrameEvent], speech: &[TranscriptEvent]) -> Result<()> {
@@ -110,6 +152,7 @@ mod tests {
             start,
             end,
             text: format!("{start}-{end}"),
+            raw: None,
         }
     }
 
@@ -118,8 +161,31 @@ mod tests {
         let frames = vec![frame(0.0), frame(60.0), frame(120.0)];
         let speech = vec![sp(10.0, 20.0), sp(50.0, 70.0), sp(5.0, 8.0)];
         let s = merge(frames, speech);
-        assert_eq!(s[0].speech.len(), 2); // mid=15 + mid=6.5
-        assert_eq!(s[1].speech.len(), 1); // mid=60
+        // sp(50,70) 跨越 60s 边界：拆成 (50,60)->slide0 与 (60,70)->slide1
+        assert_eq!(s[0].speech.len(), 3); // mid=15 + mid=6.5 + 拆分前半
+        assert_eq!(s[1].speech.len(), 1); // 拆分后半
+        // 拆分后的时间正确
+        assert!((s[0].speech[1].end - 60.0).abs() < 1e-6);
+        assert!((s[1].speech[0].start - 60.0).abs() < 1e-6);
         assert!(merge(vec![], vec![sp(1.0, 2.0)]).is_empty());
+    }
+
+    #[test]
+    fn boundary_split_proportional_text() {
+        let ev = TranscriptEvent {
+            start: 0.0,
+            end: 10.0,
+            text: "一二三四五六七八九十".into(), // 10 chars
+            raw: None,
+        };
+        let parts = split_at_boundaries(ev, &[5.0]);
+        assert_eq!(parts.len(), 2);
+        let c0 = parts[0].text.chars().count();
+        let c1 = parts[1].text.chars().count();
+        assert_eq!(c0 + c1, 10);
+        assert_eq!(c0, 5); // 50/50 时长 → 一半字符
+        // 边界太靠近端点（<0.3s）不拆
+        let ev2 = TranscriptEvent { start: 0.0, end: 1.0, text: "abc".into(), raw: None };
+        assert_eq!(split_at_boundaries(ev2, &[0.1]).len(), 1);
     }
 }

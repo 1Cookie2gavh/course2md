@@ -41,8 +41,8 @@ pub async fn fetch_meta(url: &str) -> Result<VideoMeta> {
     Ok(meta)
 }
 
-/// 下载视频到 `dest`（720p 上限，mp4 合并）。已存在则跳过。
-pub async fn download(url: &str, dest: &Path, verbose: bool) -> Result<()> {
+/// 下载视频到 `dest`（默认 1080p 上限，mp4 合并）。已存在则跳过。
+pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) -> Result<()> {
     if dest.is_file() {
         tracing::info!(path = %dest.display(), "media exists, skip download");
         return Ok(());
@@ -59,9 +59,10 @@ pub async fn download(url: &str, dest: &Path, verbose: bool) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
         let mut cmd = Command::new("yt-dlp");
+        let fmt = format!("bv*[height<={max_height}]+ba/b[height<={max_height}]/b");
         cmd.args([
             "-f",
-            "bv*[height<=720]+ba/b[height<=720]/b",
+            &fmt,
             "-S",
             "ext:mp4:m4a",
             "--merge-output-format",

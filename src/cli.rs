@@ -47,6 +47,18 @@ pub struct RunOpts {
     #[arg(long)]
     pub cooldown: Option<f64>,
 
+    /// Max video height to download (1080 recommended for slides/code)
+    #[arg(long)]
+    pub max_height: Option<u32>,
+
+    /// Slide emission mode: first | stable (stable waits for animation to settle)
+    #[arg(long)]
+    pub slide_mode: Option<String>,
+
+    /// Seconds a frame must stay unchanged before emitting (stable mode)
+    #[arg(long)]
+    pub stable_secs: Option<f64>,
+
     /// Compare only a region, e.g. 40%,0%-100%,100%
     #[arg(long)]
     pub roi: Option<String>,

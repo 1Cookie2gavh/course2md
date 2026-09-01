@@ -17,6 +17,11 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     crate::error::require_cmd("ffprobe")?;
     if !cfg.provider.eq_ignore_ascii_case("coreml") && !cfg.provider.eq_ignore_ascii_case("api") {
         crate::error::require_cmd("llama-server")?;
+    } else if cfg.provider.eq_ignore_ascii_case("coreml")
+        && crate::error::require_cmd("llama-server").is_err()
+    {
+        // fallback 是 best-effort：提前告知而不是失败后才发现
+        tracing::warn!("未找到 llama-server：CoreML 若失败将无法回退到 gpu 后端（best-effort）");
     }
 
     let local = Path::new(&cfg.url);
@@ -47,7 +52,11 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         fetch::fetch_meta(&cfg.url).await?
     };
 
-    let id = if meta.id.is_empty() {
+    let id = if is_local {
+        // 本地文件：stem + 内容指纹短哈希，避免同名不同目录的课件互相覆盖
+        let fp = local_fingerprint(local);
+        format!("{}-{fp}", sanitize_stem(local))
+    } else if meta.id.is_empty() {
         config::infer_slug(&cfg.url)
     } else {
         meta.id.clone()
@@ -77,7 +86,7 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         local.to_path_buf()
     } else if !cfg.no_download {
         tracing::info!("download video");
-        fetch::download(&cfg.url, &dest, tracing::enabled!(tracing::Level::DEBUG)).await?;
+        fetch::download(&cfg.url, &dest, cfg.max_height, tracing::enabled!(tracing::Level::DEBUG)).await?;
         dest
     } else {
         anyhow::ensure!(dest.is_file(), "--no-download 但 {} 不存在", dest.display());
@@ -205,6 +214,34 @@ fn print_summary(
     if !cfg.llm.enabled && !cfg.llm.disable_hint {
         crate::llm::write_hint_note(&crate::settings::config_path());
     }
+}
+
+fn sanitize_stem(p: &Path) -> String {
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("local")
+        .chars()
+        .take(40)
+        .collect()
+}
+
+/// canonical_path + size + mtime 的稳定指纹（8 hex），兼作缓存键。
+fn local_fingerprint(p: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.canonicalize()
+        .unwrap_or_else(|_| p.to_path_buf())
+        .to_string_lossy()
+        .hash(&mut h);
+    if let Ok(md) = std::fs::metadata(p) {
+        md.len().hash(&mut h);
+        if let Ok(m) = md.modified()
+            && let Ok(d) = m.duration_since(std::time::UNIX_EPOCH)
+        {
+            d.as_secs().hash(&mut h);
+        }
+    }
+    format!("{:016x}", h.finish())[..8].to_string()
 }
 
 fn fmt_duration(secs: f64) -> String {

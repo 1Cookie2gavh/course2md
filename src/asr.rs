@@ -132,9 +132,10 @@ fn run_blocking(
 
     let mut events = vec![];
     let mut err: Option<anyhow::Error> = None;
-    for (i, (start, end)) in segs.iter().copied().enumerate() {
+    for (i, seg) in segs.iter().copied().enumerate() {
+        let (start, end) = (seg.start, seg.end);
         let chunk = tmp.join(format!("c{i:04}.wav"));
-        if let Err(e) = cut_wav(&input.wav, start, end, &chunk) {
+        if let Err(e) = cut_wav(&input.wav, seg.cut_start, seg.cut_end, &chunk) {
             err = Some(e);
             break;
         }
@@ -142,7 +143,7 @@ fn run_blocking(
             Ok(raw) => {
                 let text = sanitize_qwen_text(&raw);
                 if !text.is_empty() {
-                    events.push(TranscriptEvent { start, end, text });
+                    events.push(TranscriptEvent { start, end, text, raw: None });
                 }
             }
             Err(e) => {
@@ -166,7 +167,6 @@ fn run_blocking(
 
 /// 云端 STT：ffmpeg VAD 分段 + 逐段 POST /audio/transcriptions（OpenAI 兼容 / OpenRouter）。
 fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result<Vec<TranscriptEvent>> {
-    use base64::Engine as _;
     let t0 = Instant::now();
     if api.api_key.trim().is_empty() {
         // 约定俗成的环境变量兜底
@@ -201,51 +201,121 @@ fn run_api(api: &crate::settings::AsrApi, wav: &Path, max_speech: f64) -> Result
     let client = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(120))
         .build();
-    let mut events = vec![];
-    let mut err: Option<anyhow::Error> = None;
-    for (i, (start, end)) in segs.iter().copied().enumerate() {
-        let chunk = tmp.join(format!("c{i:04}.wav"));
-        if let Err(e) = cut_wav(wav, start, end, &chunk) {
-            err = Some(e);
-            break;
-        }
-        let bytes = std::fs::read(&chunk)?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let body = serde_json::json!({
-            "model": api.model,
-            "input_audio": {"data": b64, "format": "wav"},
-        });
-        let resp = client
-            .post(&url)
-            .set("Authorization", &format!("Bearer {}", api.api_key))
-            .send_json(body);
-        match resp {
-            Ok(r) => {
-                let v: serde_json::Value = r.into_json().context("云端 STT 响应解析失败")?;
-                if let Some(e) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-                    err = Some(anyhow::anyhow!("云端 STT 报错：{e}"));
+    let client = std::sync::Arc::new(client);
+    let segs = std::sync::Arc::new(segs);
+    let tmp = std::sync::Arc::new(tmp);
+    let wav_path = std::sync::Arc::new(wav.to_path_buf());
+    let model = api.model.clone();
+    let key = api.api_key.clone();
+
+    // 有界并发（默认 4）：网络往返是主要瓶颈；结果按下标保序
+    const WORKERS: usize = 4;
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Option<String>, String>)>();
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handles: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            let (tx, client, segs, tmp, model, key, url, next, abort, wav_path) = (
+                tx.clone(),
+                client.clone(),
+                segs.clone(),
+                tmp.clone(),
+                model.clone(),
+                key.clone(),
+                url.clone(),
+                next.clone(),
+                abort.clone(),
+                wav_path.clone(),
+            );
+            std::thread::spawn(move || loop {
+                if abort.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let text = v["text"].as_str().unwrap_or("").trim().to_string();
-                if !text.is_empty() {
-                    events.push(TranscriptEvent { start, end, text });
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i >= segs.len() {
+                    break;
+                }
+                let seg = segs[i];
+                let r = transcribe_api(&client, &url, &model, &key, &tmp.join(format!("c{i:04}.wav")), seg, &wav_path);
+                if tx.send((i, r)).is_err() {
+                    break;
+                }
+            })
+        })
+        .collect();
+    drop(tx);
+
+    let mut results: Vec<Option<Option<String>>> = vec![None; segs.len()];
+    let mut err: Option<anyhow::Error> = None;
+    for (i, r) in rx {
+        match r {
+            Ok(text) => results[i] = Some(text),
+            Err(e) => {
+                if err.is_none() {
+                    err = Some(anyhow::anyhow!("云端 STT 失败（chunk {i}）：{e}"));
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            Err(e) => {
-                err = Some(anyhow::anyhow!("云端 STT 请求失败：{e}"));
-                break;
-            }
         }
-        let _ = std::fs::remove_file(&chunk);
         pb.inc(1);
     }
+    for h in handles {
+        let _ = h.join();
+    }
     pb.finish_and_clear();
-    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(tmp.as_ref());
     if let Some(e) = err {
         return Err(e);
     }
+    let events: Vec<TranscriptEvent> = segs
+        .iter()
+        .zip(results)
+        .filter_map(|(seg, text)| {
+            text.flatten().map(|t| TranscriptEvent {
+                start: seg.start,
+                end: seg.end,
+                text: t,
+                raw: None,
+            })
+        })
+        .collect();
     tracing::info!(n = events.len(), secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()), "asr done");
     Ok(events)
+}
+
+/// 转写单个 chunk；Ok(None) = 无语音内容。
+fn transcribe_api(
+    // base64 Engine trait
+    client: &ureq::Agent,
+    url: &str,
+    model: &str,
+    key: &str,
+    chunk: &Path,
+    seg: Seg,
+    wav: &Path,
+) -> Result<Option<String>, String> {
+    use base64::Engine as _;
+    cut_wav(wav, seg.cut_start, seg.cut_end, chunk).map_err(|e| format!("切分音频失败: {e:#}"))?;
+    let bytes = std::fs::read(chunk).map_err(|e| format!("读取 chunk 失败: {e}"))?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let body = serde_json::json!({
+        "model": model,
+        "input_audio": {"data": b64, "format": "wav"},
+    });
+    let resp = client
+        .post(url)
+        .set("Authorization", &format!("Bearer {key}"))
+        .send_json(body)
+        .map_err(|e| format!("请求失败: {e}"))?;
+    let v: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("响应解析失败: {e}"))?;
+    if let Some(e) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        return Err(format!("API 报错: {e}"));
+    }
+    let text = v["text"].as_str().unwrap_or("").trim().to_string();
+    let _ = std::fs::remove_file(chunk);
+    Ok(if text.is_empty() { None } else { Some(text) })
 }
 
 fn find_llama_server() -> Result<PathBuf> {
@@ -343,7 +413,7 @@ fn transcribe_file(base: &str, wav: &Path) -> Result<String> {
     Ok(text)
 }
 
-fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<(f64, f64)>> {
+fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<Seg>> {
     let out = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -370,21 +440,156 @@ fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<(f64, f64)>> {
     normalize_segments(invert_silence(dur, &silences), max_speech as f64, wav)
 }
 
-/// VAD 原始段的公共后处理：按 max_speech 切分、丢弃过短段、全静音时兜底整段。
+/// 最终送入 ASR 的分段：`start/end` 是事件时间（用于时间线），`cut_*` 是切音频范围（含静音填充）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Seg {
+    pub start: f64,
+    pub end: f64,
+    pub cut_start: f64,
+    pub cut_end: f64,
+}
+
+/// 音频逐 100ms 的 RMS 能量（用于在目标切点附近找最近的静音最低点）。
+pub struct Energy {
+    hop: f64,
+    rms: Vec<f32>,
+}
+
+impl Energy {
+    pub fn load(wav: &Path) -> Result<Self> {
+        // 直接解析 16k 单声道 s16 wav（extract_audio 的固定产物）
+        let data = std::fs::read(wav).with_context(|| format!("读取音频失败 {}", wav.display()))?;
+        let (body, _) = find_pcm_body(&data)
+            .ok_or_else(|| anyhow::anyhow!("无法解析 wav PCM 数据"))?;
+        let mut samples = Vec::with_capacity(body.len() / 2);
+        for c in body.as_chunks::<2>().0 {
+            samples.push(i16::from_le_bytes(*c));
+        }
+        const HOP: usize = 1600; // 100ms @16k
+        let mut rms = Vec::with_capacity(samples.len() / HOP + 1);
+        for ch in samples.chunks(HOP) {
+            let s: f64 = ch.iter().map(|&v| (v as f64 / 32768.0).powi(2)).sum::<f64>() / ch.len() as f64;
+            rms.push((s.sqrt()) as f32);
+        }
+        Ok(Self { hop: 0.1, rms })
+    }
+
+    /// [a,b]（秒）内能量最低的时刻；无数据时返回 None。
+    fn quietest(&self, a: f64, b: f64) -> Option<f64> {
+        let i0 = (a / self.hop).ceil() as usize;
+        let i1 = (b / self.hop).floor() as usize;
+        if i1 <= i0 || i0 >= self.rms.len() {
+            return None;
+        }
+        let i1 = i1.min(self.rms.len() - 1);
+        let (bi, bv) = self.rms[i0..=i1]
+            .iter()
+            .enumerate()
+            .min_by(|x, y| x.1.partial_cmp(y.1).unwrap())?;
+        if bv.is_nan() {
+            return None;
+        }
+        Some((i0 + bi) as f64 * self.hop + self.hop / 2.0)
+    }
+}
+
+/// 跳过 wav 头，返回 (PCM body, sample_rate)。
+fn find_pcm_body(data: &[u8]) -> Option<(&[u8], u32)> {
+    if data.len() < 44 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12;
+    let mut rate = 0;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]) as usize;
+        match id {
+            b"fmt " => {
+                if pos + 8 + 16 <= data.len() {
+                    rate = u32::from_le_bytes([
+                        data[pos + 12], data[pos + 13], data[pos + 14], data[pos + 15],
+                    ]);
+                }
+            }
+            b"data" => {
+                let end = (pos + 8 + size).min(data.len());
+                return Some((&data[pos + 8..end], rate));
+            }
+            _ => {}
+        }
+        pos += 8 + size + (size & 1); // chunk 对齐
+    }
+    None
+}
+
+const PAD: f64 = 0.25; // 切音频时向两侧静音各延展的秒数
+const SPLIT_WINDOW: f64 = 3.0; // 在目标切点 ± 此窗口内寻找静音最低点
+const MIN_PIECE: f64 = 1.0; // 硬切产生的最短片段
+
+/// VAD 后处理：能量感知切分 + 静音填充。
+/// - 超过 max_speech 的段在 [target-3s, target+3s] 窗口内选能量最低点切（避开词中切断）
+/// - 切音频时向两侧静音各填充 0.25s（只进静音、不进相邻语音，故无重复文本）
 pub fn normalize_segments(
-    mut speech: Vec<(f64, f64)>,
+    speech: Vec<(f64, f64)>,
     max_speech: f64,
     wav: &Path,
-) -> Result<Vec<(f64, f64)>> {
-    speech = split_max(speech, max_speech);
-    speech.retain(|(a, b)| b - a >= 0.2);
-    if speech.is_empty() {
-        let dur = crate::media::probe_duration_blocking(wav).unwrap_or(0.0);
+) -> Result<Vec<Seg>> {
+    let energy = Energy::load(wav).ok();
+    let dur = crate::media::probe_duration_blocking(wav).unwrap_or(0.0);
+    let mut raw = speech;
+    raw.retain(|(a, b)| b - a >= 0.2);
+    if raw.is_empty() {
         if dur > 0.2 {
-            speech = split_max(vec![(0.0, dur)], max_speech);
+            raw = vec![(0.0, dur)];
+        } else {
+            return Ok(vec![]);
         }
     }
-    Ok(speech)
+
+    let mut pieces: Vec<(f64, f64)> = vec![];
+    for &(s, e) in &raw {
+        split_smart(s, e, max_speech, energy.as_ref(), &mut pieces);
+    }
+
+    // 填充：向静音延展，但不越过相邻语音段
+    let segs = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, &(s, e))| {
+            // 该 piece 所在原始 VAD 段的边界
+            let host = raw
+                .iter()
+                .find(|&&(rs, re)| s >= rs - 1e-6 && e <= re + 1e-6)
+                .copied()
+                .unwrap_or((s, e));
+            let prev_end = if i > 0 { pieces[i - 1].1 } else { 0.0 };
+            let next_start = if i + 1 < pieces.len() { pieces[i + 1].0 } else { dur };
+            let lo = (host.0.max(prev_end)).max(0.0);
+            let hi = (host.1.min(next_start)).min(if dur > 0.0 { dur } else { e + PAD });
+            Seg {
+                start: s,
+                end: e,
+                cut_start: (s - PAD).max(lo),
+                cut_end: (e + PAD).min(hi.max(e)),
+            }
+        })
+        .collect();
+    Ok(segs)
+}
+
+/// 递归切分：优先在静音最低点切，找不到则回退硬切。
+fn split_smart(s: f64, e: f64, max: f64, energy: Option<&Energy>, out: &mut Vec<(f64, f64)>) {
+    if e - s <= max {
+        out.push((s, e));
+        return;
+    }
+    let target = s + max;
+    let w0 = (target - SPLIT_WINDOW).max(s + MIN_PIECE.min(max / 2.0));
+    let w1 = (target + SPLIT_WINDOW).min(e - MIN_PIECE.min(max / 2.0));
+    let cut = energy.and_then(|en| en.quietest(w0.max(s), w1.min(e))).unwrap_or(target);
+    let cut = cut.clamp(s + 0.5, e - 0.5);
+    out.push((s, cut));
+    split_smart(cut, e, max, energy, out);
 }
 
 fn invert_silence(dur: f64, sil: &[(f64, f64)]) -> Vec<(f64, f64)> {
@@ -402,20 +607,7 @@ fn invert_silence(dur: f64, sil: &[(f64, f64)]) -> Vec<(f64, f64)> {
     out
 }
 
-fn split_max(segs: Vec<(f64, f64)>, max: f64) -> Vec<(f64, f64)> {
-    let mut out = vec![];
-    for (a, b) in segs {
-        let mut x = a;
-        while b - x > max {
-            out.push((x, x + max));
-            x += max;
-        }
-        if b - x >= 0.2 {
-            out.push((x, b));
-        }
-    }
-    out
-}
+
 
 pub fn cut_wav(src: &Path, start: f64, end: f64, dest: &Path) -> Result<()> {
     let dur = (end - start).max(0.05);

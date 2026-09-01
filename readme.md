@@ -48,6 +48,8 @@ course2md ./lecture.mp4
 
 ### macOS
 
+> Requires **macOS 15 (Sequoia) or later** on Apple Silicon (the CoreML backend depends on the ANE runtime shipped with macOS 15+; Intel Macs fall back to the `gpu`/`cpu` backends).
+
 **Homebrew (recommended)** — dependencies, the Developer-ID-signed binary and the CoreML `mlx.metallib` are all handled for you:
 
 ```bash
@@ -410,10 +412,10 @@ Measured on Apple Silicon (arm64) running a **3-minute** 1080p recorded lecture 
 
 | Backend (`--provider`) | Wall Time | Avg Power (CPU / GPU / ANE) | Peak Memory | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| **`coreml` + qwen3** *(macOS default)* | 48 s | 4.0 W / 0.2 W / **3.6 W** | 1.41 GB in-proc | **Lowest power** — Neural Engine does the heavy lifting; best on battery; zero external dependencies |
-| **`coreml` + whisper-turbo** | 86 s | 13.2 W / 0.2 W / 0.4 W | 1.51 GB in-proc | Whisper large-v3-turbo on CoreML; decoder mostly on CPU for short segments |
-| **`gpu` (llama.cpp Metal)** | **12 s** | 4.2 W / **17.6 W** / — | 26 MB + 3.3 GB child | **Fastest**; GPU bursts; needs `llama-server` (Qwen3-ASR 1.7B Q8) |
-| **`cpu` (llama.cpp)** | 27 s | **20.6 W** / 0.9 W / — | 26 MB + 4.8 GB child | Universal fallback; high CPU power |
+| **`coreml` + qwen3** *(macOS default)* | 47 s | 6.7 W / 0.2 W / **3.5 W** | 1.41 GB in-proc | **Lowest power** — Neural Engine does the heavy lifting; best on battery; zero external dependencies |
+| **`coreml` + whisper-turbo** | 87 s | 15.3 W / 0.3 W / 0.4 W | 1.51 GB in-proc | Whisper large-v3-turbo on CoreML; decoder mostly on CPU for short segments |
+| **`gpu` (llama.cpp Metal)** | **13 s** | 4.7 W / **16.0 W** / — | 26 MB + 3.3 GB child | **Fastest**; GPU bursts; needs `llama-server` (Qwen3-ASR 1.7B Q8) |
+| **`cpu` (llama.cpp)** | 26 s | **21.2 W** / 0.6 W / — | 26 MB + 4.8 GB child | Universal fallback; high CPU power |
 | **`api` (cloud STT)** | ~10 s | < 1 W | negligible | Audio uploaded to provider; speed depends on network |
 
 👉 See the comprehensive [macOS Benchmark Report](docs/BENCHMARKS.md) for full methodology, energy breakdowns, and reproduction scripts.

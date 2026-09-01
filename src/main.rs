@@ -72,6 +72,14 @@ fn run_opts_to_cfg(
         similarity: opts.similarity.or(d.similarity).unwrap_or(0.85),
         sample_interval: opts.sample_interval.or(d.sample_interval).unwrap_or(1.0),
         cooldown: opts.cooldown.or(d.cooldown).unwrap_or(10.0),
+        max_height: opts.max_height.or(d.max_height).unwrap_or(1080).clamp(240, 2160),
+        slide_mode: opts
+            .slide_mode
+            .clone()
+            .or_else(|| d.slide_mode.clone())
+            .unwrap_or_else(|| "stable".into())
+            .to_ascii_lowercase(),
+        stable_secs: opts.stable_secs.or(d.stable_secs).unwrap_or(0.8).clamp(0.0, 10.0),
         roi: match &opts.roi {
             Some(s) => Some(config::Roi::parse(s)?),
             None => match &d.roi {
@@ -158,7 +166,7 @@ fn main() -> anyhow::Result<()> {
                     disable_hint,
                 } => {
                     let cfg = llm::setup_interactive(
-                        settings::load(),
+                        settings::load()?,
                         base_url,
                         api_key,
                         model,
@@ -171,9 +179,9 @@ fn main() -> anyhow::Result<()> {
                         Err(e) => eprintln!("连接测试未通过（已保存配置）：{e:#}"),
                     }
                 }
-                LlmCmd::Status => llm::print_status(&settings::load()),
+                LlmCmd::Status => llm::print_status(&settings::load()?),
                 LlmCmd::Disable => {
-                    let mut cfg = settings::load();
+                    let mut cfg = settings::load()?;
                     cfg.llm.enabled = false;
                     let path = settings::save(&cfg)?;
                     println!("已关闭 LLM 润色（凭据保留）：{}", path.display());
@@ -196,7 +204,7 @@ fn main() -> anyhow::Result<()> {
                     println!("已生成配置模板：{}", path.display());
                     println!("按需取消注释并修改；命令行参数优先于此文件。");
                 }
-                ConfigCmd::Show => settings::print_effective(&settings::load()),
+                ConfigCmd::Show => settings::print_effective(&settings::load()?),
             }
             Ok(())
         }
@@ -211,7 +219,7 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             init_logging(cli.opts.verbose, cli.opts.quiet);
-            let file = settings::load();
+            let file = settings::load()?;
             let cfg = run_opts_to_cfg(source, &cli.opts, &file)?;
             tracing::info!(out = %cfg.out_dir.display(), provider = %cfg.provider, "start");
             tokio::runtime::Runtime::new()?.block_on(pipeline::run(&cfg))

@@ -32,10 +32,26 @@ pub fn llama_paths(root: &Path) -> LlamaAsr {
 
 pub fn llama_ready(root: &Path) -> bool {
     let p = llama_paths(root);
-    p.model.is_file()
-        && fs::metadata(&p.model).map(|m| m.len() > 1_000_000).unwrap_or(false)
-        && p.mmproj.is_file()
-        && fs::metadata(&p.mmproj).map(|m| m.len() > 1_000_000).unwrap_or(false)
+    file_complete(&p.model) && file_complete(&p.mmproj)
+}
+
+/// 文件完整性：有 manifest（下载完成时记录的精确字节数）时按字节数校验；
+/// 无 manifest 的旧缓存退回 >1MB 启发式。
+fn file_complete(path: &Path) -> bool {
+    let Ok(md) = fs::metadata(path) else {
+        return false;
+    };
+    if !path.is_file() || md.len() <= 1_000_000 {
+        return false;
+    }
+    let manifest = path.with_extension("manifest.json");
+    if let Ok(s) = fs::read_to_string(&manifest)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
+        && let Some(expected) = v.get("size").and_then(|s| s.as_u64())
+    {
+        return md.len() == expected;
+    }
+    true
 }
 
 pub fn ensure_llama(root: &Path) -> Result<LlamaAsr> {
@@ -126,6 +142,11 @@ async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
         out.sync_all()?;
         drop(out);
         fs::rename(&tmp, &dest)?;
+        // 记录精确字节数，供后续完整性校验（防止半截文件被当成有效模型）
+        let _ = fs::write(
+            dest.with_extension("manifest.json"),
+            serde_json::json!({"size": done}).to_string(),
+        );
         pb.finish_and_clear();
         tracing::info!(label = %label, bytes = done, "downloaded");
         Ok(())

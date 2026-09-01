@@ -155,6 +155,7 @@ mod tests {
                 start: 10.2,
                 end: 12.5,
                 text: "你好".into(),
+                raw: None,
             }],
         }];
         let md = render_markdown(&m, &s);

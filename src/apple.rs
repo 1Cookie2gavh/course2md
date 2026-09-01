@@ -234,14 +234,15 @@ pub fn run_coreml(
     );
 
     let mut events = vec![];
-    for (i, (start, end)) in segs.iter().copied().enumerate() {
+    for (i, seg) in segs.iter().copied().enumerate() {
+        let (start, end) = (seg.start, seg.end);
         let chunk = tmp_dir.join(format!("c{i:04}.wav"));
-        cut(wav, start, end, &chunk)?;
+        cut(wav, seg.cut_start, seg.cut_end, &chunk)?;
         match asr.transcribe(&chunk) {
             Ok(Some(text)) => {
                 let text = crate::asr::sanitize_qwen_text(&text);
                 if !text.is_empty() {
-                    events.push(TranscriptEvent { start, end, text });
+                    events.push(TranscriptEvent { start, end, text, raw: None });
                 }
             }
             Ok(None) => {}

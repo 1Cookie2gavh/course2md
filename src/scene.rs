@@ -95,10 +95,16 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<f64
             .progress_chars("##-"),
     );
 
+    // 三状态检测：检测永不休眠（cooldown 只限制「发射」，不再造成盲区）。
+    //   last_emitted  已输出的视觉状态
+    //   candidate     正在观察的候选画面（含首次出现时间，用于真实时间戳）
+    // 发射条件：候选与上一输出差异显著 + 稳定时长足够 + 距上次发射 >= cooldown。
+    let stable_for = if cfg.slide_mode == "stable" { cfg.stable_secs } else { 0.0 };
     let mut times = vec![];
-    let mut last: Option<GrayImage> = None;
-    let mut skip: u32 = 0;
-    let skip_after = ((cfg.cooldown / interval).round() as u32).max(1).saturating_sub(1);
+    let mut last_emitted: Option<GrayImage> = None;
+    let mut candidate: Option<GrayImage> = None;
+    let mut candidate_first_t: Option<f64> = None;
+    let mut last_emit_t: f64 = -f64::INFINITY;
     let mut i: u64 = 0;
     loop {
         match stdout.read_exact(&mut buf).await {
@@ -109,38 +115,46 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<f64
         let t = i as f64 * interval;
         i += 1;
         pb.inc(1);
-        if skip > 0 {
-            skip -= 1;
-            continue;
-        }
         let gray = GrayImage::from_raw(tw, th, buf.clone())
             .ok_or_else(|| anyhow::anyhow!("灰度帧尺寸不匹配 {tw}x{th}"))?;
         let cmp = crop_roi(&gray, cfg.roi);
-        let (is_new, score) = match &last {
-            None => (true, None),
+
+        let differs_from_emitted = match &last_emitted {
+            None => true,
             Some(prev) => {
-                if prev.dimensions() != cmp.dimensions() {
-                    (true, None)
-                } else {
-                    let s = ssim(prev, &cmp);
-                    (s < cfg.similarity, Some(s))
-                }
+                prev.dimensions() != cmp.dimensions() || ssim(prev, &cmp) < cfg.similarity
             }
         };
-        if is_new {
-            times.push(t);
-            last = Some(cmp);
-            skip = skip_after;
-            pb.set_message(format!(
-                "slides={} t={t:.0}s ssim={}",
-                times.len(),
-                score.map(|s| format!("{s:.2}")).unwrap_or_else(|| "-".into())
-            ));
+        if !differs_from_emitted {
+            // 画面回到已输出状态：候选是过渡帧（动画/抖动），丢弃
+            candidate = None;
+            candidate_first_t = None;
+            continue;
+        }
+        // 与已输出状态不同：跟踪候选（若候选本身又变了，说明动画进行中，重置起点）
+        let candidate_changed = match &candidate {
+            None => true,
+            Some(c) => c.dimensions() != cmp.dimensions() || ssim(c, &cmp) < cfg.similarity,
+        };
+        if candidate_changed {
+            candidate = Some(cmp);
+            candidate_first_t = Some(t);
+        }
+        let first_t = candidate_first_t.unwrap_or(t);
+        let stable = t - first_t >= stable_for;
+        let gap_ok = t - last_emit_t >= cfg.cooldown;
+        if stable && gap_ok {
+            // 用候选首次出现的时间戳，而不是 cooldown 到期时间
+            times.push(first_t);
+            last_emitted = candidate.take();
+            candidate_first_t = None;
+            last_emit_t = t;
+            pb.set_message(format!("slides={} t={first_t:.1}s", times.len()));
         }
     }
     pb.finish_and_clear();
     let _ = child.wait().await;
-    tracing::info!(slides = times.len(), frames = i, "ssim scan done");
+    tracing::info!(slides = times.len(), frames = i, mode = %cfg.slide_mode, "ssim scan done");
     Ok(times)
 }
 

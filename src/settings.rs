@@ -1,7 +1,7 @@
 //! 配置文件（~/.config/course2md/config.toml）。
 //! 优先级：命令行参数 > 配置文件 > 内置默认值。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -13,6 +13,9 @@ pub struct Defaults {
     pub similarity: Option<f64>,
     pub sample_interval: Option<f64>,
     pub cooldown: Option<f64>,
+    pub slide_mode: Option<String>,
+    pub stable_secs: Option<f64>,
+    pub max_height: Option<u32>,
     pub roi: Option<String>,
     pub threads: Option<i32>,
     pub provider: Option<String>,
@@ -56,15 +59,21 @@ pub fn config_path() -> PathBuf {
     crate::config::config_dir().join("config.toml")
 }
 
-pub fn load() -> ConfigFile {
+/// 读取配置文件。文件不存在 → 默认值；存在但无法解析 → 硬错误（带位置信息），
+/// 避免用户写错一个引号后静默回落默认、甚至开始下载 2.4GB 模型。
+pub fn load() -> anyhow::Result<ConfigFile> {
     let p = config_path();
     if !p.is_file() {
-        return ConfigFile::default();
+        return Ok(ConfigFile::default());
     }
-    match std::fs::read_to_string(&p) {
-        Ok(s) => toml::from_str(&s).unwrap_or_default(),
-        Err(_) => ConfigFile::default(),
-    }
+    let s = std::fs::read_to_string(&p)
+        .with_context(|| format!("无法读取配置文件 {}", p.display()))?;
+    toml::from_str(&s).with_context(|| {
+        format!(
+            "配置文件解析失败（修正后重试；本次不回退默认值）：{}",
+            p.display()
+        )
+    })
 }
 
 pub fn save(cfg: &ConfigFile) -> Result<PathBuf> {
