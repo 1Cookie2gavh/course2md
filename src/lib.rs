@@ -12,6 +12,7 @@ pub mod models;
 pub mod npu;
 pub mod pipeline;
 pub mod render;
+pub mod runtime;
 pub mod scene;
 pub mod settings;
 pub mod timeline;

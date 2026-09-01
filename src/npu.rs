@@ -10,9 +10,8 @@ use crate::config::PipelineConfig;
 use crate::timeline::TranscriptEvent;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const NPU_WORKER_SCRIPT: &str = r#"
@@ -171,17 +170,16 @@ pub fn run_npu(
     }
 
     let model_id = resolve_npu_model(cfg.asr_model.as_deref());
-    let port = free_port()?;
+    let port = crate::runtime::free_port()?;
     let script_path = write_worker_script(&cfg.out_dir)?;
 
     tracing::info!(model = %model_id, port, "starting npu worker");
     let mut child = spawn_npu_worker(&script_path, &model_id, port)?;
     let base = format!("http://127.0.0.1:{port}");
 
-    if let Err(e) = wait_ready(&base, Duration::from_secs(300)) {
-        let _ = child.kill();
-        return Err(e).context("Intel NPU 服务启动超时（首次模型编译可能需要更多时间）");
-    }
+    // ManagedChild：此后任何 ? 早退都会在 Drop 中终止 worker，不再泄漏进程
+    crate::runtime::wait_ready(&base, Duration::from_secs(300), &mut child)
+        .context("Intel NPU 服务启动失败/超时（首次模型编译可能需要更多时间）")?;
     tracing::info!(
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
         "npu ready"
@@ -286,9 +284,9 @@ fn write_worker_script(out_dir: &Path) -> Result<PathBuf> {
     Ok(p)
 }
 
-fn spawn_npu_worker(script: &Path, model: &str, port: u16) -> Result<Child> {
+fn spawn_npu_worker(script: &Path, model: &str, port: u16) -> Result<crate::runtime::ManagedChild> {
     // 优先使用 uv（自动处理隔离环境与依赖），若无则回退系统 python3
-    let mut cmd = if which("uv").is_some() {
+    let mut cmd = if crate::runtime::which("uv").is_some() {
         let mut c = Command::new("uv");
         c.args([
             "run",
@@ -301,7 +299,7 @@ fn spawn_npu_worker(script: &Path, model: &str, port: u16) -> Result<Child> {
             "python",
         ]);
         c
-    } else if which("python3").is_some() {
+    } else if crate::runtime::which("python3").is_some() {
         Command::new("python3")
     } else {
         anyhow::bail!("未找到 uv 或 python3，无法启动 Intel NPU 识别后端。请先安装 uv 或 python3");
@@ -319,34 +317,5 @@ fn spawn_npu_worker(script: &Path, model: &str, port: u16) -> Result<Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
 
-    cmd.spawn().context("启动 Intel NPU worker 失败")
-}
-
-fn free_port() -> Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
-}
-
-fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
-    let t0 = Instant::now();
-    let url = format!("{base}/health");
-    loop {
-        if t0.elapsed() > timeout {
-            anyhow::bail!("NPU worker 启动超时");
-        }
-        if ureq::get(&url)
-            .timeout(Duration::from_secs(2))
-            .call()
-            .is_ok()
-        {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
-}
-
-fn which(cmd: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|p| p.join(cmd))
-        .find(|p| p.is_file())
+    crate::runtime::ManagedChild::spawn("NPU worker", &mut cmd)
 }

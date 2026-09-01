@@ -6,9 +6,9 @@
 use crate::config::PipelineConfig;
 use crate::timeline::TranscriptEvent;
 use anyhow::{Context, Result};
-use std::net::TcpListener;
+
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub struct AsrInput {
@@ -153,14 +153,12 @@ fn run_blocking(
     }
 
     let bin = find_llama_server()?;
-    let port = free_port()?;
+    let port = crate::runtime::free_port()?;
     tracing::info!(bin = %bin.display(), port, ngl, "llama-server");
     let mut child = spawn_server(&bin, &input.model, &input.mmproj, ngl, threads, port)?;
     let base = format!("http://127.0.0.1:{port}");
-    if let Err(e) = wait_ready(&base, Duration::from_secs(300)) {
-        let _ = child.kill();
-        return Err(e);
-    }
+    // 子进程秒退（端口冲突/模型损坏）会立即报错，而不是等满 300s
+    crate::runtime::wait_ready(&base, Duration::from_secs(300), &mut child)?;
     tracing::info!(
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
         "server ready"
@@ -419,23 +417,8 @@ fn transcribe_api(
 }
 
 fn find_llama_server() -> Result<PathBuf> {
-    for name in ["llama-server", "llama-server.exe"] {
-        if let Some(p) = which(name) {
-            return Ok(p);
-        }
-    }
-    anyhow::bail!("找不到 llama-server，请安装 llama.cpp 并加入 PATH")
-}
-
-fn which(cmd: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|p| p.join(cmd))
-        .find(|p| p.is_file())
-}
-
-fn free_port() -> Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+    crate::runtime::which("llama-server")
+        .context("找不到 llama-server，请安装 llama.cpp 并加入 PATH")
 }
 
 fn spawn_server(
@@ -445,7 +428,7 @@ fn spawn_server(
     ngl: i32,
     threads: i32,
     port: u16,
-) -> Result<Child> {
+) -> Result<crate::runtime::ManagedChild> {
     let mut cmd = Command::new(bin);
     cmd.arg("-m")
         .arg(model)
@@ -465,25 +448,7 @@ fn spawn_server(
         .arg("127.0.0.1")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    cmd.spawn().context("启动 llama-server 失败")
-}
-
-fn wait_ready(base: &str, timeout: Duration) -> Result<()> {
-    let t0 = Instant::now();
-    let url = format!("{base}/health");
-    loop {
-        if t0.elapsed() > timeout {
-            anyhow::bail!("llama-server 启动超时");
-        }
-        if ureq::get(&url)
-            .timeout(Duration::from_secs(2))
-            .call()
-            .is_ok()
-        {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
+    crate::runtime::ManagedChild::spawn("llama-server", &mut cmd)
 }
 
 fn transcribe_file(base: &str, wav: &Path) -> Result<String> {
