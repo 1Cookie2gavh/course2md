@@ -31,7 +31,7 @@ except ImportError as e:
     sys.stderr.write(f"Error: 缺少 openvino_genai 或 numpy: {e}\n请安装: pip install openvino-genai numpy 或使用 uv\n")
     sys.exit(1)
 
-model_arg = sys.argv[1] if len(sys.argv) > 1 else "OpenVINO/whisper-large-v3-turbo-int8-ov"
+model_arg = sys.argv[1] if len(sys.argv) > 1 else "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO"
 port = int(sys.argv[2]) if len(sys.argv) > 2 else 29381
 device = sys.argv[3] if len(sys.argv) > 3 else "NPU"
 
@@ -39,28 +39,45 @@ model_path = model_arg
 if not os.path.isdir(model_path):
     try:
         from huggingface_hub import snapshot_download
-        print(f"[NPU] 正在从 HuggingFace 下载/加载模型 {model_arg}...", flush=True)
-        model_path = snapshot_download(model_arg)
+        print(f"[NPU] 正在下载/加载 ASR 模型 {model_arg}...", flush=True)
+        try:
+            model_path = snapshot_download(model_arg)
+        except Exception as e_dl:
+            if "qwen" in str(model_arg).lower():
+                print(f"[NPU] Qwen3-ASR 模型下载受限 ({e_dl})，回退预备的 Whisper Large-v3 Turbo...", flush=True)
+                model_arg = "OpenVINO/whisper-large-v3-turbo-int8-ov"
+                model_path = snapshot_download(model_arg)
+            else:
+                raise e_dl
     except Exception as e:
-        sys.stderr.write(f"Error 下载模型失败 {model_arg}: {e}\n")
+        sys.stderr.write(f"Error 下载模型失败 {model_arg}: {e}
+")
         sys.exit(1)
 
 print(f"[NPU] 正在将模型加载/编译至 {device}（首次编译可能需要 1~2 分钟）...", flush=True)
 t0 = time.time()
-try:
-    pipe = ov_genai.WhisperPipeline(model_path, device)
-except Exception as e:
-    sys.stderr.write(f"Error OpenVINO NPU 编译/加载失败: {e}\n")
-    sys.exit(1)
+is_qwen = "qwen" in str(model_arg).lower() or "qwen" in str(model_path).lower()
 
-gen_cfg_path = os.path.join(model_path, "generation_config.json")
-if os.path.isfile(gen_cfg_path):
-    gen_cfg = ov_genai.WhisperGenerationConfig(gen_cfg_path)
+if is_qwen and hasattr(ov_genai, "ASRPipeline"):
+    try:
+        pipe = ov_genai.ASRPipeline(model_path, device)
+        gen_cfg = getattr(ov_genai, "ASRGenerationConfig", lambda: None)()
+    except Exception as e_qwen:
+        sys.stderr.write(f"[NPU] Qwen3 ASR 加载异常 ({e_qwen})，自动回退 WhisperPipeline
+")
+        from huggingface_hub import snapshot_download
+        fallback_path = snapshot_download("OpenVINO/whisper-large-v3-turbo-int8-ov")
+        pipe = ov_genai.WhisperPipeline(fallback_path, device)
+        gen_cfg = ov_genai.WhisperGenerationConfig(os.path.join(fallback_path, "generation_config.json"))
+        gen_cfg.language = "<|zh|>"
 else:
-    gen_cfg = ov_genai.WhisperGenerationConfig()
-
-# 默认中文与英文自动识别
-gen_cfg.language = "<|zh|>"
+    pipe = ov_genai.WhisperPipeline(model_path, device)
+    gen_cfg_path = os.path.join(model_path, "generation_config.json")
+    if os.path.isfile(gen_cfg_path):
+        gen_cfg = ov_genai.WhisperGenerationConfig(gen_cfg_path)
+    else:
+        gen_cfg = ov_genai.WhisperGenerationConfig()
+    gen_cfg.language = "<|zh|>"
 
 print(f"[NPU] 模型在 {device} 就绪（耗时 {time.time()-t0:.2f}s）", flush=True)
 
@@ -126,10 +143,13 @@ server.serve_forever()
 pub fn resolve_npu_model(raw: Option<&str>) -> String {
     let s = raw.unwrap_or("").trim().to_ascii_lowercase();
     match s.as_str() {
-        "base" => "OpenVINO/whisper-base-fp16-ov".into(),
-        "tiny" => "OpenVINO/whisper-tiny-fp16-ov".into(),
-        "small" => "OpenVINO/whisper-small-fp16-ov".into(),
-        "turbo" | "large" | "whisper" | "" => "OpenVINO/whisper-large-v3-turbo-int8-ov".into(),
+        "whisper" | "turbo" | "whisper-turbo" | "large" => "OpenVINO/whisper-large-v3-turbo-int8-ov".into(),
+        "tiny" | "whisper-tiny" => "OpenVINO/whisper-tiny-fp16-ov".into(),
+        "base" | "whisper-base" => "OpenVINO/whisper-base-fp16-ov".into(),
+        "small" | "whisper-small" => "OpenVINO/whisper-small-fp16-ov".into(),
+        "qwen3-0.6b" | "0.6b" => "dseditor/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO".into(),
+        // 优先默认推荐 Qwen3-ASR 1.7B
+        "qwen3" | "qwen3-1.7b" | "1.7b" | "" => "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO".into(),
         other => other.to_string(),
     }
 }

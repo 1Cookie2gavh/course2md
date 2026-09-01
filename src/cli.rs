@@ -71,7 +71,7 @@ pub struct RunOpts {
     #[arg(long, value_enum)]
     pub provider: Option<ProviderArg>,
 
-    /// coreml backend model: qwen3 | whisper (large-v3-turbo)
+    /// ASR model: qwen3 (default & recommended Qwen3-ASR 1.7B) | whisper (large-v3-turbo) | tiny | base
     #[arg(long)]
     pub asr_model: Option<String>,
 

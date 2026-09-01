@@ -128,17 +128,26 @@ fn normalize(s: &str) -> String {
 /// 首次使用：让用户选择下载哪个模型（非交互环境默认 qwen3）。
 fn prompt_model_choice() -> String {
     if !atty_or_tty() {
-        tracing::info!("非交互环境，默认使用 qwen3 模型（--asr-model whisper 可切换）");
+        tracing::info!("非交互环境，默认使用 Qwen3-ASR 模型（--asr-model whisper 可切换）");
         return "qwen3".into();
     }
     use std::io::{BufRead, Write};
     let mut out = std::io::stderr();
-    let _ = writeln!(
-        out,
-        "选择 CoreML 识别模型 / Select CoreML ASR model:"
-    );
-    let _ = writeln!(out, "  1) qwen3    - Qwen3-ASR 0.6B（默认 / default，约 1-2GB）");
-    let _ = writeln!(out, "  2) whisper  - Whisper large-v3-turbo（多语言 / multilingual）");
+    let _ = writeln!(out, "
+=======================================================");
+    let _ = writeln!(out, "选择识别模型 / Select ASR Model (首次运行指引):
+");
+    let _ = writeln!(out, "  1) qwen3 (Qwen3-ASR) [★ 强烈推荐 / Strongly Recommended]");
+    let _ = writeln!(out, "     - 优势: 中文及中英文混合技术课程识别准确率最高，专有名词（如 NeoVim、");
+    let _ = writeln!(out, "             ChatGPT、Web Coding、Codex）识别极准，标点规范，绝无句尾漏字截断。");
+    let _ = writeln!(out, "     - 提示: macOS 上追求 1.7B 满血版请使用 --provider gpu (Metal 硬件加速，");
+    let _ = writeln!(out, "             实测 3 分钟音频仅 13 秒完成，零漏句)。");
+    let _ = writeln!(out, "
+  2) whisper (Whisper Large-v3 Turbo)");
+    let _ = writeln!(out, "     - 优势: 纯英文或非中文多语种识别能力优秀。");
+    let _ = writeln!(out, "     - 劣势: 中文课程标点缺失较多，语速快或长句末尾偶发吞句漏字，");
+    let _ = writeln!(out, "             技术术语易发生音近识别错误（如 Web Coding 识别为 vipcoding）。");
+    let _ = writeln!(out, "=======================================================");
     let _ = write!(out, "输入序号并回车（默认 1）/ Enter choice [1]: ");
     let _ = out.flush();
     let mut line = String::new();

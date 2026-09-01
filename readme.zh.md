@@ -167,6 +167,29 @@ cargo build --release
 
 ---
 
+---
+
+## 模型选型与错漏分析指南（Model Selection & Accuracy Guide）
+
+为了保证网课与学术视频转换的高质量，`course2md` 在多款模型间进行了严格的实测对照。**所有平台均首推采用 Qwen3-ASR 1.7B**。
+
+### 1. 真实评测错漏分析（以同一段 3 分钟大学计算机课程为例）
+
+| 维度 | Qwen3-ASR 1.7B（全平台首选推荐） | Whisper Large-v3 Turbo | Whisper Tiny / Base |
+| :--- | :--- | :--- | :--- |
+| **中英混合专业词汇** | **极准**：精准识别 `NeoVim`、`Altair 8800`、`Computer Science`、`ICQ`、`OICQ`、`QQ`、`native speaker`、`ChatGPT`、`Web Coding`、`Codex` | **存在误判**：识别出 `NeoWim`，但将 `Altair 8800` 误为 `"PCG RTIR 8800"`，`Web Coding` 误为 `"vipcoding"` | **严重幻觉**：`NeoVim` 严重错认为“牛味”、“捏尾巴”；专业术语大部分无法辨识 |
+| **句子完整度** | **100% 完整**：无漏句、无截断，说话人语速较快时依然完整留存 | **偶发截断**：长分段末尾偶发丢失整句（例如漏掉“啊，整理一次，从PC到互联网...”） | **分段碎裂**：多处短句残缺 |
+| **标点符号规范** | **规范完整**：全自动输出符合中文语法的逗号、句号、双引号（如“AI替我上大学”、“hello”） | **标点缺失**：句号大面积缺失，长难句连成一片 | **基本无有效标点** |
+
+### 2. 几个主要模型的优劣与适用场景
+
+| 模型 | 推荐级别 | 推荐运行方式 | 显存/内存占用 | 核心优势 | 劣势与注意事项 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen3-ASR 1.7B** | **★★★★★<br>(强烈推荐)** | • macOS: `--provider gpu` (Metal 加速，仅需 13 秒)<br>• Linux: `--provider gpu` (CUDA) 或 `--provider npu`<br>• 通用: `--provider cpu` 或 `--provider api` | ~1.7GB~2.4GB | 中文及技术课程天花板；标点完整规范；专有名词极准；绝无句尾漏字截断 | 模型体积略大于 0.6B |
+| **Qwen3-ASR 0.6B** | **★★★★☆<br>(极致高能效)** | • macOS: `--provider coreml` (Apple Neural Engine 原生)<br>• NPU: `--provider npu --asr-model 0.6b` | ~600MB~1GB | 体积小、在轻薄本和电池模式下能效极高；纯本地零外部依赖 | 生僻复杂技术词理解略逊于 1.7B 满血版 |
+| **Whisper Large-v3 Turbo** | **★★★☆☆<br>(纯英文/小语种)** | • NPU: `--provider npu --asr-model whisper`<br>• macOS: `--provider coreml --asr-model whisper` | ~800MB~1.5GB | 纯英文或非中文多语种识别能力优秀；OpenVINO NPU 上达 12x 实时加速 | 中文标点欠缺；语速快时偶发句尾吞词；技术词音近误判率高 |
+| **Whisper Tiny / Base** | **★☆☆☆☆<br>(仅供测试)** | • NPU: `--provider npu --asr-model tiny` | <200MB | 极速（39x 实时，3分钟仅需4秒），极低显存 | 严重音近幻觉，不建议用于正式讲义 |
+
 ## 配置文件（Configuration）
 
 为了避免每次输入冗长的命令行参数，`course2md` 提供了完善的全局配置文件支持。

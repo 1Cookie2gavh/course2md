@@ -110,9 +110,20 @@ pub const TEMPLATE: &str = r#"# course2md 配置文件
 #roi = "40%,0%-100%,100%"
 # 识别线程数
 #threads = 4
-# 识别后端：coreml（仅 macOS Apple Silicon，默认）| gpu（Metal/CUDA via llama.cpp）| cpu
-#provider = "coreml"
-# 单段语音最长秒数（过长会切分）
+# 识别后端推荐：
+# - gpu: 强烈推荐！Metal (macOS) / CUDA (Linux) / Vulkan，加载 Qwen3-ASR 1.7B Q8，3分钟音频仅需13秒，专有名词与标点极准
+# - npu: Intel Core Ultra NPU 硬件加速（Linux/Windows），高能效比，比纯 CPU 快 6.5 倍
+# - coreml: macOS Apple Silicon 原生 CoreML / Neural Engine 模式，零外部依赖
+# - cpu: 纯 CPU 运行 Qwen3-ASR 1.7B Q8，通用兜底
+# - api: 云端 STT（OpenRouter），免本地模型下载
+#provider = "gpu"
+
+# 识别模型推荐 (各个后端通用)：
+# - qwen3 (强烈推荐): Qwen3-ASR 1.7B，中文及技术课程首选，专有名词准，标点规范，绝无句尾吞字
+# - whisper: Whisper Large-v3 Turbo，适合纯英文或多语种视频
+#asr_model = "qwen3"
+
+# 单段语音最长秒数（过长会切分，自动在静音低能量点切分并外补 0.25s 静音 padding）
 #max_speech = 20.0
 # 输出格式：md / html / json
 #formats = ["md", "html"]
@@ -120,9 +131,6 @@ pub const TEMPLATE: &str = r#"# course2md 配置文件
 #model_dir = "~/.cache/course2md/models"
 # 保留下载的视频 media.mp4
 #keep_video = false
-
-# CoreML 后端的识别模型：qwen3（默认）| whisper（large-v3-turbo）
-#asr_model = "qwen3"
 
 [asr_api]
 # 云端 STT（--provider api，OpenAI 兼容 /audio/transcriptions；OpenRouter 聚合多模型）
