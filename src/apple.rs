@@ -248,9 +248,6 @@ impl Drop for CoremlAsr {
     }
 }
 
-// SAFETY: 句柄仅在此线程使用（ASR 全程在同一个阻塞线程内）。
-unsafe impl Send for CoremlAsr {}
-
 /// CoreML 全流程：Silero VAD 分段 → 逐段转写。
 pub fn run_coreml(
     wav: &Path,
