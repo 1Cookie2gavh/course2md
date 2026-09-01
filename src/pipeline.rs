@@ -15,7 +15,10 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     let t_total = Instant::now();
     crate::error::require_cmd("ffmpeg")?;
     crate::error::require_cmd("ffprobe")?;
-    if !cfg.provider.eq_ignore_ascii_case("coreml") && !cfg.provider.eq_ignore_ascii_case("api") {
+    if !cfg.provider.eq_ignore_ascii_case("coreml")
+        && !cfg.provider.eq_ignore_ascii_case("api")
+        && !cfg.provider.eq_ignore_ascii_case("npu")
+    {
         crate::error::require_cmd("llama-server")?;
     } else if cfg.provider.eq_ignore_ascii_case("coreml")
         && crate::error::require_cmd("llama-server").is_err()

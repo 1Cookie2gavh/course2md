@@ -8,6 +8,7 @@ pub mod fetch;
 pub mod i18n;
 pub mod llm;
 pub mod media;
+pub mod npu;
 pub mod models;
 pub mod pipeline;
 pub mod render;

@@ -159,6 +159,7 @@ cargo build --release
 | **`gpu`** | **Linux / Windows / Intel Mac**<br>(非 Apple Silicon 默认) | **ffmpeg silencedetect**<br>+ **Qwen3-ASR 1.7B GGUF Q8** | 需要 `llama-server`<br>(由 `llama.cpp` 提供) | 约 2.4GB<br>`~/.cache/course2md/models/` | 1.7B 高精度量化模型，支持 Metal / CUDA / Vulkan 等显卡加速，吞吐极高 |
 | **`cpu`** | **通用兜底** | 同 `gpu`，禁用 GPU 卸载 (`-ngl 0`) | 需要 `llama-server` | 约 2.4GB<br>`~/.cache/course2md/models/` | 纯 CPU 计算，兼容性最高 |
 | **`api`** | **云端 STT（跨平台通用）** | **ffmpeg silencedetect**<br>+ OpenAI 兼容 `/audio/transcriptions` 端点（如 OpenRouter） | **零本地模型依赖**<br>(需网络与 API Key) | **无**（云端托管） | 零磁盘模型占用，低配置设备友好。*隐私提示：音频切片将上传云端。* |
+| **`npu`** | **Linux / Windows**<br>(Intel Core Ultra / AI Boost) | **ffmpeg silencedetect**<br>+ **OpenVINO Whisper Large-v3 Turbo** (默认) / Base / Tiny | 需要 `uv` 或 `python` 带 `openvino-genai` 与 NPU 驱动 | 按需自 HuggingFace 下载 | **比纯 CPU 快 6 倍以上**，极低功耗，显存/内存节省 84%（550MB vs 3.5GB） |
 
 > **CoreML 模型切换**：使用 `--provider coreml` 时，可通过 `--asr-model qwen3`（默认）或 `--asr-model whisper` 切换。首次在交互式终端运行且未配置时，程序会提示选择并记忆至 `~/.config/course2md/asr_model`。
 >
@@ -379,7 +380,7 @@ out/<平台>/<标题>/<编号>/
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
 | `-o, --out <目录>` | 指定输出根目录 | `out` |
-| `--provider <coreml/gpu/cpu/api>` | 识别后端：`coreml`（macOS 默认）、`gpu`（非 Mac 默认）、`cpu`、`api`（云端 STT） | 视平台而定 |
+| `--provider <coreml/gpu/cpu/api/npu>` | 识别后端：`coreml`（macOS 默认）、`gpu`（非 Mac 默认）、`cpu`、`api`（云端 STT） | 视平台而定 |
 | `--asr-model <qwen3/whisper>` | CoreML 识别模型变体（`qwen3` 0.6B 或 `whisper` large-v3-turbo） | `qwen3` |
 | `--asr-api-base-url <URL>` | 云端 STT base URL（OpenAI 兼容） | `https://openrouter.ai/api/v1` |
 | `--asr-api-key <KEY>` | 云端 STT API Key（亦可设置 `OPENROUTER_API_KEY` 环境变量） | 配置文件 / 环境变量 |
@@ -418,6 +419,7 @@ course2md --help
 | **`gpu`**（llama.cpp Metal） | **13 s** | 4.7 W / **16.0 W** / — | 26 MB + 3.3 GB 子进程 | **最快**：GPU 峰值高；需 `llama-server`（Qwen3-ASR 1.7B Q8） |
 | **`cpu`**（llama.cpp） | 26 s | **21.2 W** / 0.6 W / — | 26 MB + 4.8 GB 子进程 | 通用兜底；CPU 功耗高 |
 | **`api`**（云端 STT） | ~10 s | < 1 W | 可忽略 | 音频会上传；速度取决于网络 |
+| **`npu`**（Intel Core Ultra） | **16 s** | NPU 硬件加速 | 18 MB + 557 MB 子进程 | **比纯 CPU 快 6 倍**（3 分钟音频 15 秒识别），低功耗，Whisper Large-v3 Turbo |
 
 👉 详见完整的 [macOS 性能与功耗基准报告](docs/BENCHMARKS.md)（含测试方法论、详细能耗拆解与复现脚本）。
 

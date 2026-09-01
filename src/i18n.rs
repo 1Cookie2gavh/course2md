@@ -79,7 +79,7 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
         ("cooldown", "新截图之后至少间隔多少秒"),
         ("roi", "只比较画面中的区域，如 40%,0%-100%,100%"),
         ("threads", "识别线程数"),
-        ("provider", "识别后端：coreml（仅 macOS Apple Silicon）/ gpu（Metal/CUDA）/ cpu / api（云端 STT）"),
+        ("provider", "识别后端：coreml（仅 macOS Apple Silicon）/ gpu（Metal/CUDA）/ cpu / api（云端 STT）/ npu（Intel NPU）"),
         ("asr_model", "coreml 后端模型：qwen3 | whisper（large-v3-turbo）"),
         ("asr_api_base_url", "云端 STT base URL（OpenAI 兼容，如 https://openrouter.ai/api/v1）"),
         ("asr_api_key", "云端 STT API Key（也读 OPENROUTER_API_KEY 环境变量）"),

@@ -19,10 +19,18 @@ fn init_logging(verbose: u8, quiet: bool) {
         .init();
 }
 
-/// 默认识别后端：带 Apple 原生模块的构建优先 CoreML，其余走 llama.cpp GPU。
+/// 默认识别后端：
+/// - macOS Apple Silicon: 优先 coreml
+/// - Linux: 若存在 Intel NPU (/dev/accel/accel0) 且未安装 llama-server，优先 npu
+/// - 其余平台/配置: gpu (llama.cpp)
 fn default_provider() -> String {
     if cfg!(apple_native) {
         "coreml".into()
+    } else if cfg!(target_os = "linux")
+        && std::path::Path::new("/dev/accel/accel0").exists()
+        && course2md::error::require_cmd("llama-server").is_err()
+    {
+        "npu".into()
     } else {
         "gpu".into()
     }
@@ -109,6 +117,7 @@ fn run_opts_to_cfg(
                 course2md::cli::ProviderArg::Gpu => "gpu",
                 course2md::cli::ProviderArg::Cpu => "cpu",
                 course2md::cli::ProviderArg::Api => "api",
+                course2md::cli::ProviderArg::Npu => "npu",
             }
             .to_string(),
             None => d.provider.clone().unwrap_or_else(default_provider),
@@ -129,11 +138,7 @@ fn run_opts_to_cfg(
         resume: opts.resume || d.resume.unwrap_or(false),
         llm: resolve_llm(opts, file),
         asr_api: resolve_asr_api(opts, file),
-        asr_model: opts
-            .asr_model
-            .clone()
-            .or_else(|| d.asr_model.clone())
-            .map(|s| if s.to_ascii_lowercase().contains("whisper") { "whisper".into() } else { "qwen3".into() }),
+        asr_model: opts.asr_model.clone().or_else(|| d.asr_model.clone()),
     })
 }
 

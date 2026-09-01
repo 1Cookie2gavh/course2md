@@ -158,6 +158,7 @@ pub enum ProviderArg {
     Gpu,
     Cpu,
     Api,
+    Npu,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]

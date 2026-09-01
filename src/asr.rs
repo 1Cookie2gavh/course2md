@@ -56,6 +56,22 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
         .context("ASR 线程 join 失败")?;
         return joined;
     }
+    if cfg.provider.eq_ignore_ascii_case("npu") {
+        let max_speech = cfg.max_speech as f64;
+        let wav = wav.to_path_buf();
+        let cfg = cfg.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut cp = cp;
+            let r = crate::npu::run_npu(&cfg, &wav, max_speech, &mut cp);
+            if r.is_ok() {
+                cp.finish();
+            }
+            r
+        })
+        .await
+        .context("ASR 线程 join 失败")?;
+        return joined;
+    }
     if cfg.provider.eq_ignore_ascii_case("coreml") {
         #[cfg(apple_native)]
         {
@@ -453,7 +469,7 @@ fn transcribe_file(base: &str, wav: &Path) -> Result<String> {
     Ok(text)
 }
 
-fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<Seg>> {
+pub(crate) fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<Seg>> {
     let out = Command::new("ffmpeg")
         .args([
             "-hide_banner",
