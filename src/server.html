@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>course2md Web</title>
+<style>
+:root { color-scheme: light dark; }
+body { font-family: system-ui,-apple-system,"Segoe UI",sans-serif; max-width: 1000px; margin: 0 auto; padding: 1rem; line-height: 1.6; }
+h1 { font-size: 1.4rem; }
+h2 { font-size: 1.05rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; margin-top: 2rem; }
+.card { border: 1px solid #8885; border-radius: 8px; padding: .8rem 1rem; margin: .8rem 0; }
+textarea { width: 100%; box-sizing: border-box; min-height: 90px; font-family: inherit; }
+input[type=text], select { padding: .35rem .5rem; }
+.row { display: flex; gap: .8rem; flex-wrap: wrap; align-items: center; margin: .5rem 0; }
+.row label { white-space: nowrap; }
+button { padding: .45rem 1rem; cursor: pointer; }
+.btn-primary { background: #0969da; color: #fff; border: none; border-radius: 6px; font-size: 1rem; padding: .55rem 1.4rem; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #8883; font-size: .92rem; vertical-align: top; }
+.progress { background: #8883; border-radius: 4px; height: 10px; width: 120px; display: inline-block; vertical-align: middle; }
+.progress > div { background: #2da44e; height: 100%; border-radius: 4px; }
+.badge { padding: .1rem .45rem; border-radius: 10px; font-size: .78rem; color: #fff; }
+.b-queued { background:#6e7781; } .b-running { background:#0969da; } .b-done { background:#1a7f37; } .b-failed { background:#cf222e; }
+details { margin: .2rem 0; }
+pre.log { background:#00000014; padding:.5rem; font-size:.8rem; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
+.muted { color:#888; font-size:.85rem; }
+a { color:#0969da; }
+.notice { background:#fff8c5; border:1px solid #d4a72c66; border-radius:6px; padding:.5rem .8rem; margin:.5rem 0; font-size:.88rem; }
+</style>
+</head>
+<body>
+<h1>📹 course2md Web</h1>
+<p class="muted">本地服务（仅本机可访问）。粘贴视频链接或本地文件路径，每行一个，可混合 B 站 / YouTube / 本地视频。</p>
+
+<div class="card">
+  <h2 style="margin-top:0">新建任务</h2>
+  <textarea id="sources" placeholder="每行一个视频链接或本地文件路径，例如：&#10;https://www.bilibili.com/video/BV1xxxx&#10;https://youtu.be/xxxx&#10;D:\视频\讲座.mp4"></textarea>
+  <div class="row">
+    <label>输出目录 <input type="text" id="out" style="width:280px" placeholder="留空使用配置默认"></label>
+    <label>识别后端
+      <select id="provider">
+        <option value="gpu">gpu（本地显卡）</option>
+        <option value="cpu">cpu（纯 CPU）</option>
+        <option value="api">api（云端 STT）</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="llm" checked> LLM 润色</label>
+  </div>
+  <button class="btn-primary" id="start">🚀 开始转换</button>
+  <span class="muted" id="startHint"></span>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">任务列表</h2>
+  <table id="tasks"><thead><tr><th>#</th><th>来源</th><th>状态</th><th>进度</th><th>日志</th></tr></thead><tbody></tbody></table>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">配置</h2>
+  <div class="notice">API Key 只保存在本机配置文件；页面只显示脱敏结果，修改时需重新输入完整 Key。</div>
+  <div class="row">
+    <label>启用 LLM <input type="checkbox" id="c_enabled"></label>
+    <label>Base URL <input type="text" id="c_base_url" style="width:220px"></label>
+    <label>模型 <input type="text" id="c_model" style="width:160px"></label>
+    <label>自动总结 <input type="checkbox" id="c_summarize"></label>
+  </div>
+  <div class="row">
+    <label>LLM API Key <input type="password" id="c_llm_key" style="width:220px" placeholder="留空不修改"></label>
+    <label>STT API Key <input type="password" id="c_asr_key" style="width:220px" placeholder="留空不修改"></label>
+  </div>
+  <div class="row">
+    <label>默认输出目录 <input type="text" id="c_out" style="width:300px"></label>
+    <button id="saveCfg">💾 保存配置</button>
+    <button id="removeBtn" style="color:#cf222e">🗑 清除凭据（remove）</button>
+  </div>
+  <div class="muted" id="cfgPath"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">已转换输出</h2>
+  <button id="refreshOut">刷新</button>
+  <table id="outputs"><thead><tr><th>标题</th><th>总结</th><th>文件</th></tr></thead><tbody></tbody></table>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let tasks = new Map();
+const fmt = p => Math.round(p) + '%';
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function badge(status){ return `<span class="badge b-${status}">${status}</span>`; }
+
+function renderTasks(){
+  const tb = $('tasks').querySelector('tbody');
+  tb.innerHTML = '';
+  for (const t of tasks.values()){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${t.id}</td>
+      <td>${esc(t.source)}<br><span class="muted">${esc(t.stage)}</span></td>
+      <td>${badge(t.status)}</td>
+      <td><span class="progress"><div style="width:${t.progress}%"></div></span> ${fmt(t.progress)}</td>
+      <td><details><summary>展开日志（${t.log.length} 行）</summary><pre class="log">${esc(t.log.join('\n'))}</pre></details></td>`;
+    tb.appendChild(tr);
+  }
+}
+
+function loadTasks(){
+  fetch('/api/tasks').then(r=>r.json()).then(d=>{
+    tasks.clear();
+    (d.tasks||[]).forEach(t=>tasks.set(t.id,t));
+    renderTasks();
+  }).catch(()=>{});
+}
+
+function loadConfig(){
+  fetch('/api/config').then(r=>r.json()).then(c=>{
+    $('c_enabled').checked = c.llm.enabled;
+    $('c_base_url').value = c.llm.base_url;
+    $('c_model').value = c.llm.model;
+    $('c_summarize').checked = c.llm.summarize;
+    $('c_llm_key').placeholder = c.llm.api_key ? '已配置 '+c.llm.api_key+'（留空不修改）' : '未配置（输入并保存）';
+    $('c_asr_key').placeholder = c.asr_api.api_key ? '已配置 '+c.asr_api.api_key+'（留空不修改）' : '未配置（输入并保存）';
+    $('c_out').value = c.defaults.out;
+    $('cfgPath').textContent = '配置文件：' + c.config_path;
+    $('out').placeholder = c.defaults.out ? '留空使用默认：' + c.defaults.out : '留空使用默认输出目录';
+  }).catch(()=>{});
+}
+
+function loadOutputs(){
+  fetch('/api/outputs').then(r=>r.json()).then(d=>{
+    const tb = $('outputs').querySelector('tbody');
+    tb.innerHTML = '';
+    if(!(d.outputs||[]).length){ tb.innerHTML = '<tr><td colspan=3 class="muted">暂无输出（配置默认输出目录后刷新）</td></tr>'; return; }
+    (d.outputs||[]).forEach(o=>{
+      const tr = document.createElement('tr');
+      const rel = o.path.replace(/\\/g,'/').split('/').slice(-2).join('/');
+      const links = [];
+      if(o.has_md) links.push(`<a href="/api/output/${encodeURIComponent(rel)}/course.md" target="_blank">md</a>`);
+      if(o.has_html) links.push(`<a href="/api/output/${encodeURIComponent(rel)}/course.html" target="_blank">html</a>`);
+      tr.innerHTML = `<td>${esc(o.title)}<br><span class="muted">${esc(o.path)}</span></td>
+        <td class="muted">${esc(o.summary || (o.has_summary ? '' : '（无总结）'))}</td>
+        <td>${links.join(' ')}</td>`;
+      tb.appendChild(tr);
+    });
+  }).catch(()=>{});
+}
+
+// SSE
+function connectSSE(){
+  const es = new EventSource('/api/events');
+  es.onmessage = ev => {
+    let d; try { d = JSON.parse(ev.data); } catch(e){ return; }
+    if(d.type === 'task' && d.task){ tasks.set(d.task.id, d.task); renderTasks(); }
+    else if(d.type === 'task_created'){ loadTasks(); }
+    else if(d.type === 'task_done'){
+      loadTasks();
+      const t = tasks.get(d.id);
+      notify('✅ 转换完成', t ? t.source : ('任务 '+d.id));
+      loadOutputs();
+    }
+    else if(d.type === 'task_failed'){
+      loadTasks();
+      notify('❌ 转换失败', (tasks.get(d.id)||{}).source || ('任务 '+d.id));
+    }
+  };
+  es.onerror = () => { /* 自动重连 */ };
+}
+
+function notify(title, body){
+  if('Notification' in window){
+    if(Notification.permission === 'granted'){ new Notification(title, {body}); }
+    else if(Notification.permission === 'default'){ Notification.requestPermission(); }
+  }
+}
+
+$('start').onclick = () => {
+  const sources = $('sources').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(!sources.length){ alert('请先输入至少一个视频链接或路径'); return; }
+  const body = { sources, provider: $('provider').value, llm: $('llm').checked };
+  const out = $('out').value.trim();
+  if(out) body.out = out;
+  fetch('/api/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      $('sources').value = '';
+      $('startHint').textContent = '已加入队列：' + (d.ids||[]).join(', ');
+      loadTasks();
+    }).catch(e=>alert('提交失败：'+e));
+};
+
+$('saveCfg').onclick = () => {
+  const body = {
+    llm: {
+      enabled: $('c_enabled').checked,
+      base_url: $('c_base_url').value.trim(),
+      model: $('c_model').value.trim(),
+      summarize: $('c_summarize').checked,
+    },
+    asr_api: {},
+    defaults: { out: $('c_out').value.trim() }
+  };
+  const lk = $('c_llm_key').value; if(lk.trim()) body.llm.api_key = lk.trim();
+  const ak = $('c_asr_key').value; if(ak.trim()) body.asr_api.api_key = ak.trim();
+  fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok){ alert('配置已保存'); loadConfig(); }
+      else alert('保存失败：'+(d.error||''));
+    }).catch(e=>alert('保存失败：'+e));
+};
+
+$('removeBtn').onclick = () => {
+  if(!confirm('确定清除全部 API 凭据吗？（LLM / STT Key 将被删除）')) return;
+  fetch('/api/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({asr:true})})
+    .then(r=>r.json()).then(d=>{ if(d.ok){ alert('已清除凭据'); loadConfig(); } }).catch(e=>alert('失败：'+e));
+};
+
+$('refreshOut').onclick = loadOutputs;
+
+loadTasks(); loadConfig(); loadOutputs(); connectSSE();
+</script>
+</body>
+</html>

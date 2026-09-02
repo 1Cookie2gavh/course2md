@@ -1,6 +1,6 @@
 use clap::FromArgMatches;
-use course2md::cli::{Cli, Command, ConfigCmd, LlmCmd, ModelsCmd, RunOpts};
-use course2md::{config, doctor, llm, models, pipeline, settings};
+use course2md::cli::{Cli, Command, ConfigCmd, LlmCmd, ModelsCmd, RunOpts, ServerCmd};
+use course2md::{config, doctor, llm, models, pipeline, server, settings};
 use tracing_subscriber::EnvFilter;
 
 fn init_logging(verbose: u8, quiet: bool) {
@@ -273,6 +273,19 @@ fn main() -> anyhow::Result<()> {
                 println!("提示：--asr 可同时清除云端 STT（[asr_api]）的 API Key。");
             }
             Ok(())
+        }
+        Some(Command::Server { cmd }) => {
+            init_logging(0, false);
+            match cmd {
+                ServerCmd::Start { port } => {
+                    let p = server::start(port)?;
+                    println!("访问地址：http://127.0.0.1:{p}");
+                    Ok(())
+                }
+                ServerCmd::Stop => server::stop(),
+                ServerCmd::Status => server::status(),
+                ServerCmd::Run { port } => server::run(port),
+            }
         }
         None => {
             let source = match cli.source {

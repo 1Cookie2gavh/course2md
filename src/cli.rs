@@ -189,6 +189,29 @@ pub enum Command {
     Summarize(SummarizeArgs),
     /// Clear LLM/STT API credentials from the config file
     Remove(RemoveArgs),
+    /// Local web service (start/stop/status/run)
+    Server {
+        #[command(subcommand)]
+        cmd: ServerCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ServerCmd {
+    /// Start a background daemon (keeps running after terminal closes)
+    Start {
+        #[arg(long, default_value_t = crate::server::DEFAULT_PORT)]
+        port: u16,
+    },
+    /// Stop the background daemon
+    Stop,
+    /// Show daemon status
+    Status,
+    /// Run the server in the foreground (used internally by start)
+    Run {
+        #[arg(long, default_value_t = crate::server::DEFAULT_PORT)]
+        port: u16,
+    },
 }
 
 #[derive(Args)]

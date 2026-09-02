@@ -151,4 +151,9 @@ fn apply_cli_inner(cmd: &mut clap::Command, zh: bool) {
         &["remove"],
         "清除 LLM/STT 的 API 配置（凭据清除，提交代码前可执行）",
     );
+    sub_about(cmd, &["server"], "本地 Web 服务（start/stop/status/run）");
+    sub_about(cmd, &["server", "start"], "启动后台常驻服务（关终端仍可访问）");
+    sub_about(cmd, &["server", "stop"], "停止后台常驻服务");
+    sub_about(cmd, &["server", "status"], "查看服务状态");
+    sub_about(cmd, &["server", "run"], "前台运行服务（供 start 内部调用）");
 }

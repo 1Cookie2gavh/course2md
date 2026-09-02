@@ -241,7 +241,26 @@ fn chat(
     };
     let body = build_chat_body(s, items, image_b64.as_deref())?;
     let content = send_chat(s, &body)?;
-    parse_id_text_pairs(&content)
+    if let Some(pairs) = parse_id_text_pairs(&content) {
+        return Ok(pairs);
+    }
+    // 偶发输出瑕疵（裸对象/未转义引号导致 JSON 非法）：用严格 JSON 指令重试一次
+    let payload: Vec<serde_json::Value> = items
+        .iter()
+        .map(|(i, t)| serde_json::json!({"id": i, "text": t}))
+        .collect();
+    let repair_body = serde_json::json!({
+        "model": s.model,
+        "temperature": 0.0,
+        "max_tokens": 16384,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": "你是严格的 JSON 输出器。输出必须且只能是一个 JSON 对象数组，每项形如 {\"id\":序号,\"text\":\"校对后的文本\"}。字符串内的双引号必须转义为 \\\"，或改用中文全角引号“”。禁止输出代码围栏、注释或任何数组之外的内容。"},
+            {"role": "user", "content": serde_json::to_string(&payload)?},
+        ],
+    });
+    let content2 = send_chat(s, &repair_body)?;
+    parse_id_text_pairs(&content2)
         .with_context(|| format!("LLM 响应不是 id/text JSON 数组: {:.200}", content))
 }
 
@@ -276,37 +295,57 @@ fn build_chat_body(
         "max_tokens": 16384,
         "response_format": {"type": "json_object"},
         "messages": [
-            {"role": "system", "content": format!("{} 输出为 JSON 数组，每项形如 {{\"id\":序号,\"text\":润色后的文本}}，id 必须与输入一一对应；纯语气词条目的 text 为空字符串。{vision_note}", effective_prompt(s))},
+            {"role": "system", "content": format!("{} 输出为 JSON 数组，每项形如 {{\"id\":序号,\"text\":润色后的文本}}，id 必须与输入一一对应；纯语气词条目的 text 为空字符串。字符串内的双引号请用中文全角引号“”或转义为 \\\"，确保 JSON 合法。{vision_note}", effective_prompt(s))},
             {"role": "user", "content": content},
         ]
     }))
 }
 
-/// 从模型输出提取 [{"id":n,"text":"..."}]（容忍代码围栏、前后杂文、尾逗号与个别坏项）。
+/// 从模型输出提取 [{"id":n,"text":"..."}]（容忍代码围栏、前后杂文、尾逗号与个别坏项，
+/// 以及模型偶发的"单个对象"输出）。
 pub fn parse_id_text_pairs(content: &str) -> Option<Vec<(usize, String)>> {
-    let start = content.find('[')?;
-    let end = content.rfind(']')?;
+    if let Some(start) = content.find('[')
+        && let Some(end) = content.rfind(']')
+        && end > start
+    {
+        let slice = &content[start..=end];
+        // 1) 严格解析；个别项 id/text 类型不对时 parse_items 返回 None，
+        //    必须继续降级而不是整批丢弃（落入第 2/3 级）
+        if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(slice)
+            && let Some(items) = parse_items(&v)
+        {
+            return Some(items);
+        }
+        // 2) 清除尾逗号后重试
+        let cleaned = clean_trailing_commas(slice);
+        if cleaned != slice
+            && let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned)
+            && let Some(items) = parse_items(&v)
+        {
+            return Some(items);
+        }
+        // 3) 宽容扫描：跳过坏项，收集合法 {"id":..,"text":".."}
+        if let Some(items) = lenient_scan(slice) {
+            return Some(items);
+        }
+    }
+    // 4) 模型偶发返回单个对象（非数组）：按单元素数组处理，交给调用方拆半重试
+    parse_single_object(content)
+}
+
+/// 模型偶发输出 `{"id":0,"text":"..."}` 单个对象时兜底为单元素列表。
+fn parse_single_object(content: &str) -> Option<Vec<(usize, String)>> {
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
     if end <= start {
         return None;
     }
     let slice = &content[start..=end];
-    // 1) 严格解析；个别项 id/text 类型不对时 parse_items 返回 None，
-    //    必须继续降级而不是整批丢弃（落入第 2/3 级）
-    if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(slice)
-        && let Some(items) = parse_items(&v)
-    {
-        return Some(items);
-    }
-    // 2) 清除尾逗号后重试
     let cleaned = clean_trailing_commas(slice);
-    if cleaned != slice
-        && let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned)
-        && let Some(items) = parse_items(&v)
-    {
-        return Some(items);
-    }
-    // 3) 宽容扫描：跳过坏项，收集合法 {"id":..,"text":".."}
-    lenient_scan(slice)
+    let v = serde_json::from_str::<serde_json::Value>(&cleaned).ok()?;
+    let id = v.get("id")?.as_u64()? as usize;
+    let text = v.get("text")?.as_str()?.to_string();
+    Some(vec![(id, text)])
 }
 
 fn parse_items(v: &[serde_json::Value]) -> Option<Vec<(usize, String)>> {
@@ -723,5 +762,23 @@ mod tests {
         assert_eq!(got, vec![(0, "a".into()), (1, "b".into())]);
         assert!(parse_id_text_pairs("没有数组").is_none());
         assert!(parse_id_text_pairs("[]").is_none());
+    }
+
+    #[test]
+    fn parse_id_pairs_tolerates_single_object() {
+        // 模型偶发返回单个对象而非数组：应兜底为单元素列表（交给拆半重试）
+        let got = parse_id_text_pairs("{\"id\":0,\"text\":\"有人问我说：“古人没相机。”\"}").unwrap();
+        assert_eq!(got, vec![(0, "有人问我说：“古人没相机。”".into())]);
+        // 数组内嵌对象仍是数组优先
+        let got2 = parse_id_text_pairs("[{\"id\":5,\"text\":\"x\"}]").unwrap();
+        assert_eq!(got2, vec![(5, "x".into())]);
+    }
+
+    #[test]
+    fn parse_id_pairs_malformed_unescaped_quotes_returns_none() {
+        // 未转义引号导致 JSON 非法：解析返回 None（由 chat 的严格重试兜底），不 panic
+        assert!(
+            parse_id_text_pairs("{\"id\":0,\"text\":\"有人问我说：\"古人没相机。\"\"}").is_none()
+        );
     }
 }
