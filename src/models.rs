@@ -266,10 +266,12 @@ fn download_once(
         anyhow::bail!("下载不完整：期望 {total} 字节，实际收到 {done}（请重试）");
     }
     fs::rename(tmp, dest)?;
-    // manifest 记录 authoritative Content-Length，供后续启动校验
-    let _ = fs::write(
-        dest.with_extension("manifest.json"),
-        serde_json::json!({"size": if total > 0 { total } else { done }}).to_string(),
+    // manifest 记录 authoritative Content-Length，供后续启动校验（原子写，防半截 JSON）
+    let _ = crate::checkpoint::atomic_write(
+        &dest.with_extension("manifest.json"),
+        serde_json::json!({"size": if total > 0 { total } else { done }})
+            .to_string()
+            .as_bytes(),
     );
     pb.finish_and_clear();
     tracing::info!(label = %label, bytes = done, "downloaded");
