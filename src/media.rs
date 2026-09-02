@@ -1,8 +1,24 @@
 //! ffmpeg 子进程封装：音频抽取（16k 单声道 PCM wav）与媒体探测。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use tokio::process::Command;
+
+/// 跑子进程并检查退出码；失败时返回带 stderr 尾部摘要的错误（供各模块复用）。
+pub(crate) async fn run_cmd(cmd: &mut Command, what: &str) -> Result<std::process::Output> {
+    let out = cmd
+        .output()
+        .await
+        .with_context(|| format!("启动 {what} 失败"))?;
+    if !out.status.success() {
+        return Err(crate::error::cmd_error(
+            what,
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stderr),
+        ));
+    }
+    Ok(out)
+}
 
 /// 抽取 16kHz 单声道 s16 wav。已存在则跳过。
 pub async fn extract_audio(media: &Path, dest: &Path) -> Result<()> {
@@ -13,21 +29,16 @@ pub async fn extract_audio(media: &Path, dest: &Path) -> Result<()> {
     if let Some(p) = dest.parent() {
         tokio::fs::create_dir_all(p).await?;
     }
-    let out = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .arg("-i")
-        .arg(media)
-        .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
-        .arg(dest)
-        .output()
-        .await?;
-    if !out.status.success() {
-        return Err(crate::error::cmd_error(
-            "ffmpeg",
-            out.status.code(),
-            &String::from_utf8_lossy(&out.stderr),
-        ));
-    }
+    run_cmd(
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .arg("-i")
+            .arg(media)
+            .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
+            .arg(dest),
+        "ffmpeg",
+    )
+    .await?;
     Ok(())
 }
 
@@ -38,7 +49,27 @@ pub struct VideoInfo {
     pub duration: f64,
 }
 
-/// 视频宽高与时长。
+/// ffprobe `-of json` 输出中我们关心的字段子集。
+#[derive(serde::Deserialize)]
+struct ProbeJson {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+    format: Option<ProbeFormat>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProbeStream {
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProbeFormat {
+    /// ffprobe 的 duration 是字符串（如 "95.040000"）
+    duration: Option<String>,
+}
+
+/// 视频宽高与时长。用 `-of json` 结构化输出，取代按逗号/空白切分的文本解析。
 pub async fn probe_video(media: &Path) -> Option<VideoInfo> {
     let out = Command::new("ffprobe")
         .args([
@@ -47,11 +78,9 @@ pub async fn probe_video(media: &Path) -> Option<VideoInfo> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height",
-            "-show_entries",
-            "format=duration",
+            "stream=width,height:format=duration",
             "-of",
-            "csv=p=0",
+            "json",
         ])
         .arg(media)
         .output()
@@ -60,70 +89,59 @@ pub async fn probe_video(media: &Path) -> Option<VideoInfo> {
     if !out.status.success() {
         return None;
     }
-    // 常见两行：width,height  与 duration；或一行 width,height,duration
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut nums: Vec<f64> = s
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
-    if nums.len() < 3
-        && let Some(d) = probe_duration(media).await
-    {
-        nums.push(d);
-    }
-    if nums.len() < 3 {
+    let probe: ProbeJson = serde_json::from_slice(&out.stdout).ok()?;
+    let stream = probe.streams.first()?;
+    let duration = probe
+        .format
+        .and_then(|f| f.duration)
+        .and_then(|d| d.parse::<f64>().ok())?;
+    Some(VideoInfo {
+        width: stream.width?,
+        height: stream.height?,
+        duration,
+    })
+}
+
+/// `probe_duration` 两个入口共享的 ffprobe 参数（只输出时长数字）。
+fn duration_args() -> [&'static str; 6] {
+    [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ]
+}
+
+/// 从 ffprobe 输出解析时长（秒）；进程失败或输出非法均为 None（非致命）。
+fn parse_duration(out: &std::process::Output) -> Option<f64> {
+    if !out.status.success() {
         return None;
     }
-    Some(VideoInfo {
-        width: nums[0] as u32,
-        height: nums[1] as u32,
-        duration: nums[2],
-    })
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
 }
 
 /// 用 ffprobe 拿时长（秒）。失败时返回 None（非致命）。
 pub async fn probe_duration(media: &Path) -> Option<f64> {
     let out = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
+        .args(duration_args())
         .arg(media)
         .output()
         .await
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<f64>()
-        .ok()
+    parse_duration(&out)
 }
 
 /// [`probe_duration`] 的同步版（供阻塞线程使用）。
 pub fn probe_duration_blocking(media: &Path) -> Option<f64> {
     let out = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
+        .args(duration_args())
         .arg(media)
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<f64>()
-        .ok()
+    parse_duration(&out)
 }

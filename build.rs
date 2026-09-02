@@ -26,18 +26,17 @@ fn main() {
     let pkg = manifest.join("native/apple-asr");
     let build_dir = pkg.join(".build/release");
 
-    // 增量：Package.swift 或源码变动才重建（swift build 自身也会增量）。
-    let stamp = build_dir.join("libCAppleASR.a");
-    if !stamp.is_file() {
-        let ok = run(Command::new("swift")
-            .args(["build", "-c", "release"])
-            .current_dir(&pkg));
-        if !ok {
-            println!(
-                "cargo:warning=swift build 失败（见上方输出），跳过 Apple 原生模块；coreml 后端不可用"
-            );
-            return;
-        }
+    // 无条件跑 swift build：SPM 自己做增量（无变动时秒级返回）。
+    // 曾经的「libCAppleASR.a 存在即跳过」stamp 判断是真 bug：
+    // 只改 Swift 源码（不碰 Package.swift）时会链上旧的静态库。
+    let ok = run(Command::new("swift")
+        .args(["build", "-c", "release"])
+        .current_dir(&pkg));
+    if !ok {
+        println!(
+            "cargo:warning=swift build 失败（见上方输出），跳过 Apple 原生模块；coreml 后端不可用"
+        );
+        return;
     }
 
     println!("cargo:rustc-cfg=apple_native");
@@ -63,7 +62,9 @@ fn main() {
     ] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }
-    // Swift 运行时 overlay（/usr/lib/swift，macOS 15+ 系统自带）
+    // Swift 运行时 overlay（/usr/lib/swift，macOS 15+ 系统自带）。
+    // 下面这份手写 dylib 列表来源：`swift build -v` 的实际链接行；
+    // Xcode 升级后若出现链接错误（缺 Swift 符号），需先核对本列表是否有增删。
     println!("cargo:rustc-link-search=native=/usr/lib/swift");
     for dylib in [
         "swiftCore",
@@ -99,8 +100,9 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=objc");
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 
-    // MLX 运行时需要 metallib 与可执行文件同目录（mlx.metallib）
-    // 优先用仓库内置副本（避免 runner 差异），否则取 SPM 产物
+    // MLX 运行时需要 metallib 与可执行文件同目录（mlx.metallib）。
+    // 默认取 SPM build 产物（mlx-swift_Cmlx.bundle 内的 default.metallib）；
+    // 仅当仓库根存在手动放置的 mlx.metallib 时才优先用它（便于 runner 固定版本）。
     let vendored = pkg.join("mlx.metallib");
     let products = build_dir.canonicalize().unwrap_or(build_dir);
     let bundle = if vendored.is_file() {

@@ -154,10 +154,19 @@ public func c2mAsrTranscribe(
             }
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            outText.pointee = 0
+            return 1 // 1 = 无文本（非错误）
+        }
+        let fits = trimmed.utf8CString.count <= outLen // utf8CString 含结尾 NUL
         trimmed.withCString { cStr in
             _ = strncpy(outText, cStr, outLen - 1)
         }
-        return trimmed.isEmpty ? 1 : 0 // 1 = 无文本（非错误）
+        if !fits {
+            outText[outLen - 1] = 0 // strncpy 截断时不保证补 NUL
+            return 2 // 2 = 成功但被截断（Rust 侧据此 warn，不再静默截断）
+        }
+        return 0
     } catch {
         setErr("转写失败: \(error)")
         return -1

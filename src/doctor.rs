@@ -6,6 +6,9 @@ use anyhow::Result;
 use std::path::Path;
 use std::process::Command;
 
+/// 版本首行展示的最大字符数（防止某些工具输出超长首行撑爆版面）
+const VERSION_LINE_MAX_CHARS: usize = 72;
+
 fn tool_version(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).output().ok()?;
     if !out.status.success() {
@@ -18,7 +21,7 @@ fn tool_version(cmd: &str, args: &[&str]) -> Option<String> {
             .unwrap_or("")
             .trim()
             .chars()
-            .take(72)
+            .take(VERSION_LINE_MAX_CHARS)
             .collect(),
     )
 }
@@ -82,7 +85,7 @@ pub fn run() -> Result<()> {
                 &mut out,
                 false,
                 "mlx.metallib",
-                "  缺失：CoreML 推理会失败；重跑 install.sh 或从 native/apple-asr 复制",
+                "  缺失：CoreML 推理会失败；重跑 install.sh 安装",
             );
         }
     }
@@ -130,10 +133,12 @@ pub fn run() -> Result<()> {
     }
 
     // —— 配置与模型缓存 ——
+    // settings::load 全程只调一次：重复调用既浪费又在第二次静默吞错
+    let cfg_loaded = crate::settings::load();
     let cfg_path = config_dir().join("config.toml");
     if cfg_path.is_file() {
-        match crate::settings::load() {
-            Ok(c) => {
+        match &cfg_loaded {
+            Ok(_) => {
                 let perms_note = {
                     #[cfg(unix)]
                     {
@@ -158,7 +163,6 @@ pub fn run() -> Result<()> {
                     "config",
                     &format!("  {}{perms_note}", cfg_path.display()),
                 );
-                let _ = c; // 已验证可解析
             }
             Err(e) => check(&mut out, false, "config", &format!("  解析失败：{e:#}")),
         }
@@ -167,7 +171,6 @@ pub fn run() -> Result<()> {
     }
 
     let model_root = crate::config::cache_dir().join("models");
-    let llama = crate::models::llama_paths(&model_root);
     if crate::models::llama_ready(&model_root) {
         check(
             &mut out,
@@ -180,16 +183,14 @@ pub fn run() -> Result<()> {
             "- models        未下载（gpu/cpu 首次运行会自动下载约 2.4GB 到 {}）",
             cache_dir().display()
         ));
-        let _ = &llama;
     }
 
     // api key 提示
-    let has_key = crate::settings::load()
+    let has_key = cfg_loaded
+        .as_ref()
         .map(|c| !c.asr_api.api_key.trim().is_empty())
         .unwrap_or(false)
-        || std::env::var("OPENROUTER_API_KEY")
-            .map(|k| !k.trim().is_empty())
-            .unwrap_or(false);
+        || crate::config::asr_api_key_from_env().is_some();
     if !has_key {
         out.push("- asr_api key   未配置（--provider api 时需要）".into());
     }
@@ -198,7 +199,7 @@ pub fn run() -> Result<()> {
     let default = crate::config::default_provider_hint();
     out.push(String::new());
     out.push(format!(
-        "默认后端：{}（本机将使用 {}）",
+        "默认后端：{}（未指定 --provider 且配置文件无 provider 时，本机将使用 {}）",
         default,
         match default {
             AsrProvider::Coreml => "Apple Neural Engine / CoreML",

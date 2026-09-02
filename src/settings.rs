@@ -84,20 +84,60 @@ pub fn save(cfg: &ConfigFile) -> Result<PathBuf> {
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&p, toml::to_string_pretty(cfg)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    // 覆盖前备份旧配置（用户可能有手改内容），失败只告警不阻断
+    if p.is_file() {
+        let bak = p.with_extension("toml.bak");
+        if let Err(e) = std::fs::copy(&p, &bak) {
+            tracing::warn!("备份旧配置到 {} 失败：{e}", bak.display());
+        }
     }
+    let bytes = toml::to_string_pretty(cfg)?;
+    write_private(&p, bytes.as_bytes())?;
     Ok(p)
+}
+
+/// 写含 API key 的配置文件。tmp → fsync → rename 沿用 checkpoint::atomic_write 的
+/// 崩溃安全语义，但 tmp 以 0600 一步建成——先建 0644 再 chmod 有暴露窗口。
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("创建 {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("写 {}", tmp.display()))?;
+        if let Err(e) = f.sync_all() {
+            tracing::warn!("fsync {} 失败：{e}", tmp.display());
+        }
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+    // mode 仅在建文件时生效；tmp 若已存在且权限不同则兜底 chmod
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!("设置 {} 权限 0600 失败：{e}", path.display());
+    }
+    Ok(())
+}
+
+/// 非 Unix：无权限位概念，直接复用通用原子写。
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    crate::checkpoint::atomic_write(path, bytes)
 }
 
 /// `config init` 写入的带注释模板。
 pub const TEMPLATE: &str = r#"# course2md 配置文件
 # 优先级：命令行参数 > 本文件 > 内置默认值。
 # 任何命令行参数（如 --similarity）都可以在这里设置默认值；
-# 保持注释状态即使用内置默认。
+# 保持注释状态即使用内置默认（内置默认值见源码 src/config.rs 顶部常量）。
 
 [defaults]
 # 输出根目录（其下按 平台/标题/编号 归类）
@@ -150,7 +190,7 @@ enabled = false
 #base_url = "https://api.deepseek.com/v1"
 #api_key = "sk-..."
 #model = "deepseek-chat"
-# 自定义校对提示词（留空用内置）
+# 自定义校对指令（输出格式约束由系统自动追加；留空用内置）
 #prompt = ""
 # 关闭任务结束时的 LLM 开启提示
 #disable_hint = false
@@ -160,12 +200,9 @@ enabled = false
 
 /// 打印生效配置（CLI 覆盖合并前，来自文件的值）。
 pub fn print_effective(cfg: &ConfigFile) {
+    use crate::config as c;
     let d = &cfg.defaults;
-    println!(
-        "{}: {}",
-        crate::i18n::tr("Config file", "配置文件"),
-        config_path().display()
-    );
+    println!("配置文件: {}", config_path().display());
     println!("[defaults]");
     let s = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
     println!(
@@ -173,32 +210,28 @@ pub fn print_effective(cfg: &ConfigFile) {
         d.out
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "out".into())
+            .unwrap_or_else(|| c::DEFAULT_OUT_DIR.into())
     );
     println!(
         "  similarity     : {}",
-        d.similarity
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "0.85".into())
+        d.similarity.unwrap_or(c::DEFAULT_SIMILARITY)
     );
     println!(
         "  sample_interval: {}",
-        d.sample_interval
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "1.0".into())
+        d.sample_interval.unwrap_or(c::DEFAULT_SAMPLE_INTERVAL)
     );
     println!(
         "  cooldown       : {}",
-        d.cooldown
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "10.0".into())
+        d.cooldown.unwrap_or(c::DEFAULT_COOLDOWN)
+    );
+    println!(
+        "  max_height     : {}",
+        d.max_height.unwrap_or(c::DEFAULT_MAX_HEIGHT)
     );
     println!("  roi            : {}", s(&d.roi));
     println!(
         "  threads        : {}",
-        d.threads
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "4".into())
+        d.threads.unwrap_or(c::DEFAULT_THREADS)
     );
     println!(
         "  provider       : {}",
@@ -207,12 +240,22 @@ pub fn print_effective(cfg: &ConfigFile) {
             .unwrap_or_else(|| "(按平台自动)".into())
     );
     println!("  slide_mode     : {}", d.slide_mode.unwrap_or_default());
+    println!(
+        "  stable_secs    : {}",
+        d.stable_secs.unwrap_or(c::DEFAULT_STABLE_SECS)
+    );
     println!("  asr_model      : {}", s(&d.asr_model));
     println!(
+        "  transcript_source: {}",
+        match d.transcript_source.unwrap_or_default() {
+            c::TranscriptSource::Auto => "auto",
+            c::TranscriptSource::Subtitle => "subtitle",
+            c::TranscriptSource::Asr => "asr",
+        }
+    );
+    println!(
         "  max_speech     : {}",
-        d.max_speech
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "20.0".into())
+        d.max_speech.unwrap_or(c::DEFAULT_MAX_SPEECH)
     );
     println!(
         "  formats        : {}",
@@ -233,6 +276,8 @@ pub fn print_effective(cfg: &ConfigFile) {
             .unwrap_or_else(|| "(内置缓存目录)".into())
     );
     println!("  keep_video     : {}", d.keep_video.unwrap_or(false));
+    println!("  no_download    : {}", d.no_download.unwrap_or(false));
+    println!("  resume         : {}", d.resume.unwrap_or(false));
     println!("[asr_api]");
     println!("  base_url       : {}", cfg.asr_api.base_url);
     println!("  model          : {}", cfg.asr_api.model);

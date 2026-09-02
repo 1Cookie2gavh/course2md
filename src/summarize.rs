@@ -9,10 +9,15 @@ use crate::timeline::TranscriptEvent;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// 直接单次总结的最大字幕字符数（约 4 万字符 ≈ 5-6 万 token，128K 上下文内安全）。
-const DIRECT_CHAR_LIMIT: usize = 40_000;
+/// 直接单次总结的最大字幕字符数。
+/// 依据：中文场景 1 字符 ≈ 1-2 token（Qwen/GPT 系分词），25_000 字符 ≈ 2.5-5 万
+/// token，加上 system/user prompt 与结构化输出，128K 上下文内仍留足余量；
+/// 英文等低 token 密度语言则更宽松。超过即走 map-reduce。
+const DIRECT_CHAR_LIMIT: usize = 25_000;
 /// map-reduce 每个分块的字符上限。
 const CHUNK_CHAR_LIMIT: usize = 25_000;
+/// map-reduce 分段总结的并发上限：LLM 端点普遍限流，取保守的 4 路。
+const SUMMARIZE_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OutlineItem {
@@ -29,8 +34,10 @@ pub struct Summary {
     pub outline: Vec<OutlineItem>,
 }
 
-/// markdown 总结区块的精确起点标记（幂等判断 / strip 均基于此）。
-const SUMMARY_MD_MARKER: &str = "## 📝 视频总结";
+/// 总结区块哨兵注释（md/html 通用；HTML 注释在两种渲染产物中都原样保留）。
+/// 幂等判断 / strip / 原地替换均以哨兵为准，不再扫描正文结构字面量。
+const SUMMARY_BEGIN: &str = "<!-- course2md:summary -->";
+const SUMMARY_END: &str = "<!-- /course2md:summary -->";
 
 const SYSTEM_PROMPT: &str = "你是视频内容总结助手。根据提供的带时间戳字幕为视频生成结构化总结。\
 严格要求：1) 只依据字幕内容，严禁编造字幕中不存在的事实、数字、人名或观点；\
@@ -65,7 +72,14 @@ fn parse_time(v: Option<&serde_json::Value>) -> f64 {
     }
     if let Some(s) = v.and_then(|x| x.as_str()) {
         let s = s.trim().trim_start_matches('[').trim_end_matches(']');
+        // 容忍 "120s" 纯秒格式（map-reduce 合并输入按 [{:.0}s] 标注时间）
+        let s = s.strip_suffix('s').unwrap_or(s);
         let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() == 1
+            && let Ok(sec) = parts[0].parse::<f64>()
+        {
+            return sec;
+        }
         if parts.len() == 2
             && let (Ok(m), Ok(sec)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>())
         {
@@ -142,16 +156,7 @@ fn parse_summary(content: &str) -> Option<Summary> {
 }
 
 fn chat_once(s: &LlmSettings, sys: &str, user: &str) -> Result<String> {
-    let body = serde_json::json!({
-        "model": s.model,
-        "temperature": 0.0,
-        "max_tokens": 16384,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user},
-        ],
-    });
+    let body = llm::chat_body(&s.model, sys, user, llm::CHAT_MAX_TOKENS);
     llm::send_chat(s, &body).context("LLM 总结请求失败")
 }
 
@@ -166,7 +171,8 @@ fn summarize_text(s: &LlmSettings, transcript: &str) -> Result<Summary> {
         "你是严格的 JSON 输出器。输出必须且只能是一个合法 JSON 对象，包含 tldr、key_points、outline 字段；不要代码围栏、不要注释、不要多余文字。",
         &user_prompt(transcript),
     )?;
-    parse_summary(&repair).with_context(|| format!("LLM 总结响应解析失败: {:.200}", content))
+    // 报错须打印刚失败的 repair 内容，而不是第一次的 content
+    parse_summary(&repair).with_context(|| format!("LLM 总结响应解析失败: {:.200}", repair))
 }
 
 fn split_chunks(events: &[TranscriptEvent], char_limit: usize) -> Vec<Vec<TranscriptEvent>> {
@@ -185,29 +191,44 @@ fn split_chunks(events: &[TranscriptEvent], char_limit: usize) -> Vec<Vec<Transc
     if !cur.is_empty() {
         chunks.push(cur);
     }
-    if chunks.is_empty() {
-        chunks.push(vec![]);
-    }
     chunks
+}
+
+/// 视频元信息（标题/UP主）作为背景注入 prompt，提升总结相关性；
+/// 幻觉防护不变——SYSTEM_PROMPT 仍要求只依据字幕内容。
+fn meta_context(meta: &VideoMeta) -> String {
+    let mut s = String::new();
+    if !meta.title.trim().is_empty() {
+        s.push_str(&format!("视频标题：{}\n", meta.title.trim()));
+    }
+    if !meta.uploader.trim().is_empty() {
+        s.push_str(&format!("UP主/作者：{}\n", meta.uploader.trim()));
+    }
+    if s.is_empty() { s } else { format!("{s}\n") }
 }
 
 /// 主入口：对全部字幕生成总结；超长自动 map-reduce。
 pub async fn summarize(
     s: &LlmSettings,
     events: &[TranscriptEvent],
-    _meta: &VideoMeta,
+    meta: &VideoMeta,
 ) -> Result<Summary> {
-    llm::validate(s)?;
     let total_chars: usize = events.iter().map(|e| e.text.chars().count() + 16).sum();
-    let transcript = build_transcript(events);
+    // 空转写直接报错：发给模型只会得到编造内容或报错，浪费请求
+    if events.is_empty() || total_chars == 0 {
+        bail!("转写为空，无法总结");
+    }
+    llm::validate(s)?;
+    let ctx = meta_context(meta);
+    let transcript = format!("{ctx}{}", build_transcript(events));
     if total_chars <= DIRECT_CHAR_LIMIT {
-        let t = transcript.clone();
+        let t = transcript;
         let s2 = s.clone();
         return tokio::task::spawn_blocking(move || summarize_text(&s2, &t))
             .await
             .context("总结线程 join 失败")?;
     }
-    // ---- map-reduce ----
+    // ---- map-reduce：分段按 SUMMARIZE_CONCURRENCY 分批并发 ----
     let chunks = split_chunks(events, CHUNK_CHAR_LIMIT);
     tracing::info!(
         chunks = chunks.len(),
@@ -215,13 +236,17 @@ pub async fn summarize(
         "summary map-reduce"
     );
     let mut partials: Vec<Summary> = Vec::new();
-    for (idx, chunk) in chunks.iter().enumerate() {
-        let t = build_transcript(chunk);
-        let s2 = s.clone();
-        let sm = tokio::task::spawn_blocking(move || summarize_text(&s2, &t))
-            .await
-            .context("总结线程 join 失败")?
-            .unwrap_or_else(|e| {
+    for batch in chunks.chunks(SUMMARIZE_CONCURRENCY) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for chunk in batch {
+            let t = format!("{ctx}{}", build_transcript(chunk));
+            let s2 = s.clone();
+            handles.push(tokio::task::spawn_blocking(move || summarize_text(&s2, &t)));
+        }
+        let base = partials.len();
+        for (off, h) in handles.into_iter().enumerate() {
+            let idx = base + off;
+            let sm = h.await.context("总结线程 join 失败")?.unwrap_or_else(|e| {
                 tracing::warn!("分段总结失败（chunk {idx}）：{e:#}");
                 Summary {
                     tldr: String::new(),
@@ -229,10 +254,11 @@ pub async fn summarize(
                     outline: vec![],
                 }
             });
-        partials.push(sm);
+            partials.push(sm);
+        }
     }
     // 合并分段总结
-    let mut combiner_input = String::new();
+    let mut combiner_input = ctx.clone();
     for (idx, sm) in partials.iter().enumerate() {
         combiner_input.push_str(&format!("== 第 {} 段总结 ==\n", idx + 1));
         if !sm.tldr.is_empty() {
@@ -246,7 +272,7 @@ pub async fn summarize(
         }
         combiner_input.push('\n');
     }
-    let input = combiner_input.clone();
+    let input = combiner_input;
     let s2 = s.clone();
     let combined = tokio::task::spawn_blocking(move || {
         chat_once(
@@ -288,9 +314,10 @@ pub async fn summarize(
     })
 }
 
-/// 生成插入 course.md 的总结区块（markdown）。
+/// 生成插入 course.md 的总结区块（markdown，哨兵注释包裹）。
+/// 有意信任 LLM 输出（markdown 语义直通），不做转义。
 pub fn render_md_block(sm: &Summary) -> String {
-    let mut out = format!("\n{SUMMARY_MD_MARKER}\n\n");
+    let mut out = format!("\n{SUMMARY_BEGIN}\n\n## 📝 视频总结\n\n");
     out.push_str(&format!("> {}\n", sm.tldr));
     if !sm.key_points.is_empty() {
         out.push_str("\n### 核心要点\n\n");
@@ -309,14 +336,13 @@ pub fn render_md_block(sm: &Summary) -> String {
             ));
         }
     }
-    out.push('\n');
+    out.push_str(&format!("\n{SUMMARY_END}\n"));
     out
 }
 
-/// 生成插入 course.html 的总结区块（HTML）。
+/// 生成插入 course.html 的总结区块（HTML，哨兵注释包裹）。
 pub fn render_html_block(sm: &Summary) -> String {
-    let mut out = String::new();
-    out.push_str("<section class=\"summary\"><h2>📝 视频总结</h2>");
+    let mut out = format!("{SUMMARY_BEGIN}<section class=\"summary\"><h2>📝 视频总结</h2>");
     out.push_str(&format!(
         "<p class=\"mute\">{}</p>",
         crate::render::esc(&sm.tldr)
@@ -340,13 +366,17 @@ pub fn render_html_block(sm: &Summary) -> String {
         }
         out.push_str("</ul>");
     }
-    out.push_str("</section>");
+    out.push_str(&format!("</section>{SUMMARY_END}"));
     out
 }
 
-/// 把总结区块插入已渲染的 markdown（元信息之后、首个字幕小节之前）。
+/// 把总结区块插入已渲染的 markdown：已有总结块时按哨兵原地替换（幂等）；
+/// 首次插入定位到元信息之后、首个字幕小节（## [mm:ss]）之前。
 pub fn insert_into_md(md: &str, sm: &Summary) -> String {
     let block = render_md_block(sm);
+    if contains_summary(md) {
+        return replace_sentinel_block(md, &block);
+    }
     if let Some(pos) = md.find("\n## [") {
         let mut out = md.to_string();
         out.insert_str(pos, &block);
@@ -357,9 +387,13 @@ pub fn insert_into_md(md: &str, sm: &Summary) -> String {
     out
 }
 
-/// 把总结区块插入已渲染的 HTML（</header> 之后）。
+/// 把总结区块插入已渲染的 HTML：已有总结块时按哨兵原地替换（幂等）；
+/// 首次插入定位到 </header> 之后（兜底 </body> 前 / 文末）。
 pub fn insert_into_html(html: &str, sm: &Summary) -> String {
     let block = render_html_block(sm);
+    if contains_html_summary(html) {
+        return replace_sentinel_block(html, &block);
+    }
     if let Some(pos) = html.find("</header>") {
         let insert_at = pos + "</header>".len();
         let mut out = html.to_string();
@@ -374,6 +408,20 @@ pub fn insert_into_html(html: &str, sm: &Summary) -> String {
     let mut out = html.to_string();
     out.push_str(&block);
     out
+}
+
+/// 原地替换哨兵之间的总结区块；缺闭合哨兵时保守不改（告警）。
+/// 调用方需先经 contains_summary / contains_html_summary 确认起始哨兵存在。
+fn replace_sentinel_block(doc: &str, block: &str) -> String {
+    let Some(start) = doc.find(SUMMARY_BEGIN) else {
+        return doc.to_string();
+    };
+    let Some(end_rel) = doc[start..].find(SUMMARY_END) else {
+        tracing::warn!("发现总结起始哨兵但缺少闭合哨兵，保守不替换");
+        return doc.to_string();
+    };
+    let end = start + end_rel + SUMMARY_END.len();
+    format!("{}{block}{}", &doc[..start], &doc[end..])
 }
 
 /// 生成独立总结文件（markdown），用于 -o 导出。
@@ -402,37 +450,38 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// 判断已渲染文档是否已包含总结区块（用于幂等跳过）。
-/// 用精确 marker，避免视频标题本身含「视频总结」字样时误判。
+/// 判断已渲染 markdown 是否已包含总结区块（幂等跳过；以哨兵注释为准，
+/// 视频标题本身含「视频总结」字样时不会误判）。
 pub fn contains_summary(md: &str) -> bool {
-    md.contains(SUMMARY_MD_MARKER)
+    md.contains(SUMMARY_BEGIN)
+}
+
+/// 判断已渲染 HTML 是否已包含总结区块（幂等跳过；以哨兵注释为准）。
+pub fn contains_html_summary(html: &str) -> bool {
+    html.contains(SUMMARY_BEGIN)
+}
+
+/// 删除哨兵之间的总结区块；只有起始哨兵没有闭合哨兵时保守不删（告警）。
+fn strip_sentinel_block(doc: &str) -> String {
+    let Some(start) = doc.find(SUMMARY_BEGIN) else {
+        return doc.to_string();
+    };
+    let Some(end_rel) = doc[start..].find(SUMMARY_END) else {
+        tracing::warn!("发现总结起始哨兵但缺少闭合哨兵，保守不删除");
+        return doc.to_string();
+    };
+    let end = start + end_rel + SUMMARY_END.len();
+    format!("{}{}", &doc[..start], &doc[end..])
 }
 
 /// 从 markdown 中移除已有总结区块（--force 重写时使用）。
 pub fn strip_md_summary(md: &str) -> String {
-    let marker = SUMMARY_MD_MARKER;
-    if let Some(start) = md.find(marker) {
-        let start_at = md[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
-        let after = &md[start..];
-        let end = after.find("\n## [").map(|i| start + i).unwrap_or(md.len());
-        let mut out = md[..start_at].to_string();
-        out.push_str(&md[end..]);
-        return out;
-    }
-    md.to_string()
+    strip_sentinel_block(md)
 }
 
 /// 从 HTML 中移除已有总结区块（--force 重写时使用）。
 pub fn strip_html_summary(html: &str) -> String {
-    if let Some(start) = html.find("<section class=\"summary\">")
-        && let Some(end_rel) = html[start..].find("</section>")
-    {
-        let end = start + end_rel + "</section>".len();
-        let mut out = html[..start].to_string();
-        out.push_str(&html[end..]);
-        return out;
-    }
-    html.to_string()
+    strip_sentinel_block(html)
 }
 
 #[cfg(test)]
@@ -490,8 +539,66 @@ mod tests {
         assert!(
             with.find("<section class=\"summary\">").unwrap() < with.find("<section>").unwrap()
         );
+        assert!(contains_html_summary(&with));
         let stripped = strip_html_summary(&with);
-        assert!(!stripped.contains("summary"));
+        assert!(!contains_html_summary(&stripped));
         assert!(stripped.contains("<section>"));
+    }
+
+    #[test]
+    fn insert_is_idempotent_replace() {
+        let md = "# 标题\n\n## [00:00](u)\n\n正文\n";
+        let sm1 = Summary {
+            tldr: "旧概述".into(),
+            key_points: vec![],
+            outline: vec![],
+        };
+        let sm2 = Summary {
+            tldr: "新概述".into(),
+            key_points: vec![],
+            outline: vec![],
+        };
+        let once = insert_into_md(md, &sm1);
+        let twice = insert_into_md(&once, &sm2);
+        assert_eq!(
+            twice.matches(SUMMARY_BEGIN).count(),
+            1,
+            "重复插入应原地替换而非追加"
+        );
+        assert!(twice.contains("新概述"));
+        assert!(!twice.contains("旧概述"));
+        assert!(twice.contains("## [00:00]"), "正文保留");
+    }
+
+    #[test]
+    fn unclosed_sentinel_is_not_stripped() {
+        let md = "# 标题\n\n<!-- course2md:summary -->\n\n## 残缺块\n\n正文\n";
+        assert_eq!(strip_md_summary(md), md, "缺闭合哨兵时保守不删");
+    }
+
+    #[test]
+    fn parse_time_accepts_seconds_suffix() {
+        // map-reduce 合并输入按 [{:.0}s] 标注时间
+        let v = serde_json::json!("120s");
+        assert!((parse_time(Some(&v)) - 120.0).abs() < 1e-6);
+        let v = serde_json::json!("[90s]");
+        assert!((parse_time(Some(&v)) - 90.0).abs() < 1e-6);
+        let v = serde_json::json!("01:30");
+        assert!((parse_time(Some(&v)) - 90.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn empty_transcript_bails() {
+        let s = LlmSettings::default();
+        let meta = VideoMeta {
+            title: "t".into(),
+            uploader: String::new(),
+            duration: 0.0,
+            webpage_url: String::new(),
+            extractor: String::new(),
+            id: String::new(),
+        };
+        let err = summarize(&s, &[], &meta).await.unwrap_err();
+        assert!(err.to_string().contains("转写为空"));
     }
 }

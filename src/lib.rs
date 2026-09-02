@@ -6,7 +6,6 @@ pub mod config;
 pub mod doctor;
 pub mod error;
 pub mod fetch;
-pub mod i18n;
 pub mod llm;
 pub mod media;
 pub mod models;

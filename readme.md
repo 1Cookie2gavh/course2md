@@ -289,11 +289,11 @@ disable_hint = false
 
 - **Default Provider**: OpenRouter with `qwen/qwen3-asr-flash-2026-02-10` (~$0.000035/second of audio).
 - **Other Models**: Supports `openai/whisper-large-v3-turbo`, `qwen/qwen3-asr-1.7b`, etc.
-- **API Key Resolution**: Reads `--asr-api-key`, config file `[asr_api].api_key`, or the `OPENROUTER_API_KEY` environment variable.
+- **API Key Resolution**: Reads `--asr-api-key`, config file `[asr_api].api_key`, or the `COURSE2MD_ASR_API_KEY` environment variable (`OPENROUTER_API_KEY` still accepted).
 
 ```bash
 # Transcribe using OpenRouter with an environment variable
-export OPENROUTER_API_KEY=sk-or-v1-xxxx
+export COURSE2MD_ASR_API_KEY=sk-or-v1-xxxx
 course2md https://... --provider api
 
 # Override model or endpoint via CLI
@@ -344,12 +344,9 @@ course2md https://... --no-llm-hint
 
 ---
 
-## Language & Internationalization
+## Language
 
-`course2md` automatically adapts its interface to your system environment:
-
-- **Default Language**: English.
-- **Automatic Localization**: If your system locale (`LC_ALL`, `LC_MESSAGES`, or `LANG`) starts with `zh`, help messages, runtime logs, completion summaries, and interactive prompts automatically switch to Chinese.
+CLI help (`--help`) is in English; runtime logs, completion summaries, and prompts are in Chinese.
 
 ---
 
@@ -407,7 +404,7 @@ Model dir: /Users/username/.cache/course2md/models
 | `--provider <coreml/gpu/cpu/api/npu>` | ASR backend: `coreml` (macOS arm64), `gpu` (non-Mac), `cpu`, or `api` (cloud STT) | Platform default |
 | `--asr-model <qwen3/whisper>` | CoreML ASR model variant (`qwen3` 0.6B or `whisper` large-v3-turbo) | `qwen3` |
 | `--asr-api-base-url <URL>` | Cloud STT base URL (OpenAI-compatible) | `https://openrouter.ai/api/v1` |
-| `--asr-api-key <KEY>` | Cloud STT API Key (or set `OPENROUTER_API_KEY` env) | Config / Env |
+| `--asr-api-key <KEY>` | Cloud STT API Key (or set `COURSE2MD_ASR_API_KEY` env) | Config / Env |
 | `--asr-api-model <MODEL>` | Cloud STT model slug (e.g. `qwen/qwen3-asr-flash-2026-02-10`) | `qwen/qwen3-asr-flash-2026-02-10` |
 | `--similarity <0~1>` | SSIM similarity threshold; **higher = more sensitive = more slides captured** | `0.85` |
 | `--sample-interval <SEC>` | Frame sampling check interval in seconds | `1.0` |

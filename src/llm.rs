@@ -10,7 +10,7 @@
 use crate::timeline::{Section, TranscriptEvent};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ pub struct LlmSettings {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
-    /// 覆盖默认校对提示词
+    /// 自定义校对指令（输出格式约束由系统自动追加，prompt 无法覆盖）
     pub prompt: Option<String>,
     /// 关闭「可开启 LLM」的结束提示
     pub disable_hint: bool,
@@ -86,6 +86,39 @@ const DEFAULT_CONCURRENCY: usize = 8;
 /// LLM 请求最大尝试次数（1 次原始 + 重试）。
 const MAX_ATTEMPTS: usize = 3;
 
+/// chat/completions 公共参数：温度固定 0（校对/总结都要求确定性输出）。
+pub(crate) const CHAT_TEMPERATURE: f64 = 0.0;
+/// 单次请求输出 token 上限（润色与总结共用）。
+pub(crate) const CHAT_MAX_TOKENS: u32 = 16384;
+
+/// 共享进度条样式：模板均为静态字符串，解析失败是编程错误。
+pub(crate) fn progress_style(template: &str) -> indicatif::ProgressStyle {
+    indicatif::ProgressStyle::with_template(template)
+        .expect("静态进度条模板")
+        .progress_chars("##-")
+}
+
+/// 构造标准 chat/completions 请求体（temperature=0、json_object 结构化输出）。
+/// 润色与总结共用，避免两处各自拼 body 参数漂移；
+/// `user` 传 &str 为纯文本消息，传 `serde_json::Value::Array` 为多模态内容块。
+pub(crate) fn chat_body(
+    model: &str,
+    system: &str,
+    user: impl Into<serde_json::Value>,
+    max_tokens: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "temperature": CHAT_TEMPERATURE,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user.into()},
+        ]
+    })
+}
+
 /// 对已合并的 Section 做润色（在 merge 之后调用）。
 /// - 失败批次保留原文（润色失败不阻断转换）
 /// - vision=true 且截图存在时，请求附该节幻灯片；带图失败自动降级纯文本重试一次
@@ -98,13 +131,9 @@ pub fn polish_sections(sections: &mut [Section], frames_root: &Path, s: &LlmSett
         .map(|sec| sec.speech.chunks(BATCH).len())
         .sum();
     let pb = indicatif::ProgressBar::new(total as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::with_template(
-            "{spinner:.green} llm {pos}/{len} [{bar:32.cyan/blue}] {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
+    pb.set_style(progress_style(
+        "{spinner:.green} llm {pos}/{len} [{bar:32.cyan/blue}] {msg}",
+    ));
     let warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let vision_warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let workers = s.concurrency.clamp(1, 16);
@@ -142,25 +171,44 @@ fn polish_section(
     if sec.speech.is_empty() {
         return;
     }
-    let image = if s.vision {
+    // 同一 Section 的多 chunk 共用一张截图：只读盘 + base64 一次
+    //（数 MB 大，逐 chunk 重复编码太贵）；读取失败则该节按纯文本润色
+    let image_b64 = if s.vision {
         let p = frames_root.join(&sec.image);
-        p.is_file().then_some(p)
+        if p.is_file() {
+            match std::fs::read(&p) {
+                Ok(bytes) => {
+                    use base64::Engine as _;
+                    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+                }
+                Err(e) => {
+                    warn_once(
+                        warned,
+                        &format!("读取幻灯片截图 {} 失败（{e:#}），该节按纯文本润色", p.display()),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
     } else {
         None
     };
     for chunk in sec.speech.chunks_mut(BATCH) {
         pb.inc(1);
-        polish_chunk(s, chunk, image.as_deref(), warned, vision_warned);
+        polish_chunk(s, chunk, image_b64.as_deref(), warned, vision_warned);
     }
     // 删除「成功润色为空串」的纯语气词条目
     sec.speech.retain(|e| !e.text.trim().is_empty());
 }
 
 /// 递归润色一个分块；失败（含 id 集不匹配）时拆半重试，保证尽力而为。
+/// `image_b64` 为该节幻灯片截图的 base64（由 polish_section 统一读取一次）。
 fn polish_chunk(
     s: &LlmSettings,
     chunk: &mut [TranscriptEvent],
-    image: Option<&Path>,
+    image_b64: Option<&str>,
     warned: &std::sync::atomic::AtomicBool,
     vision_warned: &std::sync::atomic::AtomicBool,
 ) {
@@ -172,7 +220,7 @@ fn polish_chunk(
         .enumerate()
         .map(|(i, e)| (i, e.text.as_str()))
         .collect();
-    let r = match (chat(s, &items, image), image) {
+    let r = match (chat(s, &items, image_b64), image_b64) {
         (Ok(v), _) => Ok(v),
         (Err(e), Some(_)) => {
             warn_once(
@@ -188,7 +236,7 @@ fn polish_chunk(
             let mismatched = apply_polish(chunk, &polished);
             if mismatched {
                 if chunk.len() > 1 {
-                    split_and_retry(s, chunk, image, warned, vision_warned);
+                    split_and_retry(s, chunk, image_b64, warned, vision_warned);
                 } else {
                     warn_once(warned, "LLM 返回 id 集与输入不符，该批保留原文");
                 }
@@ -196,7 +244,7 @@ fn polish_chunk(
         }
         Err(e) => {
             if chunk.len() > 1 {
-                split_and_retry(s, chunk, image, warned, vision_warned);
+                split_and_retry(s, chunk, image_b64, warned, vision_warned);
             } else {
                 warn_once(warned, &format!("LLM 润色失败（{e:#}），保留原文"));
             }
@@ -208,13 +256,13 @@ fn polish_chunk(
 fn split_and_retry(
     s: &LlmSettings,
     chunk: &mut [TranscriptEvent],
-    image: Option<&Path>,
+    image_b64: Option<&str>,
     warned: &std::sync::atomic::AtomicBool,
     vision_warned: &std::sync::atomic::AtomicBool,
 ) {
     let mid = chunk.len() / 2;
-    polish_chunk(s, &mut chunk[..mid], image, warned, vision_warned);
-    polish_chunk(s, &mut chunk[mid..], image, warned, vision_warned);
+    polish_chunk(s, &mut chunk[..mid], image_b64, warned, vision_warned);
+    polish_chunk(s, &mut chunk[mid..], image_b64, warned, vision_warned);
 }
 
 /// 把 (id, 新文本) 应用到一批事件上；空字符串 = 删除该条（由调用方 retain）。
@@ -250,23 +298,14 @@ fn warn_once(warned: &std::sync::atomic::AtomicBool, msg: &str) {
 }
 
 /// 发一批（id, 文本）给 LLM，返回润色后的 (id, 文本) 列表。
-/// `image` 提供时在用户消息中附上该幻灯片截图（OpenAI 兼容 image_url 协议）。
+/// `image_b64` 提供时在用户消息中附上该幻灯片截图（OpenAI 兼容 image_url 协议）。
 fn chat(
     s: &LlmSettings,
     items: &[(usize, &str)],
-    image: Option<&Path>,
+    image_b64: Option<&str>,
 ) -> Result<Vec<(usize, String)>> {
     validate(s)?;
-    let image_b64 = match image {
-        Some(p) => {
-            use base64::Engine as _;
-            let bytes =
-                std::fs::read(p).with_context(|| format!("读取幻灯片截图 {}", p.display()))?;
-            Some(base64::engine::general_purpose::STANDARD.encode(bytes))
-        }
-        None => None,
-    };
-    let body = build_chat_body(s, items, image_b64.as_deref())?;
+    let body = build_chat_body(s, items, image_b64)?;
     let content = send_chat(s, &body)?;
     parse_id_text_pairs(&content)
         .with_context(|| format!("LLM 响应不是 id/text JSON 数组: {:.200}", content))
@@ -287,6 +326,7 @@ fn build_chat_body(
     } else {
         ""
     };
+    let system = format!("{} 输出为 JSON 数组，每项形如 {{\"id\":序号,\"text\":润色后的文本}}，id 必须与输入一一对应；纯语气词条目的 text 为空字符串。{vision_note}", effective_prompt(s));
     let mut content = vec![serde_json::json!({
         "type": "text",
         "text": serde_json::to_string(&payload)?,
@@ -297,16 +337,12 @@ fn build_chat_body(
             "image_url": {"url": format!("data:image/jpeg;base64,{b64}")},
         }));
     }
-    Ok(serde_json::json!({
-        "model": s.model,
-        "temperature": 0.0,
-        "max_tokens": 16384,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": format!("{} 输出为 JSON 数组，每项形如 {{\"id\":序号,\"text\":润色后的文本}}，id 必须与输入一一对应；纯语气词条目的 text 为空字符串。{vision_note}", effective_prompt(s))},
-            {"role": "user", "content": content},
-        ]
-    }))
+    Ok(chat_body(
+        &s.model,
+        &system,
+        serde_json::Value::Array(content),
+        CHAT_MAX_TOKENS,
+    ))
 }
 
 /// 从模型输出提取 [{"id":n,"text":"..."}]（容忍代码围栏、前后杂文、尾逗号与个别坏项）。
@@ -420,25 +456,33 @@ fn lenient_scan(s: &str) -> Option<Vec<(usize, String)>> {
 /// 发原始 chat/completions 请求并返回 message.content（润色与总结共用）。
 ///
 /// 兼容性降级：部分 OpenAI 兼容端点不支持 `response_format: json_object`
-///（直接 400）。带该字段的请求失败时去掉它重试一次，仍失败才报原始错误。
+///（直接 400）。仅当错误是参数类 4xx 时去掉该字段重试一次。
 pub(crate) fn send_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<String> {
     let resp = match request_chat(s, body) {
         Ok(r) => r,
         Err(first) => {
-            if body.get("response_format").is_some() {
-                let mut relaxed = body.clone();
-                if let Some(obj) = relaxed.as_object_mut() {
-                    obj.remove("response_format");
+            // 只有 400（或其他非 401/429 的 4xx）才有理由怀疑是 response_format
+            // 不兼容；401（鉴权）/429（限流）/超时/5xx 与该字段无关，原样报错。
+            let degradable = match first.status {
+                Some(400) => true,
+                Some(c) => (400..500).contains(&c) && c != 401 && c != 429,
+                None => false,
+            };
+            if !(degradable && body.get("response_format").is_some()) {
+                return Err(first.err);
+            }
+            let mut relaxed = body.clone();
+            if let Some(obj) = relaxed.as_object_mut() {
+                obj.remove("response_format");
+            }
+            // 降级请求只试一次：原请求已按 MAX_ATTEMPTS 重试过，这里只验证
+            // response_format 兼容性，再走完整重试循环会成倍放大等待时间。
+            match request_chat_once(s, &relaxed) {
+                Ok(r) => {
+                    tracing::debug!("端点不支持 response_format，降级重试成功");
+                    r
                 }
-                match request_chat(s, &relaxed) {
-                    Ok(r) => {
-                        tracing::debug!("端点不支持 response_format，降级重试成功");
-                        r
-                    }
-                    Err(_) => return Err(first),
-                }
-            } else {
-                return Err(first);
+                Err(_) => return Err(first.err),
             }
         }
     };
@@ -449,6 +493,14 @@ pub(crate) fn send_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<Str
         .to_string())
 }
 
+/// LLM 请求失败：携带 HTTP 状态码（网络错误为 None）与是否可重试，
+/// 供 send_chat 判断 response_format 降级是否有意义。
+struct ChatFailure {
+    status: Option<u16>,
+    retryable: bool,
+    err: anyhow::Error,
+}
+
 /// 网络层错误 / 429 / 5xx 可重试；其余 4xx（鉴权、参数）重试无意义。
 fn is_retryable(e: &ureq::Error) -> bool {
     match e {
@@ -457,20 +509,64 @@ fn is_retryable(e: &ureq::Error) -> bool {
     }
 }
 
+/// 进程级抖动序列：与纳秒异或打散，避免并发请求同步重试（不引入 rand）。
+static JITTER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 第 attempt 次失败后的退避时长：1s、2s 指数增长 + 亚秒级抖动。
 fn backoff_duration(attempt: usize) -> Duration {
     let base = 1_u64 << (attempt.saturating_sub(1).min(6)); // 1, 2, 4, ...
-    let jitter_ns = std::time::SystemTime::now()
+    let seq = JITTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-        % 500_000_000; // 0~500ms 抖动，避免并发请求同步重试
-    Duration::from_nanos(base * 1_000_000_000 + u64::from(jitter_ns))
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let jitter_ns = (nanos ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 500_000_000; // 0~500ms 抖动
+    Duration::from_nanos(base * 1_000_000_000 + jitter_ns)
+}
+
+/// 单次请求（不重试）；状态错误带上服务端返回体（鉴权/限流/参数问题一目了然）。
+fn request_chat_once(
+    s: &LlmSettings,
+    body: &serde_json::Value,
+) -> std::result::Result<ureq::Response, ChatFailure> {
+    match ureq::post(&endpoint(&s.base_url))
+        .timeout(Duration::from_secs(300))
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", s.api_key))
+        // &Value 实现了 Serialize：传引用，避免克隆含 base64 截图的数 MB 请求体
+        .send_json(body)
+    {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            let retryable = is_retryable(&e);
+            let (status, err) = match e {
+                ureq::Error::Status(code, resp) => {
+                    let tail = resp.into_string().unwrap_or_default();
+                    (
+                        Some(code),
+                        anyhow::anyhow!(
+                            "LLM 端点返回 {code}：{}",
+                            tail.chars().take(300).collect::<String>()
+                        ),
+                    )
+                }
+                other => (None, anyhow::anyhow!("LLM 请求失败: {other}")),
+            };
+            Err(ChatFailure {
+                status,
+                retryable,
+                err,
+            })
+        }
+    }
 }
 
 /// 发请求：可重试错误按指数退避重试，总共最多 [`MAX_ATTEMPTS`] 次尝试。
-fn request_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<ureq::Response> {
-    let mut last_err: Option<anyhow::Error> = None;
+fn request_chat(
+    s: &LlmSettings,
+    body: &serde_json::Value,
+) -> std::result::Result<ureq::Response, ChatFailure> {
+    let mut last_err: Option<ChatFailure> = None;
     for attempt in 1..=MAX_ATTEMPTS {
         if attempt > 1 {
             let wait = backoff_duration(attempt - 1);
@@ -482,48 +578,22 @@ fn request_chat(s: &LlmSettings, body: &serde_json::Value) -> Result<ureq::Respo
             );
             std::thread::sleep(wait);
         }
-        match ureq::post(&endpoint(&s.base_url))
-            .timeout(Duration::from_secs(300))
-            .set("Content-Type", "application/json")
-            .set("Authorization", &format!("Bearer {}", s.api_key))
-            .send_json(body.clone())
-        {
+        match request_chat_once(s, body) {
             Ok(resp) => return Ok(resp),
-            Err(e) => {
-                // 状态错误带上服务端返回体（鉴权/限流/参数问题一目了然）
-                let retryable = is_retryable(&e);
-                let wrapped = match e {
-                    ureq::Error::Status(code, resp) => {
-                        let tail = resp.into_string().unwrap_or_default();
-                        anyhow::anyhow!(
-                            "LLM 端点返回 {code}：{}",
-                            tail.chars().take(300).collect::<String>()
-                        )
-                    }
-                    other => anyhow::anyhow!("LLM 请求失败: {other}"),
-                };
-                if retryable {
-                    last_err = Some(wrapped);
-                } else {
-                    return Err(wrapped);
-                }
-            }
+            Err(f) if f.retryable => last_err = Some(f),
+            Err(f) => return Err(f),
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("LLM 请求失败")))
+    Err(last_err.unwrap_or_else(|| ChatFailure {
+        status: None,
+        retryable: false,
+        err: anyhow::anyhow!("LLM 请求失败"),
+    }))
 }
 
-/// 从模型输出中提取 JSON 字符串数组（容忍 ```json 围栏与前后杂文）。
-pub fn parse_text_array(content: &str) -> Option<Vec<String>> {
-    let start = content.find('[')?;
-    let end = content.rfind(']')?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str(&content[start..=end]).ok()
-}
-
-/// 空白提示词视为未设置，回落到内置提示词。
+/// 用户自定义校对指令；空白视为未设置，回落到内置提示词。
+/// 注意：输出格式约束（JSON 数组 / id 对应）由系统在构造请求体时自动追加，
+/// 自定义 prompt 无法覆盖（见 build_chat_body）。
 fn effective_prompt(s: &LlmSettings) -> &str {
     s.prompt
         .as_deref()
@@ -587,7 +657,7 @@ pub fn setup_interactive(
         } else {
             format!(
                 "（回车保留已配置的 {}...）",
-                &cfg.llm.api_key[..cfg.llm.api_key.len().min(6)]
+                cfg.llm.api_key.chars().take(6).collect::<String>()
             )
         };
         let v: String = dialoguer::Input::<String>::new()
@@ -610,8 +680,9 @@ pub fn setup_interactive(
     if !cfg.llm.base_url.is_empty() && !cfg.llm.base_url.contains("://") {
         cfg.llm.base_url = format!("https://{}", cfg.llm.base_url.trim());
     }
-    // 视觉能力仅交互式终端询问（脚本化调用全部传参时不阻塞）
-    if unsafe { libc::isatty(2) } == 1 {
+    // 视觉能力仅交互式终端询问（脚本化调用全部传参时不阻塞）；
+    // 检查 stdin 而非 stderr，与 dialoguer 读取的流一致
+    if std::io::stdin().is_terminal() {
         cfg.llm.vision = dialoguer::Select::new()
             .with_prompt("该模型支持视觉输入吗？（开启后润色时附幻灯片截图，辅助纠正技术词汇）")
             .items([
@@ -645,7 +716,7 @@ pub fn print_status(cfg: &crate::settings::ConfigFile) {
     let key_disp = if s.api_key.is_empty() {
         "-".to_string()
     } else {
-        format!("{}...（已隐藏）", &s.api_key[..s.api_key.len().min(6)])
+        format!("{}...（已隐藏）", s.api_key.chars().take(6).collect::<String>())
     };
     println!("  api_key ：{key_disp}");
     println!(
@@ -666,17 +737,10 @@ pub fn print_status(cfg: &crate::settings::ConfigFile) {
 }
 
 pub fn write_hint_note(path: &std::path::Path) {
-    let msg = if crate::i18n::is_zh() {
-        format!(
-            "\n提示：可用 LLM 自动润色字幕（修正语气词与明显识别错误），运行 `course2md llm setup` 一键开启。\n配置文件：{}（加 --no-llm-hint 或在配置中设 disable_hint 可关闭本提示）\n",
-            path.display()
-        )
-    } else {
-        format!(
-            "\nTip: enable LLM transcript polishing to fix filler words and obvious ASR errors — run `course2md llm setup`.\nConfig: {} (suppress this tip with --no-llm-hint or disable_hint in the config)\n",
-            path.display()
-        )
-    };
+    let msg = format!(
+        "\n提示：可用 LLM 自动润色字幕（修正语气词与明显识别错误），运行 `course2md llm setup` 一键开启。\n配置文件：{}（加 --no-llm-hint 或在配置中设 disable_hint 可关闭本提示）\n",
+        path.display()
+    );
     let _ = std::io::stderr().write_all(msg.as_bytes());
 }
 

@@ -289,11 +289,11 @@ disable_hint = false
 
 - **推荐服务**：OpenRouter 托管的 `qwen/qwen3-asr-flash-2026-02-10`（约 $0.000035 / 秒音频）。
 - **兼容模型**：支持 `openai/whisper-large-v3-turbo`、`qwen/qwen3-asr-1.7b` 等。
-- **密钥获取与配置**：可通过 `--asr-api-key`、配置文件 `[asr_api].api_key` 或 `OPENROUTER_API_KEY` 环境变量传入。
+- **密钥获取与配置**：可通过 `--asr-api-key`、配置文件 `[asr_api].api_key` 或 `COURSE2MD_ASR_API_KEY` 环境变量传入（兼容旧名 `OPENROUTER_API_KEY`）。
 
 ```bash
 # 通过环境变量使用 OpenRouter 转写
-export OPENROUTER_API_KEY=sk-or-v1-xxxx
+export COURSE2MD_ASR_API_KEY=sk-or-v1-xxxx
 course2md https://... --provider api
 
 # 命令行即时覆盖模型
@@ -345,12 +345,9 @@ course2md https://... --no-llm-hint
 
 ---
 
-## 语言与国际化（Language & i18n）
+## 语言
 
-`course2md` CLI 具备多语言自适应能力：
-
-- **默认语言**：英文（English）。
-- **自动本地化**：当系统环境变量（`LC_ALL`、`LC_MESSAGES` 或 `LANG`）以 `zh` 开头时，命令行帮助信息、完成摘要、提示信息与交互式输入均自动切换为中文。
+命令行帮助（`--help`）为英文；运行日志、完成摘要与提示信息为中文。
 
 ---
 
@@ -408,7 +405,7 @@ out/<平台>/<标题>/<编号>/
 | `--provider <coreml/gpu/cpu/api/npu>` | 识别后端：`coreml`（macOS 默认）、`gpu`（非 Mac 默认）、`cpu`、`api`（云端 STT） | 视平台而定 |
 | `--asr-model <qwen3/whisper>` | CoreML 识别模型变体（`qwen3` 0.6B 或 `whisper` large-v3-turbo） | `qwen3` |
 | `--asr-api-base-url <URL>` | 云端 STT base URL（OpenAI 兼容） | `https://openrouter.ai/api/v1` |
-| `--asr-api-key <KEY>` | 云端 STT API Key（亦可设置 `OPENROUTER_API_KEY` 环境变量） | 配置文件 / 环境变量 |
+| `--asr-api-key <KEY>` | 云端 STT API Key（亦可设置 `COURSE2MD_ASR_API_KEY` 环境变量） | 配置文件 / 环境变量 |
 | `--asr-api-model <模型名>` | 云端 STT 模型名称（如 `qwen/qwen3-asr-flash-2026-02-10`） | `qwen/qwen3-asr-flash-2026-02-10` |
 | `--similarity <0~1>` | SSIM 画面相似度阈值；**数值越高越敏感、截图越多** | `0.85` |
 | `--sample-interval <秒>` | 画面采样检查间隔（秒） | `1.0` |

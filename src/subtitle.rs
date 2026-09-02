@@ -17,6 +17,12 @@ pub fn parse_subtitle(content: &str) -> Vec<TranscriptEvent> {
         let line = lines[i];
         if let Some((start, end)) = parse_cue_header(line) {
             i += 1;
+            // 外部数据不信任：非有限时间戳的 cue 直接丢弃，
+            // 避免 NaN/inf 污染下游排序与二分查找
+            if !start.is_finite() || !end.is_finite() {
+                tracing::warn!(line, "字幕 cue 时间戳非有限值，跳过");
+                continue;
+            }
             let mut text_parts: Vec<String> = vec![];
             while i < lines.len() && !lines[i].trim().is_empty() {
                 let cleaned = clean_cue_text(lines[i]);
@@ -68,7 +74,18 @@ fn parse_ts(s: &str) -> Option<f64> {
         [s] => (0, 0, *s),
         _ => return None,
     };
-    let ms: f64 = format!("0.{frac}").parse().unwrap_or(0.0);
+    // 毫秒按位数显式解析缩放（"050" → 50/10^3）；非法字段告警并落 0，不静默吞错
+    let ms: f64 = if frac.is_empty() {
+        0.0
+    } else {
+        match frac.parse::<u32>() {
+            Ok(v) => v as f64 / 10f64.powi(frac.len() as i32),
+            Err(_) => {
+                tracing::warn!(ts = s, "字幕时间戳毫秒字段非法，按 0 处理");
+                0.0
+            }
+        }
+    };
     Some(h as f64 * 3600.0 + m as f64 * 60.0 + sec as f64 + ms)
 }
 
@@ -84,19 +101,26 @@ fn clean_cue_text(line: &str) -> String {
             _ => {}
         }
     }
+    // 注意顺序：&amp; 必须最后替换，否则 "&amp;lt;" 会先被还原成 "&lt;"
+    // 再被二次还原成 "<"，造成双重反转义
     for (from, to) in [
         ("&nbsp;", " "),
-        ("&amp;", "&"),
         ("&lt;", "<"),
         ("&gt;", ">"),
         ("&quot;", "\""),
+        ("&amp;", "&"),
     ] {
         s = s.replace(from, to);
     }
     s.trim().to_string()
 }
 
+/// yt-dlp `--sub-langs` 的语言偏好参数，fetch.rs 抓取字幕时引用；
+/// 与下方 `lang_rank` 的挑选顺序同源（zh 优先、en 其次），改动时需同步检查。
+pub(crate) const SUB_LANGS: &str = "zh.*,en.*";
+
 /// 在目录里挑选字幕文件（`sub.<lang>.srt`）：zh* 优先，其次 en*，再任意。
+/// 只认 `.srt`：依赖 fetch.rs 抓取时 `--convert-subs srt` 的约定（两边需保持一致）。
 pub fn pick_subtitle_file(dir: &Path) -> Option<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
@@ -111,6 +135,7 @@ pub fn pick_subtitle_file(dir: &Path) -> Option<PathBuf> {
     files.into_iter().next()
 }
 
+/// 语言排名：与 `SUB_LANGS`（fetch.rs `--sub-langs`）同源，zh 优先、en 其次。
 fn lang_rank(p: &Path) -> (u8, String) {
     let stem = p
         .file_stem()

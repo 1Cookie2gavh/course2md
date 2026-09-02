@@ -9,22 +9,31 @@ use anyhow::{Context, Result};
 use image::GrayImage;
 use image_compare::Algorithm;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::borrow::Cow;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+
+/// SSIM 采样宽度：足够区分版面变化，同时控制 rawvideo 带宽与 SSIM 计算开销
+const SAMPLE_WIDTH: u32 = 640;
+/// 全分辨率抽帧并发度：每帧一个 ffmpeg 进程，4 路即可利用并行度又不至于进程风暴
+const EXTRACT_CONCURRENCY: usize = 4;
 
 fn scaled_wh(ow: u32, oh: u32, target_w: u32) -> (u32, u32) {
     let h = ((oh as u64 * target_w as u64) / ow.max(1) as u64) as u32;
     (target_w, (h & !1).max(2))
 }
 
-fn crop_roi(img: &GrayImage, roi: Option<Roi>) -> GrayImage {
+/// 无 ROI 时借用原图（零拷贝）；有 ROI 时返回裁剪后的新图。
+fn crop_roi(img: &GrayImage, roi: Option<Roi>) -> Cow<'_, GrayImage> {
     let Some(r) = roi else {
-        return img.clone();
+        return Cow::Borrowed(img);
     };
     let (w, h) = img.dimensions();
     let (x1, y1, x2, y2) = r.pixels(w, h);
-    image::imageops::crop_imm(img, x1, y1, (x2 - x1).max(1), (y2 - y1).max(1)).to_image()
+    Cow::Owned(
+        image::imageops::crop_imm(img, x1, y1, (x2 - x1).max(1), (y2 - y1).max(1)).to_image(),
+    )
 }
 
 fn ssim(a: &GrayImage, b: &GrayImage) -> f64 {
@@ -36,22 +45,17 @@ fn ssim(a: &GrayImage, b: &GrayImage) -> f64 {
 /// 单点精确抽帧（全分辨率 JPEG）。
 async fn extract_frame(media: &Path, t: f64, dest: &Path) -> Result<()> {
     let ss = format!("{t:.3}");
-    let out = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", &ss])
-        .arg("-i")
-        .arg(media)
-        .args(["-frames:v", "1", "-q:v", "2"])
-        .arg(dest)
-        .output()
-        .await
-        .context("启动 ffmpeg 抽帧失败")?;
-    if !out.status.success() {
-        return Err(crate::error::cmd_error(
-            "ffmpeg",
-            out.status.code(),
-            &String::from_utf8_lossy(&out.stderr),
-        ));
-    }
+    // -q:v 2：JPEG 高质量档（2~31，越小越好），讲义文字可读性优先
+    media::run_cmd(
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", &ss])
+            .arg("-i")
+            .arg(media)
+            .args(["-frames:v", "1", "-q:v", "2"])
+            .arg(dest),
+        "ffmpeg",
+    )
+    .await?;
     Ok(())
 }
 
@@ -60,8 +64,17 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<(f6
     let info = media::probe_video(media)
         .await
         .context("ffprobe 无法读取视频宽高")?;
-    let interval = cfg.sample_interval.max(0.2);
-    let (tw, th) = scaled_wh(info.width, info.height, 640);
+    // sample_interval 下限 0.2s（即采样率上限 5fps）；配置被收紧时必须告知用户
+    let interval = if cfg.sample_interval < 0.2 {
+        tracing::warn!(
+            configured = cfg.sample_interval,
+            "sample_interval 小于下限 0.2s，按 0.2s 采样"
+        );
+        0.2
+    } else {
+        cfg.sample_interval
+    };
+    let (tw, th) = scaled_wh(info.width, info.height, SAMPLE_WIDTH);
     let fps = 1.0 / interval;
     let vf = format!("fps={fps:.6},scale={tw}:{th},format=gray");
     let total = ((info.duration / interval).ceil() as u64).max(1);
@@ -128,6 +141,9 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<(f6
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
+        // 理想采样时刻 t = i * interval：fps 滤镜的取整与 VFR 补帧会让真实帧
+        // 时间略有漂移（通常 < 一个采样间隔）；场景检测只需秒级精度，可接受，
+        // 故不逐帧解析 pts。
         let t = i as f64 * interval;
         i += 1;
         pb.inc(1);
@@ -153,7 +169,8 @@ async fn sample_timestamps(cfg: &PipelineConfig, media: &Path) -> Result<Vec<(f6
             Some(c) => c.dimensions() != cmp.dimensions() || ssim(c, &cmp) < cfg.similarity,
         };
         if candidate_changed {
-            candidate = Some(cmp);
+            // 仅候选变更时才物化为拥有所有权的图；其余路径 cmp 只借不拷
+            candidate = Some(cmp.into_owned());
             candidate_first_t = Some(t);
             candidate_last_t = Some(t);
         } else if candidate_last_t.is_some() {
@@ -218,20 +235,43 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
         .unwrap()
         .progress_chars("##-"),
     );
-    let mut frames = vec![];
-    for (i, &(onset_t, capture_t)) in times.iter().enumerate() {
+    // JoinSet 限流并发抽帧：最多 EXTRACT_CONCURRENCY 个 ffmpeg 进程并行；
+    // 按帧索引收集结果后排序，保证输出文件名与结果顺序与串行版完全一致。
+    let mut set: tokio::task::JoinSet<(usize, Result<()>)> = tokio::task::JoinSet::new();
+    let mut pending = times.iter().copied().enumerate();
+    let mut results: Vec<(usize, Result<()>)> = Vec::with_capacity(times.len());
+    loop {
+        while set.len() < EXTRACT_CONCURRENCY {
+            let Some((i, (_, capture_t))) = pending.next() else {
+                break;
+            };
+            // 截帧用代表帧时间（稳定后），时间线用 onset（首次出现）
+            let path = frames_dir.join(format!("slide_{:04}.jpg", i + 1));
+            let media = media.to_path_buf();
+            set.spawn(async move { (i, extract_frame(&media, capture_t, &path).await) });
+        }
+        match set.join_next().await {
+            Some(Ok(item)) => {
+                pb.set_message(format!("t={:.1}s", times[item.0].0));
+                pb.inc(1);
+                results.push(item);
+            }
+            Some(Err(e)) => return Err(e).context("抽帧任务异常终止"),
+            None => break,
+        }
+    }
+    pb.finish_and_clear();
+    results.sort_by_key(|(i, _)| *i);
+    let mut frames = Vec::with_capacity(results.len());
+    for (i, r) in results {
+        let (onset_t, _) = times[i];
+        r.with_context(|| format!("抽取第 {} 帧（t={onset_t:.1}s）失败", i + 1))?;
         let name = format!("slide_{:04}.jpg", i + 1);
-        let path = frames_dir.join(&name);
-        // 截帧用代表帧时间（稳定后），时间线用 onset（首次出现）
-        extract_frame(media, capture_t, &path).await?;
         frames.push(FrameEvent {
             t: onset_t,
             image: format!("frames/{name}"),
         });
-        pb.set_message(format!("t={onset_t:.1}s"));
-        pb.inc(1);
     }
-    pb.finish_and_clear();
     tracing::info!(
         frames = frames.len(),
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
