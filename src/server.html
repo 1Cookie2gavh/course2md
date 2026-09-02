@@ -102,6 +102,7 @@ a { color: var(--link); }
       </select>
     </label>
     <label><input type="checkbox" id="llm" checked> LLM 润色</label>
+    <label title="同一视频（B站 BV 号 / YouTube id / 本地文件名）已转换过或在队列中时自动跳过"><input type="checkbox" id="dedup" checked> 启用去重</label>
   </div>
   <button class="btn-primary" id="start">🚀 开始转换</button>
   <span class="muted" id="startHint"></span>
@@ -220,7 +221,10 @@ function loadOutputs(){
       if(o.has_md) links.push(`<a href="/api/output/${enc}/course.md" target="_blank">md</a>`);
       if(o.has_html) links.push(`<a href="/api/output/${enc}/course.html" target="_blank">html</a>`);
       const stats = `${o.screenshots!=null?o.screenshots:0} 图 / ${o.segments!=null?o.segments:0} 段 / ${fmtDur(o.duration)}`;
-      tr.innerHTML = `<td>${esc(o.title)}<br><span class="muted">${esc(o.path)}</span></td>
+      // 位置行显示 平台/输出id（标题列已展示标题，避免重复整条路径）
+      const relParts = (o.rel||'').split('/').filter(Boolean);
+      const loc = relParts.length >= 2 ? relParts[0] + '/' + relParts[relParts.length-1] : (o.rel||'');
+      tr.innerHTML = `<td title="${esc(o.title)}">${esc(o.title)}<br><span class="muted" title="${esc(o.path)}">${esc(loc)}</span></td>
         <td class="muted">${esc(o.summary || (o.has_summary ? '（有总结）' : '（无总结）'))}</td>
         <td>${esc(stats)}</td>
         <td>${links.join(' ')} <button class="del-btn" data-rel="${esc(o.rel)}" data-title="${esc(o.title)}">删除</button></td>`;
@@ -269,13 +273,19 @@ function notify(title, body){
 $('start').onclick = () => {
   const sources = $('sources').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if(!sources.length){ alert('请先输入至少一个视频链接或路径'); return; }
-  const body = { sources, provider: $('provider').value, llm: $('llm').checked };
+  const body = { sources, provider: $('provider').value, llm: $('llm').checked, dedup: $('dedup').checked };
   const out = $('out').value.trim();
   if(out) body.out = out;
   fetch('/api/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
       $('sources').value = '';
-      $('startHint').textContent = '已加入队列：' + (d.ids||[]).join(', ');
+      const parts = [];
+      if((d.ids||[]).length) parts.push('已加入队列 ' + d.ids.length + ' 个：' + d.ids.join(', '));
+      if((d.skipped||[]).length){
+        parts.push('⏭ 跳过重复 ' + d.skipped.length + ' 个：'
+          + d.skipped.map(s=>s.source + '：' + s.reason).join('；'));
+      }
+      $('startHint').textContent = parts.length ? parts.join('。') : '（全部被跳过，无新任务）';
       loadTasks();
     }).catch(e=>alert('提交失败：'+e));
 };

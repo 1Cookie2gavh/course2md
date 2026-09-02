@@ -519,15 +519,74 @@ fn handle(mgr: &Arc<Manager>, mut request: tiny_http::Request) {
             let out_dir = v.get("out").and_then(|x| x.as_str()).map(|s| s.to_string());
             let provider = v.get("provider").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let llm = v.get("llm").and_then(|x| x.as_bool());
+            // 去重：默认开启。同一视频（bilibili BV 号 / YouTube id / 本地文件名）
+            // 已有转换输出或在队列中 → 跳过并提示，不重复建任务。
+            let dedup = v.get("dedup").and_then(|x| x.as_bool()).unwrap_or(true);
             if sources.is_empty() {
                 let _ = request.respond(json_response(400, "{\"error\":\"sources 为空\"}".into()));
                 return;
             }
-            let mut ids = vec![];
-            for s in &sources {
-                ids.push(mgr.push(s, out_dir.clone(), &provider, llm));
+            // 已转换输出的去重键：id 目录名 -> rel；local 平台另记 标题目录 -> rel
+            let mut existing: std::collections::HashMap<String, String> = Default::default();
+            let mut local_titles: std::collections::HashMap<String, String> = Default::default();
+            let mut queued_keys: std::collections::HashSet<String> = Default::default();
+            if dedup {
+                let cfg = crate::settings::load().unwrap_or_default();
+                let scan_root = out_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .or_else(|| cfg.defaults.out.clone())
+                    .unwrap_or_else(|| PathBuf::from("out"));
+                scan_output_keys(&scan_root, &mut existing, &mut local_titles);
+                for t in mgr.tasks.lock().unwrap().iter() {
+                    if (t.status == "queued" || t.status == "running")
+                        && let Some(k) = source_key(&t.source)
+                    {
+                        queued_keys.insert(k);
+                    }
+                }
             }
-            let _ = request.respond(ok_json(&serde_json::json!({"ids": ids})));
+            let mut ids = vec![];
+            let mut skipped: Vec<serde_json::Value> = vec![];
+            for s in &sources {
+                let dup_path = source_key(s)
+                    .and_then(|k| existing.get(&k).cloned())
+                    .or_else(|| {
+                        if source_looks_local(s) {
+                            Path::new(s)
+                                .file_stem()
+                                .and_then(|x| local_titles.get(&x.to_string_lossy().into_owned()).cloned())
+                        } else {
+                            None
+                        }
+                    });
+                if dedup {
+                    if let Some(p) = dup_path {
+                        skipped.push(serde_json::json!({
+                            "source": s,
+                            "reason": format!("已存在转换输出（{p}），自动跳过"),
+                        }));
+                        continue;
+                    }
+                    if let Some(k) = source_key(s)
+                        && queued_keys.contains(&k)
+                    {
+                        skipped.push(serde_json::json!({
+                            "source": s,
+                            "reason": "已在任务队列中，自动跳过",
+                        }));
+                        continue;
+                    }
+                }
+                ids.push(mgr.push(s, out_dir.clone(), &provider, llm));
+                // 本批次内后续重复行也视为“已在队列中”（同一次粘贴了相同视频）
+                if dedup
+                    && let Some(k) = source_key(s)
+                {
+                    queued_keys.insert(k);
+                }
+            }
+            let _ = request.respond(ok_json(&serde_json::json!({"ids": ids, "skipped": skipped})));
         }
         (tiny_http::Method::Get, "/api/config") => {
             let cfg = crate::settings::load().unwrap_or_default();
@@ -701,6 +760,22 @@ fn handle(mgr: &Arc<Manager>, mut request: tiny_http::Request) {
             }
             match std::fs::remove_dir_all(&canon_target) {
                 Ok(()) => {
+                    // 删除后逐级清理空的父目录（标题层 / 平台层），直到输出根
+                    let mut cur = canon_target.parent();
+                    while let Some(p) = cur {
+                        if p == canon_root || !p.starts_with(&canon_root) {
+                            break;
+                        }
+                        let empty = std::fs::read_dir(p)
+                            .map(|mut it| it.next().is_none())
+                            .unwrap_or(false);
+                        if empty {
+                            let _ = std::fs::remove_dir(p);
+                            cur = p.parent();
+                        } else {
+                            break;
+                        }
+                    }
                     let _ = request.respond(ok_json(&serde_json::json!({"ok": true, "deleted": target.display().to_string()})));
                 }
                 Err(e) => {
@@ -722,6 +797,10 @@ fn collect_outputs(root: &Path, dir: &Path, out: &mut Vec<serde_json::Value>, de
         let title = dir
             .parent()
             .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let id = dir
+            .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let has_md = dir.join("course.md").is_file();
@@ -757,6 +836,7 @@ fn collect_outputs(root: &Path, dir: &Path, out: &mut Vec<serde_json::Value>, de
             .unwrap_or(0.0);
         out.push(serde_json::json!({
             "title": title,
+            "id": id,
             "path": dir.display().to_string(),
             "rel": rel,
             "has_md": has_md,
@@ -773,6 +853,128 @@ fn collect_outputs(root: &Path, dir: &Path, out: &mut Vec<serde_json::Value>, de
         for e in entries.flatten() {
             if e.path().is_dir() {
                 collect_outputs(root, &e.path(), out, depth + 1);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- dedup keys
+
+/// 判断来源更像本地文件路径（非 URL、非裸 BV 号）。
+fn source_looks_local(s: &str) -> bool {
+    !s.starts_with("http://") && !s.starts_with("https://") && !s.starts_with("BV")
+}
+
+/// 从来源提取去重键：bilibili（含 b23.tv、裸 BV 号）→ BV 号；
+/// YouTube（watch?v= / youtu.be/ / shorts/ / embed/）→ 11 位视频 id；
+/// 本地文件 → 文件主名（不含扩展名）。
+/// 无法识别（如 b23.tv 短链不含 BV）→ None，不做去重。
+fn source_key(source: &str) -> Option<String> {
+    let s = source.trim();
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("BV") {
+        let lower = s.to_lowercase();
+        if lower.contains("bilibili") || lower.contains("b23.tv") || s.starts_with("BV") {
+            return extract_bv(s);
+        }
+        if lower.contains("youtube") || lower.contains("youtu.be") {
+            return extract_yt(s);
+        }
+        return None;
+    }
+    Path::new(s)
+        .file_stem()
+        .map(|x| x.to_string_lossy().into_owned())
+        .filter(|x| !x.is_empty())
+}
+
+fn extract_bv(s: &str) -> Option<String> {
+    let idx = s.find("BV")?;
+    let mut out = String::new();
+    for c in s[idx..].chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            if out.len() == 12 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if out.len() >= 10 && out.starts_with("BV1") {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn extract_yt(s: &str) -> Option<String> {
+    for marker in ["youtu.be/", "v=", "shorts/", "embed/"] {
+        if let Some(idx) = s.find(marker) {
+            let rest = &s[idx + marker.len()..];
+            let mut out = String::new();
+            for c in rest.chars() {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    out.push(c);
+                    if out.len() == 11 {
+                        return Some(out);
+                    }
+                } else {
+                    break;
+                }
+            }
+            if out.len() == 11 {
+                return Some(out);
+            }
+        }
+    }
+    None
+}
+
+/// 扫描输出根目录收集去重键：`existing` = 输出 id 目录名 → rel；
+/// `local_titles` = local 平台下 标题目录 → rel。
+/// 只进入不含 timeline.jsonl 的目录（输出目录不再下钻，避免扫 frames 大目录）。
+fn scan_output_keys(
+    root: &Path,
+    existing: &mut std::collections::HashMap<String, String>,
+    local_titles: &mut std::collections::HashMap<String, String>,
+) {
+    if !root.is_dir() {
+        return;
+    }
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut stack = vec![canon_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if p.join("timeline.jsonl").is_file() {
+                let Some(id) = p.file_name().map(|x| x.to_string_lossy().into_owned()) else {
+                    continue;
+                };
+                let rel = p
+                    .strip_prefix(&canon_root)
+                    .map(|r| {
+                        r.components()
+                            .map(|c| c.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    })
+                    .unwrap_or_else(|_| p.display().to_string());
+                existing.insert(id, rel.clone());
+                let is_local = p
+                    .strip_prefix(&canon_root)
+                    .map(|r| r.components().next().map(|c| c.as_os_str() == "local").unwrap_or(false))
+                    .unwrap_or(false);
+                if is_local
+                    && let Some(title) = p.parent().and_then(|x| x.file_name())
+                {
+                    local_titles.insert(title.to_string_lossy().into_owned(), rel);
+                }
+            } else {
+                stack.push(p);
             }
         }
     }
@@ -948,6 +1150,74 @@ pub fn status() -> Result<()> {
             println!("course2md server 未在运行");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_key_bilibili_url() {
+        let url = "https://www.bilibili.com/video/BV1pb8o6yE8f/?spm_id_from=333.1007";
+        assert_eq!(source_key(url).as_deref(), Some("BV1pb8o6yE8f"));
+    }
+
+    #[test]
+    fn dedup_key_bare_bv() {
+        assert_eq!(source_key("BV1aKSZBME7V").as_deref(), Some("BV1aKSZBME7V"));
+    }
+
+    #[test]
+    fn dedup_key_youtube_forms() {
+        assert_eq!(
+            source_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1s").as_deref(),
+            Some("dQw4w9WgXcQ")
+        );
+        assert_eq!(
+            source_key("https://youtu.be/dQw4w9WgXcQ").as_deref(),
+            Some("dQw4w9WgXcQ")
+        );
+        assert_eq!(
+            source_key("https://www.youtube.com/shorts/dQw4w9WgXcQ").as_deref(),
+            Some("dQw4w9WgXcQ")
+        );
+    }
+
+    #[test]
+    fn dedup_key_local_file() {
+        assert_eq!(source_key(r"C:\videos\消防演练.mp4").as_deref(), Some("消防演练"));
+        assert_eq!(source_key("D:\\下载\\a_b.mp4").as_deref(), Some("a_b"));
+        assert_eq!(source_key("no_ext").as_deref(), Some("no_ext"));
+    }
+
+    #[test]
+    fn dedup_key_unrecognized_returns_none() {
+        assert!(source_key("https://www.bilibili.com/video/BV1pb8o6yE8f/").is_some());
+        assert!(source_key("https://example.com/some/page").is_none());
+        assert!(source_key("https://b23.tv/AbCdEf").is_none());
+    }
+
+    #[test]
+    fn dedup_scan_output_keys_local_and_remote() {
+        let tmp = std::env::temp_dir().join(format!("c2m_dedup_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mk = |rel: &str| {
+            let d = tmp.join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("timeline.jsonl"), "").unwrap();
+            d
+        };
+        mk("bilibili/消防演练/BV1aKSZBME7V");
+        mk("local/web 测试/web_test-406484cb");
+        let mut existing = std::collections::HashMap::new();
+        let mut titles = std::collections::HashMap::new();
+        scan_output_keys(&tmp, &mut existing, &mut titles);
+        assert_eq!(existing.get("BV1aKSZBME7V").map(String::as_str), Some("bilibili/消防演练/BV1aKSZBME7V"));
+        assert_eq!(existing.get("web_test-406484cb").map(String::as_str), Some("local/web 测试/web_test-406484cb"));
+        assert_eq!(titles.get("web 测试").map(String::as_str), Some("local/web 测试/web_test-406484cb"));
+        assert!(!titles.contains_key("消防演练"), "bilibili 平台标题不应进入 local 标题集合");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
