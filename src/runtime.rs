@@ -138,14 +138,26 @@ pub fn wait_ready(
 }
 
 /// 在 PATH 上查找可执行文件（Windows 自动尝试 .exe 后缀）。
+/// PATH 找不到时兜底查找当前可执行文件所在目录：course2md 与 ffmpeg/ffprobe/
+/// llama-server/yt-dlp 常同目录部署（tools\bin），而后台守护进程继承的 PATH
+/// 可能不含该目录（如从脚本/受限环境 `server start` 拉起）。
 pub fn which(cmd: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
     let names: Vec<String> = if cfg!(windows) {
         vec![cmd.to_string(), format!("{cmd}.exe")]
     } else {
         vec![cmd.to_string()]
     };
-    std::env::split_paths(&path)
+    let mut search: Vec<PathBuf> = vec![];
+    if let Some(path) = std::env::var_os("PATH") {
+        search.extend(std::env::split_paths(&path));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        search.push(dir.to_path_buf());
+    }
+    search
+        .into_iter()
         .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
         .find(|p| is_executable(p))
 }
