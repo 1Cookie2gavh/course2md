@@ -207,8 +207,31 @@ pub async fn run(cfg: &PipelineConfig, media: &Path) -> Result<Vec<FrameEvent>> 
     let frames_dir = cfg.frames_dir();
     tokio::fs::create_dir_all(&frames_dir).await?;
     let t0 = std::time::Instant::now();
-    let times = sample_timestamps(cfg, media).await?;
-    anyhow::ensure!(!times.is_empty(), "未采样到任何帧");
+    let mut times = sample_timestamps(cfg, media).await?;
+    if times.is_empty() {
+        // 画面变化少的视频（访谈/对话/单一场景/快剪）：SSIM 检不出稳定的幻灯片。
+        // 兜底按固定间隔抽帧，保证截图与分段字幕照常产出，不再整条任务失败。
+        let info = media::probe_video(media)
+            .await
+            .context("ffprobe 无法读取视频信息")?;
+        let dur = info.duration.max(1.0);
+        let cooldown = cfg.cooldown.max(1.0);
+        // 帧数上限 120，间隔不小于 cooldown
+        let step = (dur / 120.0).ceil().max(cooldown);
+        let mut t = 0.0;
+        while t < dur - 0.25 {
+            times.push((t, t));
+            t += step;
+        }
+        if times.is_empty() {
+            times.push((0.0, 0.0));
+        }
+        tracing::warn!(
+            count = times.len(),
+            step = format_args!("{step:.1}s"),
+            "SSIM 未检出幻灯片，改用固定间隔抽帧兜底"
+        );
+    }
 
     let pb = ProgressBar::new(times.len() as u64);
     pb.set_style(

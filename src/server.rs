@@ -741,27 +741,52 @@ pub fn start(base_port: u16) -> Result<u16> {
     Ok(port)
 }
 
-/// `server stop`：停止后台守护进程。
+/// `server stop`：停止后台守护进程（健康检查优先于 pid 探测，避免误判）。
 pub fn stop() -> Result<()> {
     match load_state() {
-        Some(s) => match s.pid {
-            Some(pid) if pid_alive(pid) => {
-                kill_pid(pid)?;
-                clear_state();
-                println!("已停止 course2md server（PID {pid}）");
-                Ok(())
+        Some(s) => {
+            let port = s.port;
+            let healthy = port.map(|p| {
+                ureq::get(&format!("http://127.0.0.1:{p}/api/health"))
+                    .timeout(Duration::from_secs(2))
+                    .call()
+                    .map(|r| r.status() == 200)
+                    .unwrap_or(false)
+            }).unwrap_or(false);
+            match s.pid {
+                Some(pid) if pid_alive(pid) || healthy => {
+                    let _ = kill_pid(pid);
+                    // 若 taskkill 失败但健康端点还通，进程仍在：再试一次兜底
+                    if healthy {
+                        for _ in 0..5 {
+                            let still = ureq::get(&format!("http://127.0.0.1:{}/api/health", port.unwrap_or(0)))
+                                .timeout(Duration::from_secs(1))
+                                .call()
+                                .map(|r| r.status() == 200)
+                                .unwrap_or(false);
+                            if !still {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(300));
+                            let _ = kill_pid(pid);
+                        }
+                    }
+                    clear_state();
+                    println!("已停止 course2md server（PID {pid}）");
+                    Ok(())
+                }
+                Some(pid) => {
+                    clear_state();
+                    println!("PID {pid} 已不在运行（已清理过期状态）");
+                    Ok(())
+                }
+                None => {
+                    clear_state();
+                    println!("未找到运行中的服务");
+                    Ok(())
+                }
             }
-            Some(pid) => {
-                clear_state();
-                println!("PID {pid} 已不在运行（已清理过期状态）");
-                Ok(())
-            }
-            None => {
-                clear_state();
-                println!("未找到运行中的服务");
-                Ok(())
-            }
-        },
+        }
         None => {
             println!("未找到运行中的服务（无状态文件）");
             Ok(())
