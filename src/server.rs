@@ -307,24 +307,35 @@ fn run_conversion(mgr: &Arc<Manager>, id: u64, _source: &str, args: &[String]) {
     }
 }
 
-/// 从转换输出中解析 "Stats: N screenshots / M speech segments / ..."。
+/// 从转换输出中解析截图/语音统计（兼容 v1.3.0「统计: N 张截图 / M 段语音」与旧「Stats: …」）。
 fn parse_stats(log: &str) -> (Option<u32>, Option<u32>) {
     for line in log.lines() {
+        if let Some(pos) = line.find("统计:") {
+            let rest = &line[pos + 3..];
+            let shots = rest
+                .split("张截图")
+                .next()
+                .and_then(|s| s.split_whitespace().last().and_then(|v| v.parse::<u32>().ok()));
+            let segs = rest.find("段语音").and_then(|p| {
+                rest[..p]
+                    .rsplit('/')
+                    .next()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+            });
+            return (shots, segs);
+        }
         if let Some(pos) = line.find("Stats:") {
             let rest = &line[pos + 6..];
             let shots = rest
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.trim_end_matches("screenshots").trim().parse::<u32>().ok());
-            // find "/ N speech segments"
-            let segs = rest
-                .find("speech segments")
-                .and_then(|p| {
-                    rest[..p]
-                        .rsplit('/')
-                        .next()
-                        .and_then(|s| s.trim().parse::<u32>().ok())
-                });
+            let segs = rest.find("speech segments").and_then(|p| {
+                rest[..p]
+                    .rsplit('/')
+                    .next()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+            });
             return (shots, segs);
         }
     }
