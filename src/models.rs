@@ -128,6 +128,24 @@ pub async fn download_models(root: &Path) -> Result<()> {
 /// 下载重试次数（2.4GB 大文件，网络抖动/代理断流常见）。
 const DOWNLOAD_ATTEMPTS: usize = 3;
 
+/// 4xx（除 429 限流）是确定性错误（鉴权失败/路径错/镜像缺文件），
+/// 退避重试无意义——来自 PR #9 的重试分类思路。
+fn is_permanent_status(code: u16) -> bool {
+    code != 429 && (400..500).contains(&code)
+}
+
+/// 确定性 HTTP 错误标记：重试循环见此类型直接失败。
+#[derive(Debug)]
+struct PermanentHttp(String);
+
+impl std::fmt::Display for PermanentHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PermanentHttp {}
+
 async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
     if dest.is_file() && file_complete(dest) {
         tracing::info!(label, "skip existing");
@@ -172,6 +190,10 @@ async fn download_file(url: &str, dest: &Path, label: &str) -> Result<()> {
             match download_once(&agent, &url, &tmp, &dest, &label) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
+                    // 确定性 HTTP 错误（4xx≠429）不再退避重试
+                    if e.downcast_ref::<PermanentHttp>().is_some() {
+                        return Err(e);
+                    }
                     // 保留 .part：日志给出断点位置；当前实现重跑会从头下载
                     tracing::warn!(
                         label = %label,
@@ -198,7 +220,21 @@ fn download_once(
     label: &str,
 ) -> Result<()> {
     tracing::info!(label = %label, url = %url, "download");
-    let resp = agent.get(url).call().context("请求失败")?;
+    let resp = match agent.get(url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, resp)) => {
+            // 错误信息携带响应体尾部（服务器返回的错误页/JSON 通常是排查关键）
+            let body = resp.into_string().unwrap_or_default();
+            let n = body.chars().count();
+            let tail: String = body.chars().skip(n.saturating_sub(200)).collect();
+            let msg = format!("HTTP {code}: {tail}");
+            if is_permanent_status(code) {
+                return Err(anyhow::anyhow!(PermanentHttp(msg)));
+            }
+            return Err(anyhow::anyhow!("请求失败: {msg}"));
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("请求失败")),
+    };
     let total: u64 = resp
         .header("content-length")
         .and_then(|v| v.parse().ok())
@@ -282,5 +318,17 @@ mod tests {
             "https://hf-mirror.com"
         );
         assert_eq!(hf_base(Some("  ".into())), "https://huggingface.co");
+    }
+
+    #[test]
+    fn permanent_status_classification() {
+        // 确定性错误：不重试
+        for code in [400, 401, 403, 404, 422] {
+            assert!(is_permanent_status(code), "{code} 应直接失败");
+        }
+        // 429 限流与 5xx 服务端错误：值得退避重试
+        for code in [429, 500, 502, 503] {
+            assert!(!is_permanent_status(code), "{code} 应重试");
+        }
     }
 }

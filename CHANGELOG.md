@@ -3,6 +3,15 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 改进
+
+- **模型下载错误分类**：4xx（除 429）确定性错误不再退避重试，直接失败；
+  错误信息携带响应体尾部，镜像 404/鉴权失败一眼可见（思路来自 #9，
+  感谢 @sleepinlava）
+- 模型 manifest 改原子写入，防止半截 JSON
+
 ## [1.3.0] — 2026-09-02
 
 ### 新增
