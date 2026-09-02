@@ -136,6 +136,9 @@ fn resolve_asr_api(opts: &RunOpts, file: &settings::ConfigFile) -> crate::settin
     if let Some(v) = &opts.asr_api_model {
         a.model = v.clone();
     }
+    if let Some(v) = opts.asr_api_mode {
+        a.mode = v;
+    }
     a
 }
 

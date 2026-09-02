@@ -255,7 +255,10 @@ keep_video = false
 
 [asr_api]
 # 云端 STT 配置（--provider api 时使用）
-# OpenAI 兼容 /audio/transcriptions 端点
+# base_url 可指向任何 OpenAI 兼容端点（自建网关、DeepInfra、Groq 等均可）
+#mode = "transcriptions"   # transcriptions = POST {base_url}/audio/transcriptions（默认，专用转录端点）
+                           # chat = POST {base_url}/chat/completions（支持音频输入的多模态 LLM，
+                           #        如 gpt-4o-audio-preview、google/gemini-2.5-flash、qwen2-audio）
 base_url = "https://openrouter.ai/api/v1"
 api_key = "sk-or-v1-xxxxxxxx"
 model = "qwen/qwen3-asr-flash-2026-02-10"
@@ -285,7 +288,10 @@ disable_hint = false
 
 ## 云端 STT 支持 (`--provider api`)
 
-`course2md` 支持接入任意 OpenAI 兼容的 `/audio/transcriptions` 端点，无需本地显卡与大模型下载：
+`course2md` 支持接入任意 OpenAI 兼容端点，无需本地显卡与大模型下载。`base_url` 可指向任何自定义端点（自建网关、DeepInfra、Groq 等）。两种请求模式：
+
+- **`transcriptions`（默认）**：POST `{base_url}/audio/transcriptions`，专用转录端点。
+- **`chat`**：POST `{base_url}/chat/completions`（`input_audio` 音频输入），让支持音频的多模态 LLM 直接转录，如 `gpt-4o-audio-preview`、`google/gemini-2.5-flash`、`qwen2-audio`。
 
 - **推荐服务**：OpenRouter 托管的 `qwen/qwen3-asr-flash-2026-02-10`（约 $0.000035 / 秒音频）。
 - **兼容模型**：支持 `openai/whisper-large-v3-turbo`、`qwen/qwen3-asr-1.7b` 等。
@@ -298,6 +304,15 @@ course2md https://... --provider api
 
 # 命令行即时覆盖模型
 course2md https://... --provider api --asr-api-model openai/whisper-large-v3-turbo
+
+# 自定义端点：base_url 指向任何 OpenAI 兼容服务
+course2md https://... --provider api \
+  --asr-api-base-url https://your-gateway.example.com/v1 \
+  --asr-api-model whisper-large-v3
+
+# 音频多模态 LLM（chat 模式）
+course2md https://... --provider api --asr-api-mode chat \
+  --asr-api-model google/gemini-2.5-flash
 ```
 
 > **隐私提示**：使用 `--provider api` 时，语音切片将上传至所配置的云端服务完成转写；视频截图、SSIM 画面分析与 VAD 静音切分仍全部在本地执行。

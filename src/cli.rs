@@ -90,6 +90,10 @@ pub struct RunOpts {
     #[arg(long)]
     pub asr_api_model: Option<String>,
 
+    /// Cloud STT request mode: transcriptions (/audio/transcriptions, default) | chat (/chat/completions, for audio-capable LLMs)
+    #[arg(long, value_enum)]
+    pub asr_api_mode: Option<crate::settings::AsrApiMode>,
+
     /// Transcript source: auto (subtitle first, then ASR) | subtitle | asr
     #[arg(long, value_enum)]
     pub transcript_source: Option<crate::config::TranscriptSource>,

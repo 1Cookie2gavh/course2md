@@ -86,7 +86,9 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
     use crate::config::AsrProvider;
 
     if cfg.provider == AsrProvider::Api {
-        let id = AsrIdentity::new("api", &cfg.asr_api.model, cfg.max_speech);
+        // 同一模型在 transcriptions / chat 两种端点下的输出可能不同，身份须含模式
+        let model_id = format!("{}:{}", cfg.asr_api.mode, cfg.asr_api.model);
+        let id = AsrIdentity::new("api", &model_id, cfg.max_speech);
         let api = cfg.asr_api.clone();
         let max_speech = cfg.max_speech as f64;
         let wav = wav.to_path_buf();
@@ -305,10 +307,11 @@ fn run_api(
     }
 
     let tmp = crate::runtime::TempWorkDir::new("asr")?;
-    let url = format!(
-        "{}/audio/transcriptions",
-        api.base_url.trim().trim_end_matches('/')
-    );
+    let base = api.base_url.trim().trim_end_matches('/');
+    let url = match api.mode {
+        crate::settings::AsrApiMode::Transcriptions => format!("{base}/audio/transcriptions"),
+        crate::settings::AsrApiMode::Chat => format!("{base}/chat/completions"),
+    };
     let pb = indicatif::ProgressBar::new(segs.len() as u64);
     pb.set_style(
         indicatif::ProgressStyle::with_template(
@@ -336,8 +339,14 @@ fn run_api(
     std::thread::scope(|s| {
         for _ in 0..WORKERS {
             let tx = tx.clone();
-            let (client, url, model, key, tmp_dir, wav) =
-                (&client, &url, &api.model, &api_key, tmp.path(), wav);
+            let target = ApiTarget {
+                client: &client,
+                url: &url,
+                model: &api.model,
+                key: &api_key,
+                mode: api.mode,
+            };
+            let (tmp_dir, wav) = (tmp.path(), wav);
             let (segs, pending, next, abort) = (&segs, &pending, &next, &abort);
             s.spawn(move || loop {
                 if abort.load(std::sync::atomic::Ordering::Relaxed) {
@@ -349,10 +358,7 @@ fn run_api(
                 };
                 let seg = segs[i];
                 let r = transcribe_api(
-                    client,
-                    url,
-                    model,
-                    key,
+                    &target,
                     &tmp_dir.join(format!("c{i:04}.wav")),
                     seg,
                     wav,
@@ -440,12 +446,22 @@ fn post_json_retry(
     unreachable!()
 }
 
+/// chat 模式下让多模态 LLM 转录的指令（保持与本地 ASR 输出风格一致：忠实、带自然标点）。
+const CHAT_TRANSCRIBE_PROMPT: &str = "请将这段音频转录为文字。只输出转录内容本身（保留自然标点），\
+不要添加任何解释、概括或格式标记。若没有语音内容，输出空字符串。";
+
+/// 云端转录端点：地址、凭据与请求模式（worker 间共享借用）。
+struct ApiTarget<'a> {
+    client: &'a ureq::Agent,
+    url: &'a str,
+    model: &'a str,
+    key: &'a str,
+    mode: crate::settings::AsrApiMode,
+}
+
 /// 转写单个 chunk；Ok(None) = 无语音内容。
 fn transcribe_api(
-    client: &ureq::Agent,
-    url: &str,
-    model: &str,
-    key: &str,
+    t: &ApiTarget,
     chunk: &Path,
     seg: Seg,
     wav: &Path,
@@ -455,11 +471,24 @@ fn transcribe_api(
     let bytes =
         std::fs::read(chunk).with_context(|| format!("读取 chunk {}", chunk.display()))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let body = serde_json::json!({
-        "model": model,
-        "input_audio": {"data": b64, "format": "wav"},
-    });
-    let v = post_json_retry(client, url, Some(key), &body)?;
+    let body = match t.mode {
+        crate::settings::AsrApiMode::Transcriptions => serde_json::json!({
+            "model": t.model,
+            "input_audio": {"data": b64, "format": "wav"},
+        }),
+        crate::settings::AsrApiMode::Chat => serde_json::json!({
+            "model": t.model,
+            "temperature": 0.0,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": CHAT_TRANSCRIBE_PROMPT},
+                    {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}},
+                ],
+            }],
+        }),
+    };
+    let v = post_json_retry(t.client, t.url, Some(t.key), &body)?;
     if let Some(e) = v
         .get("error")
         .and_then(|e| e.get("message"))
@@ -467,9 +496,33 @@ fn transcribe_api(
     {
         anyhow::bail!("API 报错: {e}");
     }
-    let text = v["text"].as_str().unwrap_or("").trim().to_string();
+    let text = match t.mode {
+        crate::settings::AsrApiMode::Transcriptions => {
+            v["text"].as_str().unwrap_or("").trim().to_string()
+        }
+        crate::settings::AsrApiMode::Chat => parse_chat_content(&v).trim().to_string(),
+    };
     let _ = std::fs::remove_file(chunk);
     Ok(if text.is_empty() { None } else { Some(text) })
+}
+
+/// 从 chat/completions 响应取文本：content 通常是字符串；部分多模态端点
+/// 返回 [{type:"text", text:...}] 分片数组，拼起来即可。
+fn parse_chat_content(v: &serde_json::Value) -> String {
+    let content = &v["choices"][0]["message"]["content"];
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
 }
 
 fn find_llama_server() -> Result<PathBuf> {
@@ -821,5 +874,21 @@ mod tests {
         assert_eq!(sanitize_qwen_text("内容</asr_text>尾巴"), "内容");
         let s = invert_silence(10.0, &[(0.0, 1.0), (4.0, 5.0)]);
         assert!((s[0].0 - 1.0).abs() < 1e-6 && (s[0].1 - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chat_content_parsing() {
+        // 字符串形式（主流 OpenAI 兼容端点）
+        let v = serde_json::json!({"choices":[{"message":{"content":"你好世界"}}]});
+        assert_eq!(parse_chat_content(&v), "你好世界");
+        // 分片数组形式（部分多模态端点）
+        let v = serde_json::json!({"choices":[{"message":{"content":[
+            {"type":"text","text":"你好"},
+            {"type":"text","text":"世界"}
+        ]}}]});
+        assert_eq!(parse_chat_content(&v), "你好世界");
+        // 缺字段/异常响应 → 空串（调用方按无语音处理）
+        let v = serde_json::json!({"choices":[]});
+        assert_eq!(parse_chat_content(&v), "");
     }
 }

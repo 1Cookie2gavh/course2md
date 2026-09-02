@@ -255,7 +255,10 @@ keep_video = false
 
 [asr_api]
 # Cloud STT settings (used when --provider api)
-# OpenAI-compatible /audio/transcriptions endpoint
+# base_url can point to any OpenAI-compatible endpoint (self-hosted gateway, DeepInfra, Groq, ...)
+#mode = "transcriptions"   # transcriptions = POST {base_url}/audio/transcriptions (default, dedicated STT endpoint)
+                           # chat = POST {base_url}/chat/completions (audio-capable multimodal LLMs,
+                           #        e.g. gpt-4o-audio-preview, google/gemini-2.5-flash, qwen2-audio)
 base_url = "https://openrouter.ai/api/v1"
 api_key = "sk-or-v1-xxxxxxxx"
 model = "qwen/qwen3-asr-flash-2026-02-10"
@@ -283,9 +286,12 @@ disable_hint = false
 
 ---
 
-## Cloud STT via OpenRouter (`--provider api`)
+## Cloud STT (`--provider api`)
 
-`course2md` supports transcribing via any OpenAI-compatible `/audio/transcriptions` endpoint without requiring local GPU or ASR model downloads:
+`course2md` can transcribe via any OpenAI-compatible endpoint — no local GPU or ASR model download required. `base_url` accepts any custom endpoint (self-hosted gateway, DeepInfra, Groq, ...). Two request modes:
+
+- **`transcriptions` (default)**: POST `{base_url}/audio/transcriptions`, dedicated transcription endpoint.
+- **`chat`**: POST `{base_url}/chat/completions` with `input_audio` payloads — let audio-capable multimodal LLMs transcribe directly, e.g. `gpt-4o-audio-preview`, `google/gemini-2.5-flash`, `qwen2-audio`.
 
 - **Default Provider**: OpenRouter with `qwen/qwen3-asr-flash-2026-02-10` (~$0.000035/second of audio).
 - **Other Models**: Supports `openai/whisper-large-v3-turbo`, `qwen/qwen3-asr-1.7b`, etc.
@@ -298,6 +304,15 @@ course2md https://... --provider api
 
 # Override model or endpoint via CLI
 course2md https://... --provider api --asr-api-model openai/whisper-large-v3-turbo
+
+# Custom endpoint: point base_url at any OpenAI-compatible service
+course2md https://... --provider api \
+  --asr-api-base-url https://your-gateway.example.com/v1 \
+  --asr-api-model whisper-large-v3
+
+# Audio-capable multimodal LLM (chat mode)
+course2md https://... --provider api --asr-api-mode chat \
+  --asr-api-model google/gemini-2.5-flash
 ```
 
 > **Privacy Note**: With `--provider api`, speech audio chunks are uploaded to the specified cloud endpoint for transcription. Video frames, OCR/SSIM, and VAD segmentation remain strictly local.

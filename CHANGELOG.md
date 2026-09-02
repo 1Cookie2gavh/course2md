@@ -3,7 +3,14 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [1.3.0] — 2026-09-02
+
+### 新增
+
+- **云端 STT 支持 chat 模式**：`[asr_api] mode = "chat"`（或 `--asr-api-mode chat`）
+  走 OpenAI 兼容 `/chat/completions`（`input_audio` 音频输入），可直接用
+  gpt-4o-audio-preview、Gemini、Qwen2-Audio 等支持音频的多模态 LLM 转录；
+  `base_url` 自定义端点用法补充进用户文档
 
 ### 修复（全面代码审查，详见 docs/REVIEW.md）
 

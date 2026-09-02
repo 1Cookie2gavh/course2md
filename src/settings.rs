@@ -31,13 +31,35 @@ pub struct Defaults {
     pub resume: Option<bool>,
 }
 
-/// 云端 STT（provider = "api"，OpenAI 兼容 /audio/transcriptions，如 OpenRouter）。
+/// 云端 STT 的请求模式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AsrApiMode {
+    /// POST {base_url}/audio/transcriptions（OpenAI 兼容转录端点，如 OpenRouter 的 qwen3-asr）
+    #[default]
+    Transcriptions,
+    /// POST {base_url}/chat/completions（支持音频输入的多模态 LLM，
+    /// 如 gpt-4o-audio-preview、Gemini、Qwen2-Audio 等 OpenAI 兼容端点）
+    Chat,
+}
+
+impl std::fmt::Display for AsrApiMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Transcriptions => "transcriptions",
+            Self::Chat => "chat",
+        })
+    }
+}
+
+/// 云端 STT（provider = "api"，OpenAI 兼容端点，如 OpenRouter）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AsrApi {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub mode: AsrApiMode,
 }
 
 impl Default for AsrApi {
@@ -46,6 +68,7 @@ impl Default for AsrApi {
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key: String::new(),
             model: "qwen/qwen3-asr-flash-2026-02-10".into(),
+            mode: AsrApiMode::Transcriptions,
         }
     }
 }
@@ -178,11 +201,14 @@ pub const TEMPLATE: &str = r#"# course2md 配置文件
 #keep_video = false
 
 [asr_api]
-# 云端 STT（--provider api，OpenAI 兼容 /audio/transcriptions；OpenRouter 聚合多模型）
+# 云端 STT（--provider api）。base_url 可指向任何 OpenAI 兼容端点（自定义端点）。
+#mode = "transcriptions"   # transcriptions = POST /audio/transcriptions（默认，专用转录端点）
+                            # chat = POST /chat/completions（支持音频输入的多模态 LLM，
+                            #        如 gpt-4o-audio-preview、google/gemini-2.5-flash、qwen2-audio）
 #base_url = "https://openrouter.ai/api/v1"
 #api_key = "sk-or-..."
 #model = "qwen/qwen3-asr-flash-2026-02-10"
-# 其他常用模型：openai/whisper-large-v3-turbo、qwen/qwen3-asr-1.7b
+# 其他常用模型：openai/whisper-large-v3-turbo、qwen/qwen3-asr-1.7b（transcriptions 模式）
 
 [llm]
 # LLM 字幕润色（默认关闭）。运行 `course2md llm setup` 可交互式配置。
