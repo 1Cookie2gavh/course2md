@@ -49,19 +49,21 @@ pub struct SubtitleFetch {
 pub async fn fetch_subtitle(url: &str, out_dir: &Path) -> Result<Option<SubtitleFetch>> {
     let dir = out_dir.join(".subs");
     // 每次重新抓取，避免读到上次运行残留的旧字幕
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = tokio::fs::remove_dir_all(&dir).await;
     tokio::fs::create_dir_all(&dir).await?;
     let tmpl = dir.join("sub");
     for auto in [false, true] {
         let mut cmd = Command::new("yt-dlp");
         cmd.args([
             "--skip-download",
+            // 转为 srt：pick_subtitle_file（subtitle.rs）只认 .srt，两处约定需保持一致
             "--convert-subs",
             "srt",
             "--sub-format",
             "srt/vtt/best",
             "--sub-langs",
-            "zh.*,en.*",
+            // 语言偏好与 subtitle.rs 的 lang_rank 同源
+            crate::subtitle::SUB_LANGS,
             "-o",
         ])
         .arg(&tmpl);
@@ -71,8 +73,10 @@ pub async fn fetch_subtitle(url: &str, out_dir: &Path) -> Result<Option<Subtitle
             cmd.arg("--write-subs");
         }
         cmd.arg(url);
-        // 无字幕不是错误（yt-dlp 打 warning 后成功退出）；网络失败也先继续尝试 auto
-        if run(&mut cmd).await.is_err() {
+        // 命令失败（yt-dlp 缺失/网络错误）：记 warn（错误内含 stderr 尾部摘要）后继续尝试 auto；
+        // 命令成功但无产物（平台无字幕，yt-dlp 打 warning 后正常退出）不算错误
+        if let Err(e) = run(&mut cmd).await {
+            tracing::warn!(auto, error = %e, "yt-dlp 字幕抓取失败");
             continue;
         }
         if let Some(path) = crate::subtitle::pick_subtitle_file(&dir) {
@@ -126,7 +130,12 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
             Ok(()) => {
                 // 新版 yt-dlp 在 merge 时会按 --merge-output-format 再补后缀：
                 // -o media.mp4.part 实际产出 media.mp4.part.mp4。两种命名都兼容。
-                let merged = PathBuf::from(format!("{}.mp4", tmp.display()));
+                // OsString 拼接而非 format!("{}", display())：非 UTF-8 路径也能正确处理
+                let merged = {
+                    let mut s = tmp.clone().into_os_string();
+                    s.push(".mp4");
+                    PathBuf::from(s)
+                };
                 let produced = if merged.is_file() {
                     merged
                 } else if tmp.is_file() {
@@ -148,14 +157,7 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
 }
 
 async fn run(cmd: &mut Command) -> Result<String> {
-    let out = cmd.output().await.context("启动子进程失败")?;
-    if !out.status.success() {
-        return Err(crate::error::cmd_error(
-            "yt-dlp",
-            out.status.code(),
-            &String::from_utf8_lossy(&out.stderr),
-        ));
-    }
+    let out = crate::media::run_cmd(cmd, "yt-dlp").await?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 

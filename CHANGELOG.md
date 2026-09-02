@@ -3,6 +3,83 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 改进
+
+- **模型下载错误分类**：4xx（除 429）确定性错误不再退避重试，直接失败；
+  错误信息携带响应体尾部，镜像 404/鉴权失败一眼可见（思路来自 #9，
+  感谢 @sleepinlava）
+- 模型 manifest 改原子写入，防止半截 JSON
+
+## [1.3.0] — 2026-09-02
+
+### 新增
+
+- **云端 STT 支持 chat 模式**：`[asr_api] mode = "chat"`（或 `--asr-api-mode chat`）
+  走 OpenAI 兼容 `/chat/completions`（`input_audio` 音频输入），可直接用
+  gpt-4o-audio-preview、Gemini、Qwen2-Audio 等支持音频的多模态 LLM 转录；
+  `base_url` 自定义端点用法补充进用户文档
+
+### 修复（全面代码审查，详见 docs/REVIEW.md）
+
+- **checkpoint 崩溃恢复自我污染**：resume 打开 append 前先把 asr.jsonl 截断到
+  最后一个完整行，避免半截末行与新记录拼成中间损坏行导致整档作废
+- **Swift 改动不生效**：build.rs 不再用 stamp 文件跳过 `swift build`
+  （SPM 自己做增量），改 shim.swift 后一定重链
+- **api_key 掩码 panic**：非 ASCII key 按字节切片越界，改为按字符截取
+- **字幕 HTML 实体双重反转义**：`&amp;` 移到最后替换，`&amp;lt;` 不再变成 `<`
+- 多处 `partial_cmp().unwrap()` 对 NaN panic 改为 `total_cmp`；
+  字幕解析出口过滤非有限时间戳
+- `unsafe libc::isatty(2)` 改为 `std::io::IsTerminal`（检查 stdin；
+  顺带修复 Windows 编译）
+- 空转写（静音课件）不再发 LLM 总结请求（纯幻觉输出）
+- NPU worker 关闭流程：去掉零等待的 SIGTERM+SIGKILL 叠加，
+  改为 shutdown → 轮询等待 → 进程组 SIGTERM → Drop 兜底
+- **response_format 降级重试只在 400 时触发**（401 不再双发、429 不再放大限流）
+- **总结块改用显式哨兵注释** `<!-- course2md:summary -->`：插入/幂等/删除统一
+  走哨兵；`--force` 不再误删用户在总结后手工追加的内容
+- `fetch_subtitle` 区分「命令失败」（warn 带 stderr）与「平台无字幕」（None）
+- ffprobe 输出改 `-of json` 解析，不再按逗号+空白切文本
+- `display()` 拼路径改为 `OsString` 拼接，非 UTF-8 路径不再损坏
+- CoreML 未知 `--asr-model` 不再静默归为 qwen3，直接报错（与 NPU 后端对齐）
+
+### 改进
+
+- **ASR 层重构**：四个 provider 分支抽 `run_with_cp` 统一 checkpoint 骨架；
+  临时目录改 RAII guard（`TempWorkDir`）；云端 STT 与 llama-server 转写
+  加指数退避重试；`run_api` 手写线程池改 `std::thread::scope`
+  （11 个 Arc clone 全删，错误链保留）
+- **截图抽帧 4 路并发**（JoinSet 限流），长课件抽帧阶段显著提速
+- **checkpoint 身份改用独立 schema 版本**（不再随 course2md patch 版本
+  作废全部 ASR 进度；本次升级会使旧 checkpoint 失效一次）
+- **llama 模型身份单一真相源**：`models::llama_gguf_identity()`，
+  checkpoint identity 与下载逻辑同源
+- **默认值单一来源**：内置默认值收敛为 `config.rs` 顶部常量，
+  main/settings 模板/`config show` 三处共用；`config show` 补齐
+  no_download/resume/stable_secs/max_height/transcript_source 展示
+- **云端 STT 环境变量改名 `COURSE2MD_ASR_API_KEY`**（`OPENROUTER_API_KEY`
+  兼容保留），与可配置 base_url 解耦
+- `settings::save`：Unix 下一步建成 0600（消除明文窗口），覆盖前备份
+  `config.toml.bak`
+- LLM 润色同一 Section 的截图只读盘+base64 一次；重试不再克隆数 MB
+  请求体；summarize map-reduce 4 路并发；总结 prompt 注入视频标题/UP主
+- 2.4GB 模型下载加超时与重试，失败保留 `.part` 并提示
+- `wait_ready` 校验 `/health` 响应体，端口被无关服务抢占不再误判就绪
+- NPU worker 脚本挪出输出目录（进临时目录、原子写入）；
+  worker stderr 不再 inherit 污染进度条
+- 删除死代码：`parse_text_array`、`AsrInput`、NPU base64 分支、
+  Python 默认端口、vendored `mlx.metallib`（3.8MB，由 SPM 构建产物回退）
+- **移除半途而废的 i18n 模块**（help 平行表已漂移且静默失败；
+  界面输出统一为中文，CLI help 保持英文 derive）
+
+### 改进（此前已列入）
+
+- **LLM 请求重试**：网络/TLS 错误、429、5xx 按指数退避重试（1s→2s，含抖动），
+  最多 3 次尝试；4xx（鉴权/参数）快速失败并附服务端返回体
+- **润色真并发**：波次式改为 worker 池抢占取活，消除队头阻塞；
+  并发数可配置（`[llm] concurrency`，默认 4→8，范围 1~16）
+
 ## [1.2.0] — 2026-09-01
 
 ### 新增：视频总结与凭据清理（来自 #7，感谢 @1Cookie2gavh）

@@ -3,6 +3,7 @@
 use crate::fetch::VideoMeta;
 use crate::timeline::Section;
 use anyhow::Result;
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// mm:ss 或 h:mm:ss
@@ -23,32 +24,49 @@ pub fn ts_url(meta: &VideoMeta, sec: f64) -> String {
     format!("{base}{sep}t={}", sec.floor() as u64)
 }
 
+/// md 侧的最小转义策略：标题/作者等内联元信息只 strip 换行（换行会截断 ATX
+/// 标题与列表行）与行首 `#`（防伪造标题）。其余 markdown 特殊字符不转义——
+/// 最坏是渲染偏差，不破坏文档结构；html 侧则由 esc 全量转义。
+fn md_inline(s: &str) -> String {
+    s.replace(['\n', '\r'], " ").trim_start_matches('#').to_string()
+}
+
 pub fn render_markdown(meta: &VideoMeta, sections: &[Section]) -> String {
+    let title = md_inline(&meta.title);
+    let uploader = md_inline(if meta.uploader.is_empty() {
+        "未知"
+    } else {
+        &meta.uploader
+    });
     let mut md = String::new();
-    md.push_str(&format!("# {}\n\n", meta.title));
-    md.push_str(&format!(
-        "- 作者：{}\n- 时长：{}\n- 来源：[{}]({})\n- 由 course2md 生成（{} 张截图 / {} 段语音）\n\n",
-        if meta.uploader.is_empty() { "未知" } else { &meta.uploader },
+    // 写 String 不会失败，unwrap 安全
+    write!(md, "# {title}\n\n").unwrap();
+    write!(
+        md,
+        "- 作者：{uploader}\n- 时长：{}\n- 来源：[{}]({})\n- 由 course2md 生成（{} 张截图 / {} 段语音）\n\n",
         fmt_ts(meta.duration),
         meta.webpage_url,
         meta.webpage_url,
         sections.len(),
         sections.iter().map(|s| s.speech.len()).sum::<usize>(),
-    ));
+    )
+    .unwrap();
     md.push_str("---\n\n");
     for s in sections {
-        md.push_str(&format!(
+        write!(
+            md,
             "## [{}]({})\n\n![{}]({})\n\n",
             fmt_ts(s.t),
             ts_url(meta, s.t),
             fmt_ts(s.t),
             s.image
-        ));
+        )
+        .unwrap();
         if s.speech.is_empty() {
             md.push_str("_(本段无语音)_\n\n");
         } else {
             for ev in &s.speech {
-                md.push_str(&format!("{}\n\n", ev.text));
+                write!(md, "{}\n\n", ev.text).unwrap();
             }
         }
     }
@@ -57,28 +75,32 @@ pub fn render_markdown(meta: &VideoMeta, sections: &[Section]) -> String {
 
 pub fn render_html(meta: &VideoMeta, sections: &[Section]) -> String {
     let mut body = String::new();
-    body.push_str(&format!(
-        "<header><h1>{}</h1><p>作者 {} · 时长 {} · <a href=\"{}\">源视频</a> · {} 张截图 / {} 段语音</p></header>\n",
+    writeln!(
+        body,
+        "<header><h1>{}</h1><p>作者 {} · 时长 {} · <a href=\"{}\">源视频</a> · {} 张截图 / {} 段语音</p></header>",
         esc(&meta.title),
         esc(if meta.uploader.is_empty() { "未知" } else { &meta.uploader }),
         fmt_ts(meta.duration),
         esc(&meta.webpage_url),
         sections.len(),
         sections.iter().map(|s| s.speech.len()).sum::<usize>(),
-    ));
+    )
+    .unwrap();
     for s in sections {
-        body.push_str(&format!(
+        write!(
+            body,
             "<section id=\"t{ts}\"><h2><a href=\"{url}\" target=\"_blank\">[{t}]</a></h2>\n<a href=\"{url}\" target=\"_blank\"><img loading=\"lazy\" src=\"{img}\" alt=\"{t}\"></a>\n",
             ts = s.t.floor() as u64,
             url = esc(&ts_url(meta, s.t)),
             t = esc(&fmt_ts(s.t)),
             img = esc(&s.image),
-        ));
+        )
+        .unwrap();
         if s.speech.is_empty() {
             body.push_str("<p class=\"mute\">（本段无语音）</p>\n");
         } else {
             for ev in &s.speech {
-                body.push_str(&format!("<p>{}</p>\n", esc(&ev.text)));
+                writeln!(body, "<p>{}</p>", esc(&ev.text)).unwrap();
             }
         }
         body.push_str("</section>\n");

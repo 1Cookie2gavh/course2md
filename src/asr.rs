@@ -11,11 +11,31 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub struct AsrInput {
-    pub wav: PathBuf,
-    pub model: PathBuf,
-    pub mmproj: PathBuf,
-}
+// ---------- 超参数（审查后统一收拢到文件顶部） ----------
+
+/// ffmpeg 静音检测：低于 -28dB 且持续 0.4s 视为静音（课件停顿切分点）
+const SILENCEDETECT_AF: &str = "silencedetect=noise=-28dB:d=0.4";
+/// llama-server 上下文长度（token）：chunk 已被 VAD 限长在 max_speech 内，4096 足够
+const LLAMA_CTX: &str = "4096";
+/// llama-server 单 chunk 生成上限（token）
+const LLAMA_MAX_GEN: &str = "256";
+/// 采样参数：转写要确定性输出（temperature 0）。
+/// max_tokens 与 server 的 -n 对齐；apple CoreML shim 用 448，因为那是
+/// speech-swift 侧 Qwen3 模型的既有默认，两条后端各自调优，勿盲目对齐。
+const LLAMA_TEMPERATURE: f64 = 0.0;
+const LLAMA_MAX_TOKENS: u32 = 256;
+/// llama-server /health 就绪等待上限（首次加载模型较慢）
+const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// 云端 STT 单次请求超时
+const API_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+/// llama-server 单 chunk 转写超时
+const LLAMA_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
+/// 云端 STT 并发 worker 数：网络往返是主要瓶颈
+const WORKERS: usize = 4;
+/// HTTP 重试：最多 3 次（1 次首发 + 2 次重试），指数退避 1s → 2s；
+/// 4xx 是确定性错误（鉴权/参数）不重试，5xx 与网络错误重试
+const MAX_ATTEMPTS: u32 = 3;
+const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 
 /// 清洗 Qwen3 转写中的提示词残留。
 pub fn sanitize_qwen_text(s: &str) -> String {
@@ -39,45 +59,50 @@ pub fn sanitize_qwen_text(s: &str) -> String {
     t.to_string()
 }
 
+/// 打开 checkpoint → spawn_blocking 执行 → 成功才 finish → join。
+/// 四个 provider 分支共享这套骨架（coreml 此前写法不一致，统一为「成功才 finish」）。
+async fn run_with_cp<F>(
+    cfg: &PipelineConfig,
+    identity: &crate::checkpoint::AsrIdentity,
+    f: F,
+) -> Result<Vec<TranscriptEvent>>
+where
+    F: FnOnce(&mut crate::checkpoint::Checkpoint) -> Result<Vec<TranscriptEvent>> + Send + 'static,
+{
+    let mut cp = crate::checkpoint::Checkpoint::open(&cfg.out_dir, cfg.resume, identity)?;
+    tokio::task::spawn_blocking(move || {
+        let r = f(&mut cp);
+        if r.is_ok() {
+            cp.finish()?;
+        }
+        r
+    })
+    .await
+    .context("ASR 线程 join 失败")?
+}
+
 pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<TranscriptEvent>> {
-    use crate::checkpoint::{AsrIdentity, Checkpoint};
+    use crate::checkpoint::AsrIdentity;
     use crate::config::AsrProvider;
-    let open = |id: &AsrIdentity| Checkpoint::open(&cfg.out_dir, cfg.resume, id);
 
     if cfg.provider == AsrProvider::Api {
-        let id = AsrIdentity::new("api", &cfg.asr_api.model, cfg.max_speech);
-        let mut cp = open(&id)?;
+        // 同一模型在 transcriptions / chat 两种端点下的输出可能不同，身份须含模式
+        let model_id = format!("{}:{}", cfg.asr_api.mode, cfg.asr_api.model);
+        let id = AsrIdentity::new("api", &model_id, cfg.max_speech);
         let api = cfg.asr_api.clone();
         let max_speech = cfg.max_speech as f64;
         let wav = wav.to_path_buf();
-        let joined = tokio::task::spawn_blocking(move || {
-            let r = run_api(&api, &wav, max_speech, &mut cp);
-            if r.is_ok() {
-                cp.finish()?;
-            }
-            r
-        })
-        .await
-        .context("ASR 线程 join 失败")?;
-        return joined;
+        return run_with_cp(cfg, &id, move |cp| run_api(&api, &wav, max_speech, cp)).await;
     }
     if cfg.provider == AsrProvider::Npu {
         let model = crate::npu::resolve_npu_model(cfg.asr_model.as_deref());
         let id = AsrIdentity::new("npu", &model, cfg.max_speech);
-        let mut cp = open(&id)?;
         let max_speech = cfg.max_speech as f64;
         let wav = wav.to_path_buf();
-        let cfg = cfg.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            let r = crate::npu::run_npu(&cfg, &wav, max_speech, &mut cp);
-            if r.is_ok() {
-                cp.finish()?;
-            }
-            r
+        return run_with_cp(cfg, &id, move |cp| {
+            crate::npu::run_npu(&model, &wav, max_speech, cp)
         })
-        .await
-        .context("ASR 线程 join 失败")?;
-        return joined;
+        .await;
     }
     if cfg.provider == AsrProvider::Coreml {
         #[cfg(apple_native)]
@@ -86,20 +111,13 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
             let max_speech = cfg.max_speech as f64;
             let model = crate::apple::resolve_model(
                 cfg.asr_model.as_deref().filter(|s| !s.trim().is_empty()),
-            );
+            )?;
             let id = AsrIdentity::new("coreml", &model, cfg.max_speech);
-            let mut cp = open(&id)?;
-            let joined = tokio::task::spawn_blocking(move || {
-                let tmp =
-                    std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
-                let _ = std::fs::create_dir_all(&tmp);
-                let res = crate::apple::run_coreml(&wav, max_speech, &model, &tmp, &mut cp);
-                let res = res.and_then(|ev| cp.finish().map(|()| ev));
-                let _ = std::fs::remove_dir_all(&tmp);
-                res
+            let joined = run_with_cp(cfg, &id, move |cp| {
+                let tmp = crate::runtime::TempWorkDir::new("asr")?;
+                crate::apple::run_coreml(&wav, max_speech, &model, tmp.path(), cp)
             })
-            .await
-            .context("ASR 线程 join 失败")?;
+            .await;
             match joined {
                 Ok(events) => return Ok(events), // 空 = VAD 无语音（终态，不再回落）
                 Err(e) => tracing::warn!("CoreML 后端失败（{e:#}），回落 llama-server"),
@@ -123,33 +141,27 @@ pub async fn run(cfg: &PipelineConfig, wav: &std::path::Path) -> Result<Vec<Tran
     let llama = crate::models::ensure_llama_or_download(&cfg.model_dir).await?;
     // coreml 回落场景：身份随实际转写后端（llama/qwen3），旧 coreml 进度作废，
     // 避免同一 checkpoint 混入两个模型的转写文本。
-    let id = AsrIdentity::new("llama", "qwen3-1.7b-gguf", cfg.max_speech);
-    let mut cp = open(&id)?;
-    let input = AsrInput {
-        wav: wav.to_path_buf(),
-        model: llama.model,
-        mmproj: llama.mmproj,
-    };
-    tokio::task::spawn_blocking(move || {
-        let r = run_blocking(&input, ngl, threads, max_speech, &mut cp);
-        if r.is_ok() {
-            cp.finish()?;
-        }
-        r
+    let id = AsrIdentity::new("llama", crate::models::llama_gguf_identity(), cfg.max_speech);
+    let model = llama.model;
+    let mmproj = llama.mmproj;
+    let wav = wav.to_path_buf();
+    run_with_cp(cfg, &id, move |cp| {
+        run_blocking(&wav, &model, &mmproj, ngl, threads, max_speech, cp)
     })
     .await
-    .context("ASR 线程 join 失败")?
 }
 
 fn run_blocking(
-    input: &AsrInput,
+    wav: &Path,
+    model: &Path,
+    mmproj: &Path,
     ngl: i32,
     threads: i32,
     max_speech: f32,
     cp: &mut crate::checkpoint::Checkpoint,
 ) -> Result<Vec<TranscriptEvent>> {
     let t0 = Instant::now();
-    let segs = ffmpeg_vad(&input.wav, max_speech)?;
+    let segs = ffmpeg_vad(wav, max_speech)?;
     tracing::info!(segs = segs.len(), "vad");
     if segs.is_empty() {
         tracing::warn!("未检测到语音（VAD 结果为空），跳过识别");
@@ -159,15 +171,20 @@ fn run_blocking(
     let bin = find_llama_server()?;
     let port = crate::runtime::free_port()?;
     tracing::info!(bin = %bin.display(), port, ngl, "llama-server");
-    let mut child = spawn_server(&bin, &input.model, &input.mmproj, ngl, threads, port)?;
+    let mut child = spawn_server(&bin, model, mmproj, ngl, threads, port)?;
     let stderr_tail = child
         .take_stderr()
-        .map(crate::runtime::drain_stderr)
+        .map(|s| crate::runtime::drain_stderr(s, "llama_server"))
         .unwrap_or_default();
     let base = format!("http://127.0.0.1:{port}");
     // 子进程秒退（端口冲突/模型损坏）会立即报错，而不是等满 300s；
     // 失败时附上 llama-server 自己的 stderr 尾部，诊断信息不因 piped 而丢失
-    if let Err(e) = crate::runtime::wait_ready(&base, Duration::from_secs(300), &mut child) {
+    if let Err(e) = crate::runtime::wait_ready(
+        &base,
+        SERVER_READY_TIMEOUT,
+        &mut child,
+        Some("\"status\":\"ok\""),
+    ) {
         return Err(e.context(format!(
             "llama-server 启动失败，其 stderr 尾部：\n{}",
             stderr_tail.tail()
@@ -178,17 +195,19 @@ fn run_blocking(
         "server ready"
     );
 
-    let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp);
-    let r = run_chunks(&input.wav, &segs, cp, &tmp, "asr", |_i, _seg, chunk| {
-        transcribe_file(&base, chunk).map(|t| {
+    // 共享 agent（连接复用），不再每个 chunk 新建
+    let client = ureq::AgentBuilder::new()
+        .timeout(LLAMA_HTTP_TIMEOUT)
+        .build();
+    let tmp = crate::runtime::TempWorkDir::new("asr")?;
+    let r = run_chunks(wav, &segs, cp, tmp.path(), "asr", |_i, _seg, chunk| {
+        transcribe_file(&client, &base, chunk).map(|t| {
             let t = sanitize_qwen_text(&t);
             (!t.is_empty()).then_some(t)
         })
     });
     child.kill();
     let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&tmp);
     let events = r.map_err(|e| {
         // 转写中途失败大概率是 server 侧问题，附上 stderr 尾部便于定位
         let tail = stderr_tail.tail();
@@ -261,7 +280,7 @@ pub(crate) fn run_chunks(
     }
     // 事件统一来自 checkpoint（历史 + 本次），按时间排序
     let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
-    all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+    all.sort_by(|a, b| a.start.total_cmp(&b.start));
     Ok(all)
 }
 
@@ -277,16 +296,9 @@ fn run_api(
     let api_key = if !api.api_key.trim().is_empty() {
         api.api_key.clone()
     } else {
-        std::env::var("OPENROUTER_API_KEY")
-            .ok()
-            .filter(|k| !k.trim().is_empty())
-            .context("云端 STT 未配置 API Key：在配置文件 [asr_api] 设置 api_key，或用 --asr-api-key / OPENROUTER_API_KEY")?
+        crate::config::asr_api_key_from_env()
+            .context("云端 STT 未配置 API Key：在配置文件 [asr_api] 设置 api_key，或用 --asr-api-key / COURSE2MD_ASR_API_KEY（兼容旧名 OPENROUTER_API_KEY）")?
     };
-    let api = crate::settings::AsrApi {
-        api_key,
-        ..api.clone()
-    };
-    let api = &api;
     let segs = ffmpeg_vad(wav, max_speech as f32)?;
     tracing::info!(segs = segs.len(), endpoint = %api.base_url, model = %api.model, "api vad");
     if segs.is_empty() {
@@ -294,12 +306,12 @@ fn run_api(
         return Ok(vec![]);
     }
 
-    let tmp = std::env::temp_dir().join(format!("course2md-asr-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp);
-    let url = format!(
-        "{}/audio/transcriptions",
-        api.base_url.trim().trim_end_matches('/')
-    );
+    let tmp = crate::runtime::TempWorkDir::new("asr")?;
+    let base = api.base_url.trim().trim_end_matches('/');
+    let url = match api.mode {
+        crate::settings::AsrApiMode::Transcriptions => format!("{base}/audio/transcriptions"),
+        crate::settings::AsrApiMode::Chat => format!("{base}/chat/completions"),
+    };
     let pb = indicatif::ProgressBar::new(segs.len() as u64);
     pb.set_style(
         indicatif::ProgressStyle::with_template(
@@ -310,102 +322,84 @@ fn run_api(
     );
 
     let client = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(120))
+        .timeout(API_HTTP_TIMEOUT)
         .build();
-    let client = std::sync::Arc::new(client);
-    let segs = std::sync::Arc::new(segs);
-    let tmp = std::sync::Arc::new(tmp);
-    let wav_path = std::sync::Arc::new(wav.to_path_buf());
-    let model = api.model.clone();
-    let key = api.api_key.clone();
     // 断点续跑：预先过滤出未完成的 chunk（worker 只拿真正需要执行的任务）
     let pending: Vec<usize> = (0..segs.len())
         .filter(|&i| !cp.is_done(segs[i].start, segs[i].end))
         .collect();
     pb.set_position((segs.len() - pending.len()) as u64);
-    let pending = std::sync::Arc::new(pending);
 
-    // 有界并发（默认 4）：网络往返是主要瓶颈；结果经 channel 回收后记录
-    const WORKERS: usize = 4;
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Option<String>, String>)>();
-    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handles: Vec<_> = (0..WORKERS)
-        .map(|_| {
-            let (tx, client, segs, tmp, model, key, url, next, abort, wav_path, pending) = (
-                tx.clone(),
-                client.clone(),
-                segs.clone(),
-                tmp.clone(),
-                model.clone(),
-                key.clone(),
-                url.clone(),
-                next.clone(),
-                abort.clone(),
-                wav_path.clone(),
-                pending.clone(),
-            );
-            std::thread::spawn(move || {
-                loop {
-                    if abort.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let Some(i) = pending.get(idx).copied() else {
-                        break;
-                    };
-                    let seg = segs[i];
-                    let r = transcribe_api(
-                        &client,
-                        &url,
-                        &model,
-                        &key,
-                        &tmp.join(format!("c{i:04}.wav")),
-                        seg,
-                        &wav_path,
-                    );
-                    if tx.send((i, r)).is_err() {
-                        break;
-                    }
-                }
-            })
-        })
-        .collect();
-    drop(tx);
-
+    // 有界并发（std::thread::scope + 借用，无需 Arc）：网络往返是主要瓶颈；
+    // 结果经 channel 回收后记录。abort 后 in-flight 请求自然结束，无人 join 不到。
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Option<String>>)>();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let abort = std::sync::atomic::AtomicBool::new(false);
     let mut err: Option<anyhow::Error> = None;
-    for (i, r) in rx {
-        match r {
-            Ok(text) => {
-                // 空结果（None）同样记录完成，避免静音 chunk 反复重跑
-                if let Err(e) = cp.record(segs[i].start, segs[i].end, text.as_deref().unwrap_or(""))
-                    && err.is_none()
-                {
-                    err = Some(e);
-                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::thread::scope(|s| {
+        for _ in 0..WORKERS {
+            let tx = tx.clone();
+            let target = ApiTarget {
+                client: &client,
+                url: &url,
+                model: &api.model,
+                key: &api_key,
+                mode: api.mode,
+            };
+            let (tmp_dir, wav) = (tmp.path(), wav);
+            let (segs, pending, next, abort) = (&segs, &pending, &next, &abort);
+            s.spawn(move || loop {
+                if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
                 }
-            }
-            Err(e) => {
-                if err.is_none() {
-                    err = Some(anyhow::anyhow!("云端 STT 失败（chunk {i}）：{e}"));
-                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(i) = pending.get(idx).copied() else {
+                    break;
+                };
+                let seg = segs[i];
+                let r = transcribe_api(
+                    &target,
+                    &tmp_dir.join(format!("c{i:04}.wav")),
+                    seg,
+                    wav,
+                );
+                if tx.send((i, r)).is_err() {
+                    break;
                 }
-            }
+            });
         }
-        pb.inc(1);
-    }
-    for h in handles {
-        let _ = h.join();
-    }
+        drop(tx);
+
+        for (i, r) in rx {
+            match r {
+                Ok(text) => {
+                    // 空结果（None）同样记录完成，避免静音 chunk 反复重跑
+                    if let Err(e) =
+                        cp.record(segs[i].start, segs[i].end, text.as_deref().unwrap_or(""))
+                    {
+                        if err.is_none() {
+                            err = Some(e);
+                        }
+                        abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    if err.is_none() {
+                        err = Some(e.context(format!("云端 STT 失败（chunk {i}）")));
+                        abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            pb.inc(1);
+        }
+    });
     pb.finish_and_clear();
-    let _ = std::fs::remove_dir_all(tmp.as_ref());
     if let Some(e) = err {
         return Err(e);
     }
     // 事件统一来自 checkpoint（收集循环里已 record），按时间排序
-    let mut all: Vec<TranscriptEvent> = cp.events().to_vec();
-    all.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-    let events = all;
+    let mut events: Vec<TranscriptEvent> = cp.events().to_vec();
+    events.sort_by(|a, b| a.start.total_cmp(&b.start));
     tracing::info!(
         n = events.len(),
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
@@ -414,41 +408,121 @@ fn run_api(
     Ok(events)
 }
 
+/// POST JSON（带重试）：网络错误与 5xx 按 RETRY_BACKOFF_BASE 指数退避、
+/// 共尝试 MAX_ATTEMPTS 次；4xx 是确定性错误（鉴权/参数），重试无意义直接失败。
+fn post_json_retry(
+    agent: &ureq::Agent,
+    url: &str,
+    key: Option<&str>,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut delay = RETRY_BACKOFF_BASE;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let mut req = agent.post(url);
+        if let Some(k) = key {
+            req = req.set("Authorization", &format!("Bearer {k}"));
+        }
+        match req.send_json(body.clone()) {
+            Ok(resp) => return resp.into_json().context("响应解析失败"),
+            Err(e) => {
+                let retryable = match &e {
+                    ureq::Error::Status(code, _) => *code >= 500,
+                    ureq::Error::Transport(_) => true,
+                };
+                if retryable && attempt < MAX_ATTEMPTS {
+                    tracing::warn!(
+                        attempt,
+                        backoff_secs = delay.as_secs(),
+                        "请求失败（{e}），稍后重试"
+                    );
+                    std::thread::sleep(delay);
+                    delay *= 2;
+                } else {
+                    return Err(anyhow::anyhow!("请求失败: {e}"));
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// chat 模式下让多模态 LLM 转录的指令（保持与本地 ASR 输出风格一致：忠实、带自然标点）。
+const CHAT_TRANSCRIBE_PROMPT: &str = "请将这段音频转录为文字。只输出转录内容本身（保留自然标点），\
+不要添加任何解释、概括或格式标记。若没有语音内容，输出空字符串。";
+
+/// 云端转录端点：地址、凭据与请求模式（worker 间共享借用）。
+struct ApiTarget<'a> {
+    client: &'a ureq::Agent,
+    url: &'a str,
+    model: &'a str,
+    key: &'a str,
+    mode: crate::settings::AsrApiMode,
+}
+
 /// 转写单个 chunk；Ok(None) = 无语音内容。
 fn transcribe_api(
-    // base64 Engine trait
-    client: &ureq::Agent,
-    url: &str,
-    model: &str,
-    key: &str,
+    t: &ApiTarget,
     chunk: &Path,
     seg: Seg,
     wav: &Path,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>> {
     use base64::Engine as _;
-    cut_wav(wav, seg.cut_start, seg.cut_end, chunk).map_err(|e| format!("切分音频失败: {e:#}"))?;
-    let bytes = std::fs::read(chunk).map_err(|e| format!("读取 chunk 失败: {e}"))?;
+    cut_wav(wav, seg.cut_start, seg.cut_end, chunk).context("切分音频失败")?;
+    let bytes =
+        std::fs::read(chunk).with_context(|| format!("读取 chunk {}", chunk.display()))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let body = serde_json::json!({
-        "model": model,
-        "input_audio": {"data": b64, "format": "wav"},
-    });
-    let resp = client
-        .post(url)
-        .set("Authorization", &format!("Bearer {key}"))
-        .send_json(body)
-        .map_err(|e| format!("请求失败: {e}"))?;
-    let v: serde_json::Value = resp.into_json().map_err(|e| format!("响应解析失败: {e}"))?;
+    let body = match t.mode {
+        crate::settings::AsrApiMode::Transcriptions => serde_json::json!({
+            "model": t.model,
+            "input_audio": {"data": b64, "format": "wav"},
+        }),
+        crate::settings::AsrApiMode::Chat => serde_json::json!({
+            "model": t.model,
+            "temperature": 0.0,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": CHAT_TRANSCRIBE_PROMPT},
+                    {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}},
+                ],
+            }],
+        }),
+    };
+    let v = post_json_retry(t.client, t.url, Some(t.key), &body)?;
     if let Some(e) = v
         .get("error")
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
     {
-        return Err(format!("API 报错: {e}"));
+        anyhow::bail!("API 报错: {e}");
     }
-    let text = v["text"].as_str().unwrap_or("").trim().to_string();
+    let text = match t.mode {
+        crate::settings::AsrApiMode::Transcriptions => {
+            v["text"].as_str().unwrap_or("").trim().to_string()
+        }
+        crate::settings::AsrApiMode::Chat => parse_chat_content(&v).trim().to_string(),
+    };
     let _ = std::fs::remove_file(chunk);
     Ok(if text.is_empty() { None } else { Some(text) })
+}
+
+/// 从 chat/completions 响应取文本：content 通常是字符串；部分多模态端点
+/// 返回 [{type:"text", text:...}] 分片数组，拼起来即可。
+fn parse_chat_content(v: &serde_json::Value) -> String {
+    let content = &v["choices"][0]["message"]["content"];
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
 }
 
 fn find_llama_server() -> Result<PathBuf> {
@@ -472,9 +546,9 @@ fn spawn_server(
         .arg("-ngl")
         .arg(ngl.to_string())
         .arg("-c")
-        .arg("4096")
+        .arg(LLAMA_CTX)
         .arg("-n")
-        .arg("256")
+        .arg(LLAMA_MAX_GEN)
         .arg("-t")
         .arg(threads.to_string())
         .arg("--port")
@@ -489,13 +563,13 @@ fn spawn_server(
     crate::runtime::ManagedChild::spawn("llama-server", &mut cmd)
 }
 
-fn transcribe_file(base: &str, wav: &Path) -> Result<String> {
+fn transcribe_file(client: &ureq::Agent, base: &str, wav: &Path) -> Result<String> {
     let bytes = std::fs::read(wav)?;
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let body = serde_json::json!({
-        "temperature": 0.0,
-        "max_tokens": 256,
+        "temperature": LLAMA_TEMPERATURE,
+        "max_tokens": LLAMA_MAX_TOKENS,
         "messages": [{
             "role": "user",
             "content": [
@@ -504,12 +578,8 @@ fn transcribe_file(base: &str, wav: &Path) -> Result<String> {
             ]
         }]
     });
-    let resp = ureq::post(&format!("{base}/v1/chat/completions"))
-        .timeout(Duration::from_secs(180))
-        .set("Content-Type", "application/json")
-        .send_json(body)
+    let v = post_json_retry(client, &format!("{base}/v1/chat/completions"), None, &body)
         .context("llama-server 识别请求失败")?;
-    let v: serde_json::Value = resp.into_json()?;
     let text = v["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("")
@@ -524,7 +594,7 @@ pub(crate) fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<Seg>> {
     let out = Command::new("ffmpeg")
         .args(["-hide_banner", "-i"])
         .arg(wav)
-        .args(["-af", "silencedetect=noise=-28dB:d=0.4", "-f", "null", "-"])
+        .args(["-af", SILENCEDETECT_AF, "-f", "null", "-"])
         .output()
         .context("ffmpeg silencedetect")?;
     if !out.status.success() {
@@ -540,25 +610,36 @@ pub(crate) fn ffmpeg_vad(wav: &Path, max_speech: f32) -> Result<Vec<Seg>> {
         );
     }
     let log = String::from_utf8_lossy(&out.stderr);
-    let dur = crate::media::probe_duration_blocking(wav).unwrap_or(0.0);
+    // 时长只探测一次，传入 normalize_segments（此前两处各 ffprobe 一次）；
+    // 失败至少告警——静默落 0.0 会让末段语音丢失。
+    let dur = match crate::media::probe_duration_blocking(wav) {
+        Some(d) => d,
+        None => {
+            tracing::warn!("ffprobe 时长探测失败，按 0 处理（末段语音可能丢失）");
+            0.0
+        }
+    };
     let mut silences: Vec<(f64, f64)> = vec![];
     let mut start: Option<f64> = None;
     for line in log.lines() {
         if let Some(v) = line.split("silence_start:").nth(1) {
-            start = v.trim().parse().ok();
+            match v.trim().parse::<f64>() {
+                Ok(t) => start = Some(t),
+                // 解析失败不能静默丢弃：0.0 会产生倒挂区间进 invert_silence
+                Err(e) => tracing::warn!("silencedetect silence_start 解析失败（{v:?}）：{e}"),
+            }
         } else if let Some(v) = line.split("silence_end:").nth(1) {
-            let end: f64 = v
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .parse()
-                .unwrap_or(0.0);
-            if let Some(s) = start.take() {
-                silences.push((s, end));
+            match v.split_whitespace().next().unwrap_or("").parse::<f64>() {
+                Ok(end) => {
+                    if let Some(s) = start.take() {
+                        silences.push((s, end));
+                    }
+                }
+                Err(e) => tracing::warn!("silencedetect silence_end 解析失败（{v:?}）：{e}"),
             }
         }
     }
-    normalize_segments(invert_silence(dur, &silences), max_speech as f64, wav)
+    normalize_segments(invert_silence(dur, &silences), max_speech as f64, wav, dur)
 }
 
 /// 最终送入 ASR 的分段：`start/end` 是事件时间（用于时间线），`cut_*` 是切音频范围（含静音填充）。
@@ -607,13 +688,11 @@ impl Energy {
             return None;
         }
         let i1 = i1.min(self.rms.len() - 1);
-        let (bi, bv) = self.rms[i0..=i1]
+        // total_cmp：rms 来自非负能量的 sqrt，理论上无 NaN，但不赌 partial_cmp 不 panic
+        let (bi, _) = self.rms[i0..=i1]
             .iter()
             .enumerate()
-            .min_by(|x, y| x.1.partial_cmp(y.1).unwrap())?;
-        if bv.is_nan() {
-            return None;
-        }
+            .min_by(|x, y| x.1.total_cmp(y.1))?;
         Some((i0 + bi) as f64 * self.hop + self.hop / 2.0)
     }
 }
@@ -658,13 +737,15 @@ const MIN_PIECE: f64 = 1.0; // 硬切产生的最短片段
 /// VAD 后处理：能量感知切分 + 静音填充。
 /// - 超过 max_speech 的段在 [target-3s, target+3s] 窗口内选能量最低点切（避开词中切断）
 /// - 切音频时向两侧静音各填充 0.25s（只进静音、不进相邻语音，故无重复文本）
+///
+/// `dur` 由调用方一次性探测传入（避免每段各 ffprobe 一次）。
 pub fn normalize_segments(
     speech: Vec<(f64, f64)>,
     max_speech: f64,
     wav: &Path,
+    dur: f64,
 ) -> Result<Vec<Seg>> {
     let energy = Energy::load(wav).ok();
-    let dur = crate::media::probe_duration_blocking(wav).unwrap_or(0.0);
     // VAD 成功但无语音（或全被短段过滤）→ 空分段。
     // 不再把整段音频当语音兜底：静音课件会诱发 ASR 幻觉。
     let mut raw = speech;
@@ -793,5 +874,21 @@ mod tests {
         assert_eq!(sanitize_qwen_text("内容</asr_text>尾巴"), "内容");
         let s = invert_silence(10.0, &[(0.0, 1.0), (4.0, 5.0)]);
         assert!((s[0].0 - 1.0).abs() < 1e-6 && (s[0].1 - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chat_content_parsing() {
+        // 字符串形式（主流 OpenAI 兼容端点）
+        let v = serde_json::json!({"choices":[{"message":{"content":"你好世界"}}]});
+        assert_eq!(parse_chat_content(&v), "你好世界");
+        // 分片数组形式（部分多模态端点）
+        let v = serde_json::json!({"choices":[{"message":{"content":[
+            {"type":"text","text":"你好"},
+            {"type":"text","text":"世界"}
+        ]}}]});
+        assert_eq!(parse_chat_content(&v), "你好世界");
+        // 缺字段/异常响应 → 空串（调用方按无语音处理）
+        let v = serde_json::json!({"choices":[]});
+        assert_eq!(parse_chat_content(&v), "");
     }
 }

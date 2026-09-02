@@ -3,6 +3,33 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+// —— 内置默认值（唯一来源）：main.rs 的 CLI 合并、settings.rs 的展示统一引用这里 ——
+/// SSIM 画面相似度阈值（越高越敏感、截图越多）
+pub const DEFAULT_SIMILARITY: f64 = 0.85;
+/// 画面采样间隔（秒）
+pub const DEFAULT_SAMPLE_INTERVAL: f64 = 1.0;
+/// 两张截图之间的最小间隔（秒）
+pub const DEFAULT_COOLDOWN: f64 = 10.0;
+/// 下载视频的高度上限（讲义截图质量优先）
+pub const DEFAULT_MAX_HEIGHT: u32 = 1080;
+/// stable 模式下画面需保持不变的秒数
+pub const DEFAULT_STABLE_SECS: f64 = 0.8;
+/// ASR 识别线程数
+pub const DEFAULT_THREADS: i32 = 4;
+/// 单段语音最长秒数（过长会在静音点切分）
+pub const DEFAULT_MAX_SPEECH: f32 = 20.0;
+/// 默认输出根目录
+pub const DEFAULT_OUT_DIR: &str = "out";
+
+/// 云端 STT API key 环境变量：新名 `COURSE2MD_ASR_API_KEY` 优先，
+/// `OPENROUTER_API_KEY` 仅作兼容回落（旧文档/脚本中已存在）。
+pub fn asr_api_key_from_env() -> Option<String> {
+    ["COURSE2MD_ASR_API_KEY", "OPENROUTER_API_KEY"]
+        .into_iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|k| !k.trim().is_empty())
+}
+
 /// ASR 后端。typed enum 取代散落各处的字符串比较（`eq_ignore_ascii_case`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -198,6 +225,27 @@ fn parse_coord(s: &str) -> anyhow::Result<f64> {
     }
 }
 
+/// provider=npu 已知的模型别名表（来源：npu.rs `resolve_npu_model` 的映射，
+/// 对应 HuggingFace 上的 OpenVINO 预转换仓库）。新增别名时两处需同步。
+const NPU_MODEL_ALIASES: &[&str] = &[
+    "qwen3",
+    "qwen3-1.7b",
+    "qwen3-0.6b",
+    "1.7b",
+    "0.6b",
+    "whisper",
+    "turbo",
+    "whisper-turbo",
+    "whisper-large",
+    "large",
+    "tiny",
+    "whisper-tiny",
+    "base",
+    "whisper-base",
+    "small",
+    "whisper-small",
+];
+
 impl PipelineConfig {
     /// 全量预检：所有配置错误必须在任何昂贵操作（下载/抽帧/模型加载）之前暴露。
     /// 返回 Err 的送进 main 后直接退出，不会碰网络与模型。
@@ -277,26 +325,8 @@ impl PipelineConfig {
                     );
                 }
                 AsrProvider::Npu => {
-                    let known = [
-                        "qwen3",
-                        "qwen3-1.7b",
-                        "qwen3-0.6b",
-                        "1.7b",
-                        "0.6b",
-                        "whisper",
-                        "turbo",
-                        "whisper-turbo",
-                        "whisper-large",
-                        "large",
-                        "tiny",
-                        "whisper-tiny",
-                        "base",
-                        "whisper-base",
-                        "small",
-                        "whisper-small",
-                    ];
                     anyhow::ensure!(
-                        known.contains(&lower.as_str()) || lower.contains('/'),
+                        NPU_MODEL_ALIASES.contains(&lower.as_str()) || lower.contains('/'),
                         "provider npu 的 asr_model 需是已知别名或 HuggingFace 仓库 id（含 /，收到 {m:?}）"
                     );
                 }
@@ -306,12 +336,10 @@ impl PipelineConfig {
 
         // api 后端：key 缺失时立即报错，而不是切完音频才发现
         if self.provider == AsrProvider::Api {
-            let env_key = std::env::var("OPENROUTER_API_KEY")
-                .ok()
-                .is_some_and(|k| !k.trim().is_empty());
             anyhow::ensure!(
-                !self.asr_api.api_key.trim().is_empty() || env_key,
-                "provider api 需要 API key：配置文件 [asr_api].api_key、--asr-api-key 或环境变量 OPENROUTER_API_KEY"
+                !self.asr_api.api_key.trim().is_empty() || asr_api_key_from_env().is_some(),
+                "provider api 需要 API key：配置文件 [asr_api].api_key、--asr-api-key \
+                 或环境变量 COURSE2MD_ASR_API_KEY（兼容旧名 OPENROUTER_API_KEY）"
             );
         }
 
@@ -405,6 +433,8 @@ pub fn resolve_resume(cli_resume: bool, cli_no_resume: bool, file_resume: Option
 }
 
 /// 平台默认后端提示（doctor 展示与 main 实际选择保持同一逻辑）。
+/// 注意 NPU 只在 llama-server 缺席时兜底：装了 llama-server 的 Intel 机器默认仍走 gpu，
+/// 避免把「能跑 GPU」的机器静默降级到更慢的 NPU 管线。
 pub fn default_provider_hint() -> AsrProvider {
     if cfg!(apple_native) {
         AsrProvider::Coreml
@@ -419,6 +449,8 @@ pub fn default_provider_hint() -> AsrProvider {
 }
 
 /// 像 URL 或已存在的本地文件才当作输入；否则视为没传参数。
+/// `contains(...)` 三个分支是为 scheme-less 输入（如 `www.bilibili.com/video/BV...`）
+/// 兜底——用户粘贴域名时不一定带 http(s) 前缀。
 pub fn looks_like_source(s: &str) -> bool {
     let p = Path::new(s);
     if p.is_file() {
@@ -470,8 +502,10 @@ pub fn infer_slug(source: &str) -> String {
 }
 
 fn bvid(s: &str) -> Option<String> {
-    let i = s.find("BV")?;
-    let id: String = s[i..].chars().take(12).collect();
+    // 锚定到 /video/ 路径段之后查找 BV，避免查询参数（?x=BV...）误中
+    let rest = s.split_once("/video/").map(|(_, r)| r)?;
+    let j = rest.find("BV")?;
+    let id: String = rest[j..].chars().take(12).collect();
     if id.len() >= 6 && id.chars().all(|c| c.is_ascii_alphanumeric()) {
         Some(id)
     } else {
@@ -561,16 +595,16 @@ mod tests {
             url: "https://youtu.be/x".into(),
             out_dir: "out".into(),
             out_root: "out".into(),
-            similarity: 0.85,
-            sample_interval: 1.0,
-            cooldown: 10.0,
-            max_height: 1080,
+            similarity: DEFAULT_SIMILARITY,
+            sample_interval: DEFAULT_SAMPLE_INTERVAL,
+            cooldown: DEFAULT_COOLDOWN,
+            max_height: DEFAULT_MAX_HEIGHT,
             slide_mode: SlideMode::Stable,
-            stable_secs: 0.8,
+            stable_secs: DEFAULT_STABLE_SECS,
             roi: None,
-            threads: 4,
+            threads: DEFAULT_THREADS,
             provider: AsrProvider::Gpu,
-            max_speech: 20.0,
+            max_speech: DEFAULT_MAX_SPEECH,
             formats: vec![OutputFormat::Md],
             model_dir: "/tmp/m".into(),
             keep_video: false,
@@ -596,21 +630,21 @@ mod tests {
         assert!(c.validate().is_err());
         c.max_speech = f32::INFINITY;
         assert!(c.validate().is_err());
-        c.max_speech = 20.0;
+        c.max_speech = DEFAULT_MAX_SPEECH;
 
         c.similarity = 0.0;
         assert!(c.validate().is_err());
         c.similarity = 1.5;
         assert!(c.validate().is_err());
-        c.similarity = 0.85;
+        c.similarity = DEFAULT_SIMILARITY;
 
         c.sample_interval = 0.0;
         assert!(c.validate().is_err());
-        c.sample_interval = 1.0;
+        c.sample_interval = DEFAULT_SAMPLE_INTERVAL;
 
         c.threads = 0;
         assert!(c.validate().is_err());
-        c.threads = 4;
+        c.threads = DEFAULT_THREADS;
 
         c.formats = vec![];
         assert!(c.validate().is_err());

@@ -78,7 +78,7 @@ pub fn merge(
     for ev in speech {
         for piece in split_at_natural_boundaries(ev, &boundaries) {
             let mid = (piece.start + piece.end) / 2.0;
-            let idx = match sections[..].binary_search_by(|s| s.t.partial_cmp(&mid).unwrap()) {
+            let idx = match sections[..].binary_search_by(|s| s.t.total_cmp(&mid)) {
                 Ok(i) => i,
                 Err(0) => 0, // 首张截图之前
                 Err(i) => i - 1,
@@ -237,15 +237,15 @@ fn is_standalone_filler(text: &str) -> bool {
     )
 }
 
+// 注：此处用同步 std::fs——事件量小（KB 级）且为单次落盘；
+// 改 tokio::fs 需把签名改 async 并牵连 pipeline.rs，收益不抵成本。
 pub fn write_jsonl(path: &Path, frames: &[FrameEvent], speech: &[TranscriptEvent]) -> Result<()> {
     use std::io::Write;
     let mut events: Vec<TimelineEvent> = vec![];
     events.extend(frames.iter().cloned().map(TimelineEvent::Frame));
     events.extend(speech.iter().cloned().map(TimelineEvent::Speech));
-    events.sort_by(|a, b| {
-        let (ta, tb) = (time_of(a), time_of(b));
-        ta.partial_cmp(&tb).unwrap()
-    });
+    // total_cmp：对 NaN 也有全序定义，避免 partial_cmp().unwrap() 在外部数据下 panic
+    events.sort_by(|a, b| time_of(a).total_cmp(&time_of(b)));
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     for ev in &events {
         serde_json::to_writer(&mut f, ev)?;

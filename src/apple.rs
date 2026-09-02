@@ -104,28 +104,31 @@ fn ensure_metallib() -> Result<()> {
 }
 
 /// 解析 coreml 后端用的模型：显式指定 > 标记文件 > （交互式终端则询问并记忆）> qwen3。
-pub fn resolve_model(explicit: Option<&str>) -> String {
+pub fn resolve_model(explicit: Option<&str>) -> Result<String> {
     if let Some(m) = explicit {
         return normalize(m);
     }
     let marker = crate::config::config_dir().join("asr_model");
-    if let Ok(s) = std::fs::read_to_string(&marker) {
-        let m = normalize(s.trim());
-        if m == "qwen3" || m == "whisper" {
-            return m;
-        }
+    if let Ok(s) = std::fs::read_to_string(&marker)
+        && let Ok(m) = normalize(s.trim())
+    {
+        return Ok(m);
     }
     let chosen = prompt_model_choice();
     let _ = std::fs::write(&marker, &chosen);
-    chosen
+    Ok(chosen)
 }
 
-fn normalize(s: &str) -> String {
+/// 模型名归一化。未知名字报错而不是静默归为 qwen3——与 npu 侧
+/// 「不静默更换模型」原则对齐（静默换模型会让转写来源不可追溯）。
+fn normalize(s: &str) -> Result<String> {
     let s = s.trim().to_ascii_lowercase();
-    if s.contains("whisper") {
-        "whisper".into()
+    if s.is_empty() || s.contains("qwen") {
+        Ok("qwen3".into())
+    } else if s.contains("whisper") {
+        Ok("whisper".into())
     } else {
-        "qwen3".into()
+        anyhow::bail!("未知的 CoreML 模型名 `{s}`（可选：qwen3 | whisper）")
     }
 }
 
@@ -184,10 +187,14 @@ impl CoremlAsr {
             )
         };
         match rc {
-            0 => {
+            0 | 2 => {
                 let s = CStr::from_bytes_until_nul(&out)
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                if rc == 2 {
+                    // shim 侧缓冲（16KB）不够，文本被截断：至少留痕
+                    tracing::warn!("CoreML 转写结果超过缓冲上限被截断");
+                }
                 Ok(Some(s))
             }
             1 => Ok(None),
@@ -214,7 +221,9 @@ pub fn run_coreml(
 ) -> Result<Vec<TranscriptEvent>> {
     let t0 = Instant::now();
     let raw = vad(wav, 0.25, 0.35)?;
-    let segs = crate::asr::normalize_segments(raw, max_speech, wav)?;
+    // 时长只探测一次（与 ffmpeg_vad 同样约定：normalize_segments 不再自行 ffprobe）
+    let dur = crate::media::probe_duration_blocking(wav).unwrap_or(0.0);
+    let segs = crate::asr::normalize_segments(raw, max_speech, wav, dur)?;
     tracing::info!(segs = segs.len(), engine = "silero-coreml", "vad");
     if segs.is_empty() {
         tracing::warn!("未检测到语音（VAD 结果为空），跳过识别");

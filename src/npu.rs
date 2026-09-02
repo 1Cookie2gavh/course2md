@@ -6,20 +6,31 @@
 //! course2md 逐 chunk 提交并保存 checkpoint。
 
 use crate::checkpoint::Checkpoint;
-use crate::config::PipelineConfig;
 use crate::timeline::TranscriptEvent;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+// ---------- 超参数 ----------
+
+/// NPU worker /health 就绪等待上限（首次模型编译可能需要 1-2 分钟）
+const NPU_READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// NPU 单 chunk 转写请求超时
+const NPU_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+/// 优雅关闭通知的请求超时（worker 可能正忙，别卡死主流程）
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+/// POST /shutdown 后等待 worker 自行退出的上限
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+/// SIGTERM 后再给的短等待（仍未退由 ManagedChild Drop 的 kill 兜底）
+const SIGTERM_WAIT: Duration = Duration::from_millis(500);
 
 const NPU_WORKER_SCRIPT: &str = r#"
 import http.server
 import json
 import sys
 import os
-import io
 import wave
 import time
 
@@ -31,7 +42,7 @@ except ImportError as e:
     sys.exit(1)
 
 model_arg = sys.argv[1] if len(sys.argv) > 1 else "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO"
-port = int(sys.argv[2]) if len(sys.argv) > 2 else 29381
+port = int(sys.argv[2])  # Rust 侧永远显式传参（free_port 动态分配），不留默认端口
 device = sys.argv[3] if len(sys.argv) > 3 else "NPU"
 
 model_path = model_arg
@@ -95,18 +106,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(n)
         try:
             req = json.loads(body)
+            # Rust 侧只走 path 分支（chunk 已切好落盘），不再支持 base64 内嵌
             wav_path = req.get("path")
-            if wav_path and os.path.isfile(wav_path):
-                with wave.open(wav_path, "rb") as wf:
-                    frames = wf.readframes(wf.getnframes())
-                    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-            else:
-                import base64
-                b64_data = req.get("input_audio", {}).get("data", "")
-                raw = base64.b64decode(b64_data)
-                with wave.open(io.BytesIO(raw), "rb") as wf:
-                    frames = wf.readframes(wf.getnframes())
-                    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            with wave.open(wav_path, "rb") as wf:
+                frames = wf.readframes(wf.getnframes())
+                samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
 
             res = pipe.generate(samples.tolist(), gen_cfg)
             text = res.texts[0].strip() if res.texts else ""
@@ -143,8 +147,10 @@ pub fn resolve_npu_model(raw: Option<&str>) -> String {
     }
 }
 
+/// `model_id` 由调用方经 [`resolve_npu_model`] 解析后传入（checkpoint 身份与
+/// worker 加载必须是同一个模型，避免解析两次）。
 pub fn run_npu(
-    cfg: &PipelineConfig,
+    model_id: &str,
     wav: &Path,
     max_speech: f64,
     cp: &mut Checkpoint,
@@ -157,30 +163,43 @@ pub fn run_npu(
         return Ok(vec![]);
     }
 
-    let model_id = resolve_npu_model(cfg.asr_model.as_deref());
-    let port = crate::runtime::free_port()?;
-    let script_path = write_worker_script(&cfg.out_dir)?;
+    // chunk 与 worker 脚本都放在临时目录（此前脚本写进用户的 out_dir/.workers/，
+    // 污染输出目录）；原子写避免崩溃留下半截脚本
+    let tmp = crate::runtime::TempWorkDir::new("npu")?;
+    let script_path = tmp.path().join("npu_worker.py");
+    crate::checkpoint::atomic_write(&script_path, NPU_WORKER_SCRIPT.as_bytes())?;
 
+    let port = crate::runtime::free_port()?;
     tracing::info!(model = %model_id, port, "starting npu worker");
-    let mut child = spawn_npu_worker(&script_path, &model_id, port)?;
+    let mut child = spawn_npu_worker(&script_path, model_id, port)?;
+    let stderr_tail = child
+        .take_stderr()
+        .map(|s| crate::runtime::drain_stderr(s, "npu_worker"))
+        .unwrap_or_default();
     let base = format!("http://127.0.0.1:{port}");
 
     // ManagedChild：此后任何 ? 早退都会在 Drop 中终止 worker，不再泄漏进程
-    crate::runtime::wait_ready(&base, Duration::from_secs(300), &mut child)
-        .context("Intel NPU 服务启动失败/超时（首次模型编译可能需要更多时间）")?;
+    if let Err(e) = crate::runtime::wait_ready(
+        &base,
+        NPU_READY_TIMEOUT,
+        &mut child,
+        Some("\"status\":\"ok\""),
+    ) {
+        return Err(e.context(format!(
+            "Intel NPU 服务启动失败/超时（首次模型编译可能需要更多时间），其 stderr 尾部：\n{}",
+            stderr_tail.tail()
+        )));
+    }
     tracing::info!(
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
         "npu ready"
     );
 
-    let tmp = std::env::temp_dir().join(format!("course2md-npu-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp);
-
     let client = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(120))
+        .timeout(NPU_HTTP_TIMEOUT)
         .build();
 
-    let r = crate::asr::run_chunks(wav, &segs, cp, &tmp, "npu asr", |_i, _seg, chunk| {
+    let r = crate::asr::run_chunks(wav, &segs, cp, tmp.path(), "npu asr", |_i, _seg, chunk| {
         let req_body = serde_json::json!({
             "path": chunk.to_string_lossy(),
         });
@@ -199,23 +218,31 @@ pub fn run_npu(
         Ok((!sanitized.is_empty()).then_some(sanitized))
     });
 
-    // 优雅通知 worker 退出，并终止整个进程组（避免 uv 衍生的孙子进程残留）
+    // 优雅关闭：POST /shutdown → try_wait 轮询 ~2s → 未退再 SIGTERM 进程组
+    // （避免 uv 衍生的孙子进程残留）→ 短等 → 仍未退由 ManagedChild Drop 兜底。
     let _ = client
         .post(&format!("{base}/shutdown"))
-        .timeout(Duration::from_millis(500))
+        .timeout(SHUTDOWN_TIMEOUT)
         .send_json(serde_json::json!({}));
-    #[cfg(unix)]
-    {
-        let pid = child.id() as i32;
-        unsafe {
-            libc::kill(-pid, libc::SIGTERM);
+    if !wait_exit(&mut child, SHUTDOWN_WAIT) {
+        #[cfg(unix)]
+        {
+            let pid = child.id() as i32;
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+            }
         }
+        let _ = wait_exit(&mut child, SIGTERM_WAIT);
     }
-    child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&tmp);
 
-    let events = r?;
+    let events = r.map_err(|e| {
+        let tail = stderr_tail.tail();
+        if tail.is_empty() {
+            e
+        } else {
+            e.context(format!("NPU worker stderr 尾部：\n{tail}"))
+        }
+    })?;
     tracing::info!(
         n = events.len(),
         secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
@@ -224,12 +251,18 @@ pub fn run_npu(
     Ok(events)
 }
 
-fn write_worker_script(out_dir: &Path) -> Result<PathBuf> {
-    let dir = out_dir.join(".workers");
-    std::fs::create_dir_all(&dir)?;
-    let p = dir.join("npu_worker.py");
-    std::fs::write(&p, NPU_WORKER_SCRIPT)?;
-    Ok(p)
+/// 非阻塞轮询等待子进程退出；true = 已在 timeout 内退出。
+fn wait_exit(child: &mut crate::runtime::ManagedChild, timeout: Duration) -> bool {
+    let t0 = Instant::now();
+    loop {
+        if child.try_wait().is_some() {
+            return true;
+        }
+        if t0.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn spawn_npu_worker(script: &Path, model: &str, port: u16) -> Result<crate::runtime::ManagedChild> {
@@ -263,7 +296,9 @@ fn spawn_npu_worker(script: &Path, model: &str, port: u16) -> Result<crate::runt
         .arg(port.to_string())
         .arg("NPU")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        // stderr 不能 inherit：脚本里全是 print，会插在进度条重绘中间，
+        // 破坏 indicatif 的原地更新（同 issue #4）。piped + 后台 drain。
+        .stderr(Stdio::piped());
 
     crate::runtime::ManagedChild::spawn("NPU worker", &mut cmd)
 }

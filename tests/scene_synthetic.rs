@@ -40,21 +40,15 @@ fn make_test_video(path: &std::path::Path) {
     assert!(st.success());
 }
 
-#[test]
-fn scene_detects_slides_with_true_timestamps() {
-    if !have_ffmpeg() {
-        eprintln!("skip: ffmpeg not found");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("c2m-scene-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let video = dir.join("synthetic.mp4");
-    make_test_video(&video);
-
-    let cfg = course2md::config::PipelineConfig {
+/// 两个场景测试共享的 PipelineConfig 基座；差异字段在调用处用结构体更新语法覆盖。
+fn test_cfg(
+    video: &std::path::Path,
+    dir: &std::path::Path,
+) -> course2md::config::PipelineConfig {
+    course2md::config::PipelineConfig {
         url: video.display().to_string(),
-        out_dir: dir.clone(),
-        out_root: dir.clone(),
+        out_dir: dir.to_path_buf(),
+        out_root: dir.to_path_buf(),
         similarity: 0.9,
         sample_interval: 0.5,
         cooldown: 10.0,
@@ -66,7 +60,7 @@ fn scene_detects_slides_with_true_timestamps() {
         provider: course2md::config::AsrProvider::Cpu,
         max_speech: 20.0,
         formats: vec![course2md::config::OutputFormat::Md],
-        model_dir: dir.clone(),
+        model_dir: dir.to_path_buf(),
         keep_video: true,
         no_download: true,
         resume: false,
@@ -74,7 +68,21 @@ fn scene_detects_slides_with_true_timestamps() {
         asr_api: Default::default(),
         asr_model: None,
         transcript_source: course2md::config::TranscriptSource::Asr,
-    };
+    }
+}
+
+#[test]
+fn scene_detects_slides_with_true_timestamps() {
+    if !have_ffmpeg() {
+        eprintln!("skip: ffmpeg not found");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("c2m-scene-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let video = dir.join("synthetic.mp4");
+    make_test_video(&video);
+
+    let cfg = test_cfg(&video, &dir);
 
     let frames = tokio::runtime::Runtime::new()
         .unwrap()
@@ -125,28 +133,10 @@ drawbox=color=gray:t=fill:enable='gte(t,3.5)'";
     assert!(st.success());
 
     let cfg = course2md::config::PipelineConfig {
-        url: video.display().to_string(),
-        out_dir: dir.clone(),
-        out_root: dir.clone(),
-        similarity: 0.9,
-        sample_interval: 0.5,
         cooldown: 2.0,
         slide_mode: course2md::config::SlideMode::Stable,
         stable_secs: 1.2,
-        max_height: 1080,
-        roi: None,
-        threads: 2,
-        provider: course2md::config::AsrProvider::Cpu,
-        max_speech: 20.0,
-        formats: vec![course2md::config::OutputFormat::Md],
-        model_dir: dir.clone(),
-        keep_video: true,
-        no_download: true,
-        resume: false,
-        llm: Default::default(),
-        asr_api: Default::default(),
-        asr_model: None,
-        transcript_source: course2md::config::TranscriptSource::Asr,
+        ..test_cfg(&video, &dir)
     };
 
     let frames = tokio::runtime::Runtime::new()
@@ -154,8 +144,8 @@ drawbox=color=gray:t=fill:enable='gte(t,3.5)'";
         .block_on(course2md::scene::run(&cfg, &video))
         .expect("scene run");
     let ts: Vec<f64> = frames.iter().map(|f| f.t).collect();
-    // 黑色 transition 只存在 1.5s < stable_secs(1.2s)? 2~3.5s 黑持续1.5s > 1.2s —— 会发射。
-    // 但灰色 3.5 起稳定。此处验证核心行为：至少白(0)与灰(3.5)两页存在、黑色中间页存在与否不误报。
+    // 黑页（2~3.5s，持续 1.5s > stable_secs=1.2s）是否被单独发射取决于采样相位，
+    // 非确定行为；这里只断言确定性行为：首页 ~0s 与稳定灰页 onset ~3.5s 都存在。
     assert!(ts.len() >= 2, "stable 模式至少检出 2 页，got {ts:?}");
     assert!((ts[0] - 0.0).abs() < 1.0, "first slide ~0s, got {}", ts[0]);
     let gray = ts.iter().find(|&&t| (t - 3.5).abs() < 1.0);

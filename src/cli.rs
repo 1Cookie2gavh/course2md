@@ -74,6 +74,7 @@ pub struct RunOpts {
     pub provider: Option<crate::config::AsrProvider>,
 
     /// ASR model: qwen3 (default & recommended Qwen3-ASR 1.7B) | whisper (large-v3-turbo) | tiny | base
+    /// (backend constraints: gpu/cpu only support qwen3 family; whisper sizes like tiny/base only on coreml/npu/api)
     #[arg(long)]
     pub asr_model: Option<String>,
 
@@ -81,13 +82,17 @@ pub struct RunOpts {
     #[arg(long)]
     pub asr_api_base_url: Option<String>,
 
-    /// Cloud STT API key (OPENROUTER_API_KEY env is also honored)
+    /// Cloud STT API key (env COURSE2MD_ASR_API_KEY honored, OPENROUTER_API_KEY as legacy fallback; note: CLI values land in shell history — prefer config file or env)
     #[arg(long)]
     pub asr_api_key: Option<String>,
 
     /// Cloud STT model (e.g. qwen/qwen3-asr-flash-2026-02-10)
     #[arg(long)]
     pub asr_api_model: Option<String>,
+
+    /// Cloud STT request mode: transcriptions (/audio/transcriptions, default) | chat (/chat/completions, for audio-capable LLMs)
+    #[arg(long, value_enum)]
+    pub asr_api_mode: Option<crate::settings::AsrApiMode>,
 
     /// Transcript source: auto (subtitle first, then ASR) | subtitle | asr
     #[arg(long, value_enum)]
@@ -125,7 +130,7 @@ pub struct RunOpts {
     #[arg(long)]
     pub llm_base_url: Option<String>,
 
-    /// Override LLM API key
+    /// Override LLM API key (note: lands in shell history — prefer the config file)
     #[arg(long)]
     pub llm_api_key: Option<String>,
 

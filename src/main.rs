@@ -1,4 +1,4 @@
-use clap::FromArgMatches;
+use clap::Parser;
 use course2md::cli::{Cli, Command, ConfigCmd, LlmCmd, ModelsCmd, RunOpts, ServerCmd};
 use course2md::{config, doctor, llm, models, pipeline, server, settings};
 use tracing_subscriber::EnvFilter;
@@ -58,27 +58,27 @@ fn run_opts_to_cfg(
 ) -> anyhow::Result<config::PipelineConfig> {
     let d = &file.defaults;
     use config::{OutputFormat, SlideMode};
+    let out_root = opts
+        .out
+        .clone()
+        .or_else(|| d.out.clone())
+        .map(config::expand_tilde)
+        .unwrap_or_else(|| config::DEFAULT_OUT_DIR.into());
     Ok(config::PipelineConfig {
         url: source,
-        out_root: opts
-            .out
-            .clone()
-            .or_else(|| d.out.clone())
-            .map(config::expand_tilde)
-            .unwrap_or_else(|| "out".into()),
-        out_dir: opts
-            .out
-            .clone()
-            .or_else(|| d.out.clone())
-            .map(config::expand_tilde)
-            .unwrap_or_else(|| "out".into()),
-        similarity: opts.similarity.or(d.similarity).unwrap_or(0.85),
-        sample_interval: opts.sample_interval.or(d.sample_interval).unwrap_or(1.0),
-        cooldown: opts.cooldown.or(d.cooldown).unwrap_or(10.0),
+        // out_dir 此处只是初值；pipeline 里会改写为 {out_root}/{platform}/{title}/{id}/
+        out_dir: out_root.clone(),
+        out_root,
+        similarity: opts.similarity.or(d.similarity).unwrap_or(config::DEFAULT_SIMILARITY),
+        sample_interval: opts
+            .sample_interval
+            .or(d.sample_interval)
+            .unwrap_or(config::DEFAULT_SAMPLE_INTERVAL),
+        cooldown: opts.cooldown.or(d.cooldown).unwrap_or(config::DEFAULT_COOLDOWN),
         max_height: opts
             .max_height
             .or(d.max_height)
-            .unwrap_or(1080)
+            .unwrap_or(config::DEFAULT_MAX_HEIGHT)
             .clamp(240, 2160),
         slide_mode: opts
             .slide_mode
@@ -87,7 +87,7 @@ fn run_opts_to_cfg(
         stable_secs: opts
             .stable_secs
             .or(d.stable_secs)
-            .unwrap_or(0.8)
+            .unwrap_or(config::DEFAULT_STABLE_SECS)
             .clamp(0.0, 10.0),
         roi: match &opts.roi {
             Some(s) => Some(config::Roi::parse(s)?),
@@ -96,12 +96,15 @@ fn run_opts_to_cfg(
                 None => None,
             },
         },
-        threads: opts.threads.or(d.threads).unwrap_or(4),
+        threads: opts.threads.or(d.threads).unwrap_or(config::DEFAULT_THREADS),
         provider: opts
             .provider
             .or(d.provider)
             .unwrap_or_else(config::default_provider_hint),
-        max_speech: opts.max_speech.or(d.max_speech).unwrap_or(20.0),
+        max_speech: opts
+            .max_speech
+            .or(d.max_speech)
+            .unwrap_or(config::DEFAULT_MAX_SPEECH),
         formats: opts
             .formats
             .clone()
@@ -133,19 +136,14 @@ fn resolve_asr_api(opts: &RunOpts, file: &settings::ConfigFile) -> crate::settin
     if let Some(v) = &opts.asr_api_model {
         a.model = v.clone();
     }
+    if let Some(v) = opts.asr_api_mode {
+        a.mode = v;
+    }
     a
 }
 
 fn main() -> anyhow::Result<()> {
-    course2md::i18n::init();
-    // 帮助文本按 locale 改写后再解析
-    let cli = {
-        use clap::CommandFactory;
-        let mut cmd = Cli::command();
-        course2md::i18n::apply_cli(&mut cmd);
-        let matches = cmd.get_matches();
-        Cli::from_arg_matches(&matches)?
-    };
+    let cli = Cli::parse();
     match cli.command {
         Some(Command::Models { cmd }) => {
             init_logging(0, false);
@@ -246,11 +244,17 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Remove(args)) => {
             init_logging(0, false);
             let mut cfg = settings::load()?;
-            let mut cleared = vec![
-                "llm.api_key".to_string(),
-                "llm.base_url".to_string(),
-                "llm.model".to_string(),
-            ];
+            let mut cleared: Vec<String> = vec![];
+            // 只列出确实非空、本次真正清掉的字段（空配置不冒充「已清除」）
+            for (name, value) in [
+                ("llm.api_key", &cfg.llm.api_key),
+                ("llm.base_url", &cfg.llm.base_url),
+                ("llm.model", &cfg.llm.model),
+            ] {
+                if !value.is_empty() {
+                    cleared.push(name.to_string());
+                }
+            }
             cfg.llm.api_key.clear();
             cfg.llm.base_url.clear();
             cfg.llm.model.clear();
@@ -264,11 +268,11 @@ fn main() -> anyhow::Result<()> {
                 cfg.asr_api.api_key.clear();
             }
             let path = settings::save(&cfg)?;
-            println!(
-                "已清除 API 配置（{}）：{}",
-                cleared.join(", "),
-                path.display()
-            );
+            if cleared.is_empty() {
+                println!("没有需要清除的 API 配置：{}", path.display());
+            } else {
+                println!("已清除 API 配置（{}）：{}", cleared.join(", "), path.display());
+            }
             if !args.asr {
                 println!("提示：--asr 可同时清除云端 STT（[asr_api]）的 API Key。");
             }
@@ -300,8 +304,7 @@ fn main() -> anyhow::Result<()> {
             init_logging(cli.opts.verbose, cli.opts.quiet);
             let file = settings::load()?;
             let cfg = run_opts_to_cfg(source, &cli.opts, &file)?;
-            // 预检：所有配置错误在下载/抽帧/模型加载之前暴露（毫秒级失败）
-            cfg.validate()?;
+            // 全量预检在 pipeline::run 开头做（下载/抽帧/模型加载之前，毫秒级失败）
             tracing::info!(out = %cfg.out_dir.display(), provider = %cfg.provider, "start");
             tokio::runtime::Runtime::new()?.block_on(pipeline::run(&cfg))
         }
@@ -363,7 +366,7 @@ fn summarize_dir(
         let has_md = md_path.is_file()
             && course2md::summarize::contains_summary(&std::fs::read_to_string(&md_path)?);
         let has_html = html_path.is_file()
-            && std::fs::read_to_string(&html_path)?.contains("class=\"summary\"");
+            && course2md::summarize::contains_html_summary(&std::fs::read_to_string(&html_path)?);
         if has_md && has_html {
             println!("跳过（已有总结，--force 可覆盖）：{}", dir.display());
             return Ok(());
@@ -391,7 +394,7 @@ fn summarize_dir(
     }
     if html_path.is_file() {
         let html = std::fs::read_to_string(&html_path)?;
-        let html = if html.contains("class=\"summary\"") {
+        let html = if course2md::summarize::contains_html_summary(&html) {
             course2md::summarize::strip_html_summary(&html)
         } else {
             html
