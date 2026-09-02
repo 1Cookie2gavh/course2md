@@ -5,35 +5,88 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>course2md Web</title>
 <style>
-:root { color-scheme: light; }
+/* ===== 主题变量：浅色（默认）===== */
+:root {
+  color-scheme: light;
+  --bg: #ffffff;
+  --card-bg: #ffffff;
+  --text: #1f2328;
+  --muted: #57606a;
+  --border: #d0d7de;
+  --input-bg: #ffffff;
+  --input-text: #1f2328;
+  --log-bg: #f6f8fa;
+  --log-text: #1f2328;
+  --link: #0969da;
+  --notice-bg: #fff8c5;
+  --notice-text: #5c4d00;
+  --notice-border: #d4a72c66;
+  --progress-track: #d0d7de;
+  --btn-primary: #0969da;
+  --btn-primary-text: #ffffff;
+  --del-border: #cf222e66;
+  --shadow: none;
+}
+/* ===== 主题变量：深色 ===== */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0d1117;
+  --card-bg: #161b22;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --border: #30363d;
+  --input-bg: #0d1117;
+  --input-text: #e6edf3;
+  --log-bg: #0d1117;
+  --log-text: #c9d1d9;
+  --link: #58a6ff;
+  --notice-bg: #332b00;
+  --notice-text: #ffd76d;
+  --notice-border: #d4a72c66;
+  --progress-track: #30363d;
+  --btn-primary: #1f6feb;
+  --btn-primary-text: #ffffff;
+  --del-border: #f8514966;
+}
+
 * { box-sizing: border-box; }
-body { font-family: system-ui,-apple-system,"Segoe UI",sans-serif; max-width: 1100px; margin: 0 auto; padding: 1rem; line-height: 1.6; color: #1f2328; background: #fff; }
-h1 { font-size: 1.4rem; color: #1f2328; }
-h2 { font-size: 1.05rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; margin-top: 2rem; color: #1f2328; }
-.card { border: 1px solid #8885; border-radius: 8px; padding: .8rem 1rem; margin: .8rem 0; background: #fff; }
-textarea { width: 100%; min-height: 90px; font-family: inherit; color: #1f2328; }
-input[type=text], input[type=password], select { padding: .35rem .5rem; color: #1f2328; }
+body { font-family: system-ui,-apple-system,"Segoe UI",sans-serif; max-width: 1100px; margin: 0 auto; padding: 1rem; line-height: 1.6; background: var(--bg); color: var(--text); transition: background .2s, color .2s; }
+h1 { font-size: 1.4rem; color: var(--text); }
+h2 { font-size: 1.05rem; border-bottom: 1px solid var(--border); padding-bottom: .3rem; margin-top: 2rem; color: var(--text); }
+.head-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .5rem; }
+#themeBtn { padding: .3rem .7rem; cursor: pointer; border: 1px solid var(--border); border-radius: 6px; background: var(--card-bg); color: var(--text); }
+#themeBtn:hover { border-color: var(--link); }
+.card { border: 1px solid var(--border); border-radius: 8px; padding: .8rem 1rem; margin: .8rem 0; background: var(--card-bg); }
+textarea { width: 100%; min-height: 90px; font-family: inherit; background: var(--input-bg); color: var(--input-text); border: 1px solid var(--border); border-radius: 6px; padding: .4rem; }
+input[type=text], input[type=password], select { padding: .35rem .5rem; background: var(--input-bg); color: var(--input-text); border: 1px solid var(--border); border-radius: 6px; }
 .row { display: flex; gap: .8rem; flex-wrap: wrap; align-items: center; margin: .5rem 0; }
-.row label { white-space: nowrap; color: #1f2328; }
-button { padding: .45rem 1rem; cursor: pointer; }
-.btn-primary { background: #0969da; color: #fff !important; border: none; border-radius: 6px; font-size: 1rem; padding: .55rem 1.4rem; }
+.row label { white-space: nowrap; color: var(--text); }
+button { padding: .45rem 1rem; cursor: pointer; background: var(--card-bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+.btn-primary { background: var(--btn-primary); color: var(--btn-primary-text) !important; border: none; font-size: 1rem; padding: .55rem 1.4rem; }
 table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #8883; font-size: .92rem; vertical-align: top; color: #1f2328; }
-.progress { background: #8883; border-radius: 4px; height: 10px; width: 110px; display: inline-block; vertical-align: middle; }
+th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--border); font-size: .92rem; vertical-align: top; color: var(--text); }
+th { color: var(--muted); font-weight: 600; }
+.progress { background: var(--progress-track); border-radius: 4px; height: 10px; width: 110px; display: inline-block; vertical-align: middle; }
 .progress > div { background: #2da44e; height: 100%; border-radius: 4px; }
 .badge { padding: .1rem .45rem; border-radius: 10px; font-size: .78rem; color: #fff; }
 .b-queued { background:#6e7781; } .b-running { background:#0969da; } .b-done { background:#1a7f37; } .b-failed { background:#cf222e; }
 details { margin: .2rem 0; }
-pre.log { background:#00000014; padding:.5rem; font-size:.8rem; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-all; color:#1f2328; }
-.muted { color:#57606a; font-size:.85rem; }
-a { color:#0969da; }
-.notice { background:#fff8c5; border:1px solid #d4a72c66; border-radius:6px; padding:.5rem .8rem; margin:.5rem 0; font-size:.88rem; color:#5c4d00; }
-.del-btn { color:#cf222e; background:none; border:1px solid #cf222e66; border-radius:4px; padding:.1rem .4rem; font-size:.78rem; cursor:pointer; }
-.del-btn:hover { background:#cf222e; color:#fff; }
+summary { cursor: pointer; color: var(--muted); }
+pre.log { background: var(--log-bg); padding: .5rem; font-size: .8rem; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all; color: var(--log-text); border: 1px solid var(--border); border-radius: 6px; }
+.muted { color: var(--muted); font-size: .85rem; }
+a { color: var(--link); }
+.notice { background: var(--notice-bg); border: 1px solid var(--notice-border); border-radius: 6px; padding: .5rem .8rem; margin: .5rem 0; font-size: .88rem; color: var(--notice-text); }
+.del-btn { color: #cf222e; background: none; border: 1px solid var(--del-border); border-radius: 4px; padding: .1rem .4rem; font-size: .78rem; cursor: pointer; }
+.del-btn:hover { background: #cf222e; color: #fff; }
+:root[data-theme="dark"] .del-btn { color: #f85149; }
+:root[data-theme="dark"] .del-btn:hover { background: #f85149; color: #fff; }
 </style>
 </head>
 <body>
-<h1>📹 course2md Web</h1>
+<div class="head-row">
+  <h1 style="margin:0">📹 course2md Web</h1>
+  <button id="themeBtn" title="切换浅色/深色模式">🌙 深色</button>
+</div>
 <p class="muted">本地服务（仅本机可访问）。粘贴视频链接或本地文件路径，每行一个，可混合 B 站 / YouTube / 本地视频。</p>
 
 <div class="card">
@@ -93,6 +146,25 @@ const fmtSec = s => { if(s==null) return '—'; s=Math.round(s); const m=Math.fl
 const fmtDur = d => { if(!d||d<=0) return '—'; const m=Math.floor(d/60), r=Math.round(d%60); return m>0? (m+'m'+r+'s') : (r+'s'); };
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function badge(status){ return `<span class="badge b-${status}">${status}</span>`; }
+
+// ===== 主题切换（记忆选择，默认跟随系统）=====
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  try { localStorage.setItem('c2m-theme', t); } catch(e){}
+  $('themeBtn').textContent = t === 'dark' ? '☀️ 浅色' : '🌙 深色';
+}
+(function initTheme(){
+  let t = null;
+  try { t = localStorage.getItem('c2m-theme'); } catch(e){}
+  if (t !== 'light' && t !== 'dark') {
+    t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  applyTheme(t);
+})();
+$('themeBtn').onclick = () => {
+  const cur = document.documentElement.getAttribute('data-theme');
+  applyTheme(cur === 'dark' ? 'light' : 'dark');
+};
 
 function renderTasks(){
   const tb = $('tasks').querySelector('tbody');
