@@ -5,28 +5,31 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>course2md Web</title>
 <style>
-:root { color-scheme: light dark; }
-body { font-family: system-ui,-apple-system,"Segoe UI",sans-serif; max-width: 1000px; margin: 0 auto; padding: 1rem; line-height: 1.6; }
-h1 { font-size: 1.4rem; }
-h2 { font-size: 1.05rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; margin-top: 2rem; }
-.card { border: 1px solid #8885; border-radius: 8px; padding: .8rem 1rem; margin: .8rem 0; }
-textarea { width: 100%; box-sizing: border-box; min-height: 90px; font-family: inherit; }
-input[type=text], select { padding: .35rem .5rem; }
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body { font-family: system-ui,-apple-system,"Segoe UI",sans-serif; max-width: 1100px; margin: 0 auto; padding: 1rem; line-height: 1.6; color: #1f2328; background: #fff; }
+h1 { font-size: 1.4rem; color: #1f2328; }
+h2 { font-size: 1.05rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; margin-top: 2rem; color: #1f2328; }
+.card { border: 1px solid #8885; border-radius: 8px; padding: .8rem 1rem; margin: .8rem 0; background: #fff; }
+textarea { width: 100%; min-height: 90px; font-family: inherit; color: #1f2328; }
+input[type=text], input[type=password], select { padding: .35rem .5rem; color: #1f2328; }
 .row { display: flex; gap: .8rem; flex-wrap: wrap; align-items: center; margin: .5rem 0; }
-.row label { white-space: nowrap; }
+.row label { white-space: nowrap; color: #1f2328; }
 button { padding: .45rem 1rem; cursor: pointer; }
-.btn-primary { background: #0969da; color: #fff; border: none; border-radius: 6px; font-size: 1rem; padding: .55rem 1.4rem; }
+.btn-primary { background: #0969da; color: #fff !important; border: none; border-radius: 6px; font-size: 1rem; padding: .55rem 1.4rem; }
 table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #8883; font-size: .92rem; vertical-align: top; }
-.progress { background: #8883; border-radius: 4px; height: 10px; width: 120px; display: inline-block; vertical-align: middle; }
+th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #8883; font-size: .92rem; vertical-align: top; color: #1f2328; }
+.progress { background: #8883; border-radius: 4px; height: 10px; width: 110px; display: inline-block; vertical-align: middle; }
 .progress > div { background: #2da44e; height: 100%; border-radius: 4px; }
 .badge { padding: .1rem .45rem; border-radius: 10px; font-size: .78rem; color: #fff; }
 .b-queued { background:#6e7781; } .b-running { background:#0969da; } .b-done { background:#1a7f37; } .b-failed { background:#cf222e; }
 details { margin: .2rem 0; }
-pre.log { background:#00000014; padding:.5rem; font-size:.8rem; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
-.muted { color:#888; font-size:.85rem; }
+pre.log { background:#00000014; padding:.5rem; font-size:.8rem; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-all; color:#1f2328; }
+.muted { color:#57606a; font-size:.85rem; }
 a { color:#0969da; }
-.notice { background:#fff8c5; border:1px solid #d4a72c66; border-radius:6px; padding:.5rem .8rem; margin:.5rem 0; font-size:.88rem; }
+.notice { background:#fff8c5; border:1px solid #d4a72c66; border-radius:6px; padding:.5rem .8rem; margin:.5rem 0; font-size:.88rem; color:#5c4d00; }
+.del-btn { color:#cf222e; background:none; border:1px solid #cf222e66; border-radius:4px; padding:.1rem .4rem; font-size:.78rem; cursor:pointer; }
+.del-btn:hover { background:#cf222e; color:#fff; }
 </style>
 </head>
 <body>
@@ -53,12 +56,12 @@ a { color:#0969da; }
 
 <div class="card">
   <h2 style="margin-top:0">任务列表</h2>
-  <table id="tasks"><thead><tr><th>#</th><th>来源</th><th>状态</th><th>进度</th><th>日志</th></tr></thead><tbody></tbody></table>
+  <table id="tasks"><thead><tr><th>#</th><th>来源</th><th>状态</th><th>进度</th><th>耗时</th><th>结果</th><th>日志</th></tr></thead><tbody></tbody></table>
 </div>
 
 <div class="card">
   <h2 style="margin-top:0">配置</h2>
-  <div class="notice">API Key 只保存在本机配置文件；页面只显示脱敏结果，修改时需重新输入完整 Key。</div>
+  <div class="notice">⚠️ API Key 只保存在本机配置文件；页面只显示脱敏结果，修改时需重新输入完整 Key。</div>
   <div class="row">
     <label>启用 LLM <input type="checkbox" id="c_enabled"></label>
     <label>Base URL <input type="text" id="c_base_url" style="width:220px"></label>
@@ -78,17 +81,17 @@ a { color:#0969da; }
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">已转换输出</h2>
-  <button id="refreshOut">刷新</button>
-  <table id="outputs"><thead><tr><th>标题</th><th>总结</th><th>文件</th></tr></thead><tbody></tbody></table>
+  <h2 style="margin-top:0">已转换输出 <span class="muted" id="outRoot"></span></h2>
+  <button id="refreshOut">🔄 刷新</button>
+  <table id="outputs"><thead><tr><th>标题</th><th>总结</th><th>截图/语音/时长</th><th>操作</th></tr></thead><tbody></tbody></table>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
 let tasks = new Map();
-const fmt = p => Math.round(p) + '%';
+const fmtSec = s => { if(s==null) return '—'; s=Math.round(s); const m=Math.floor(s/60), r=s%60; return m>0? (m+'m'+r+'s') : (r+'s'); };
+const fmtDur = d => { if(!d||d<=0) return '—'; const m=Math.floor(d/60), r=Math.round(d%60); return m>0? (m+'m'+r+'s') : (r+'s'); };
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
 function badge(status){ return `<span class="badge b-${status}">${status}</span>`; }
 
 function renderTasks(){
@@ -96,10 +99,15 @@ function renderTasks(){
   tb.innerHTML = '';
   for (const t of tasks.values()){
     const tr = document.createElement('tr');
+    const result = t.status==='done'
+      ? `${t.screenshots!=null?t.screenshots+'图':'—'} / ${t.segments!=null?t.segments+'段':'—'}`
+      : (t.status==='failed' ? '✗' : '—');
     tr.innerHTML = `<td>${t.id}</td>
       <td>${esc(t.source)}<br><span class="muted">${esc(t.stage)}</span></td>
       <td>${badge(t.status)}</td>
-      <td><span class="progress"><div style="width:${t.progress}%"></div></span> ${fmt(t.progress)}</td>
+      <td><span class="progress"><div style="width:${t.progress}%"></div></span> ${Math.round(t.progress)}%</td>
+      <td>${fmtSec(t.elapsed_secs)}</td>
+      <td>${esc(result)}</td>
       <td><details><summary>展开日志（${t.log.length} 行）</summary><pre class="log">${esc(t.log.join('\n'))}</pre></details></td>`;
     tb.appendChild(tr);
   }
@@ -129,24 +137,36 @@ function loadConfig(){
 
 function loadOutputs(){
   fetch('/api/outputs').then(r=>r.json()).then(d=>{
+    $('outRoot').textContent = '（根目录：' + d.root + '）';
     const tb = $('outputs').querySelector('tbody');
     tb.innerHTML = '';
-    if(!(d.outputs||[]).length){ tb.innerHTML = '<tr><td colspan=3 class="muted">暂无输出（配置默认输出目录后刷新）</td></tr>'; return; }
+    if(!(d.outputs||[]).length){ tb.innerHTML = '<tr><td colspan=4 class="muted">暂无输出</td></tr>'; return; }
     (d.outputs||[]).forEach(o=>{
       const tr = document.createElement('tr');
-      const rel = o.path.replace(/\\/g,'/').split('/').slice(-2).join('/');
+      const enc = encodeURIComponent(o.rel);
       const links = [];
-      if(o.has_md) links.push(`<a href="/api/output/${encodeURIComponent(rel)}/course.md" target="_blank">md</a>`);
-      if(o.has_html) links.push(`<a href="/api/output/${encodeURIComponent(rel)}/course.html" target="_blank">html</a>`);
+      if(o.has_md) links.push(`<a href="/api/output/${enc}/course.md" target="_blank">md</a>`);
+      if(o.has_html) links.push(`<a href="/api/output/${enc}/course.html" target="_blank">html</a>`);
+      const stats = `${o.screenshots!=null?o.screenshots:0} 图 / ${o.segments!=null?o.segments:0} 段 / ${fmtDur(o.duration)}`;
       tr.innerHTML = `<td>${esc(o.title)}<br><span class="muted">${esc(o.path)}</span></td>
-        <td class="muted">${esc(o.summary || (o.has_summary ? '' : '（无总结）'))}</td>
-        <td>${links.join(' ')}</td>`;
+        <td class="muted">${esc(o.summary || (o.has_summary ? '（有总结）' : '（无总结）'))}</td>
+        <td>${esc(stats)}</td>
+        <td>${links.join(' ')} <button class="del-btn" data-rel="${esc(o.rel)}" data-title="${esc(o.title)}">删除</button></td>`;
       tb.appendChild(tr);
+    });
+    tb.querySelectorAll('.del-btn').forEach(btn=>{
+      btn.onclick = ()=>{
+        const rel = btn.getAttribute('data-rel');
+        const title = btn.getAttribute('data-title');
+        if(!confirm(`确定删除「${title}」的整个输出目录吗？\n（${rel}）`)) return;
+        fetch('/api/output/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rel})})
+          .then(r=>r.json()).then(d=>{ if(d.ok){ alert('已删除'); loadOutputs(); } else alert('删除失败：'+(d.error||'')); })
+          .catch(e=>alert('删除失败：'+e));
+      };
     });
   }).catch(()=>{});
 }
 
-// SSE
 function connectSSE(){
   const es = new EventSource('/api/events');
   es.onmessage = ev => {
@@ -156,15 +176,15 @@ function connectSSE(){
     else if(d.type === 'task_done'){
       loadTasks();
       const t = tasks.get(d.id);
-      notify('✅ 转换完成', t ? t.source : ('任务 '+d.id));
-      loadOutputs();
+      notify('✅ 转换完成', (t?t.source:'任务 '+d.id) + (t&&t.elapsed_secs?`（耗时 ${fmtSec(t.elapsed_secs)}）`:''));
+      setTimeout(loadOutputs, 500);
     }
     else if(d.type === 'task_failed'){
       loadTasks();
       notify('❌ 转换失败', (tasks.get(d.id)||{}).source || ('任务 '+d.id));
     }
   };
-  es.onerror = () => { /* 自动重连 */ };
+  es.onerror = () => {};
 }
 
 function notify(title, body){
@@ -203,7 +223,7 @@ $('saveCfg').onclick = () => {
   const ak = $('c_asr_key').value; if(ak.trim()) body.asr_api.api_key = ak.trim();
   fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
-      if(d.ok){ alert('配置已保存'); loadConfig(); }
+      if(d.ok){ alert('配置已保存'); loadConfig(); loadOutputs(); }
       else alert('保存失败：'+(d.error||''));
     }).catch(e=>alert('保存失败：'+e));
 };

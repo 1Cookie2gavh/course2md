@@ -82,6 +82,9 @@ struct Task {
     progress: u8, // 0-100
     log: Vec<String>,
     out_dir: Option<String>,
+    elapsed_secs: Option<f64>,
+    screenshots: Option<u32>,
+    segments: Option<u32>,
 }
 
 const MAX_LOG: usize = 600;
@@ -139,6 +142,9 @@ impl Manager {
             progress: 0,
             log: vec![format!("[任务 {}] 已创建：{}", id, source)],
             out_dir,
+            elapsed_secs: None,
+            screenshots: None,
+            segments: None,
         };
         self.tasks.lock().unwrap().push(task);
         {
@@ -190,6 +196,7 @@ fn parse_progress(line: &str) -> Option<(String, u8)> {
 }
 
 fn run_conversion(mgr: &Arc<Manager>, id: u64, _source: &str, args: &[String]) {
+    let t_started = std::time::Instant::now();
     mgr.update(id, |t| {
         t.status = "running".into();
         t.stage = "启动中".into();
@@ -265,12 +272,25 @@ fn run_conversion(mgr: &Arc<Manager>, id: u64, _source: &str, args: &[String]) {
             bail!("转换进程退出码 {}", status.code().unwrap_or(-1))
         }
     })();
+    let elapsed = t_started.elapsed().as_secs_f64();
     match result {
         Ok(()) => {
+            let (shots, segs) = {
+                let tasks = mgr.tasks.lock().unwrap();
+                let log = tasks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.log.join("\n"))
+                    .unwrap_or_default();
+                parse_stats(&log)
+            };
             mgr.update(id, |t| {
                 t.status = "done".into();
                 t.stage = "完成".into();
                 t.progress = 100;
+                t.elapsed_secs = Some(elapsed);
+                t.screenshots = shots;
+                t.segments = segs;
                 t.log.push("[任务] 转换完成 ✓".into());
             });
             mgr.emit(&serde_json::json!({"type": "task_done", "id": id}).to_string());
@@ -279,11 +299,36 @@ fn run_conversion(mgr: &Arc<Manager>, id: u64, _source: &str, args: &[String]) {
             mgr.update(id, |t| {
                 t.status = "failed".into();
                 t.stage = "失败".into();
+                t.elapsed_secs = Some(elapsed);
                 t.log.push(format!("[任务] 失败：{e:#}"));
             });
             mgr.emit(&serde_json::json!({"type": "task_failed", "id": id, "error": format!("{e:#}")}).to_string());
         }
     }
+}
+
+/// 从转换输出中解析 "Stats: N screenshots / M speech segments / ..."。
+fn parse_stats(log: &str) -> (Option<u32>, Option<u32>) {
+    for line in log.lines() {
+        if let Some(pos) = line.find("Stats:") {
+            let rest = &line[pos + 6..];
+            let shots = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.trim_end_matches("screenshots").trim().parse::<u32>().ok());
+            // find "/ N speech segments"
+            let segs = rest
+                .find("speech segments")
+                .and_then(|p| {
+                    rest[..p]
+                        .rsplit('/')
+                        .next()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                });
+            return (shots, segs);
+        }
+    }
+    (None, None)
 }
 
 fn worker_loop(mgr: Arc<Manager>) {
@@ -338,6 +383,34 @@ fn ok_json(v: &serde_json::Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>
 
 fn not_found() -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     json_response(404, "{\"error\":\"not found\"}".into())
+}
+
+/// URL 百分号解码（前端 encodeURIComponent 会把 / 编成 %2F，此处还原为路径分隔符）。
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push(h * 16 + l);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn read_body(request: &mut tiny_http::Request) -> String {
@@ -565,13 +638,13 @@ fn handle(mgr: &Arc<Manager>, mut request: tiny_http::Request) {
                 .unwrap_or_else(|| PathBuf::from("out"));
             let mut outputs = vec![];
             if root.is_dir() {
-                collect_outputs(&root, &mut outputs, 0);
+                collect_outputs(&root, &root, &mut outputs, 0);
             }
             let _ = request.respond(ok_json(&serde_json::json!({"root": root.display().to_string(), "outputs": outputs})));
         }
         (tiny_http::Method::Get, path) if path.starts_with("/api/output/") => {
-            // /api/output/<urlencoded path>/course.md|course.html|summary
-            let rel = path.trim_start_matches("/api/output/");
+            // /api/output/<urlencoded rel>/course.md|course.html（rel 相对输出根，含平台段）
+            let rel = percent_decode(path.trim_start_matches("/api/output/"));
             let cfg = crate::settings::load().unwrap_or_default();
             let root = cfg
                 .defaults
@@ -579,7 +652,7 @@ fn handle(mgr: &Arc<Manager>, mut request: tiny_http::Request) {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("out"));
             let canon_root = root.canonicalize().unwrap_or(root.clone());
-            let target = canon_root.join(rel);
+            let target = canon_root.join(&rel);
             let canon_target = target.canonicalize().unwrap_or(target.clone());
             if !canon_target.starts_with(&canon_root) || !canon_target.is_file() {
                 let _ = request.respond(not_found());
@@ -596,13 +669,41 @@ fn handle(mgr: &Arc<Manager>, mut request: tiny_http::Request) {
                     .with_header(format!("Content-Type: {mime}").parse::<tiny_http::Header>().unwrap()),
             );
         }
+        (tiny_http::Method::Post, "/api/output/delete") => {
+            // 删除整个输出目录（含 course.md/html/frames/timeline 等）
+            let body = read_body(&mut request);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+            let rel = v.get("rel").and_then(|x| x.as_str()).unwrap_or("");
+            let rel = percent_decode(rel);
+            let cfg = crate::settings::load().unwrap_or_default();
+            let root = cfg
+                .defaults
+                .out
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("out"));
+            let canon_root = root.canonicalize().unwrap_or(root.clone());
+            let target = canon_root.join(&rel);
+            let canon_target = target.canonicalize().unwrap_or(target.clone());
+            if rel.is_empty() || !canon_target.starts_with(&canon_root) || !canon_target.is_dir() {
+                let _ = request.respond(json_response(400, "{\"error\":\"无效路径\"}".into()));
+                return;
+            }
+            match std::fs::remove_dir_all(&canon_target) {
+                Ok(()) => {
+                    let _ = request.respond(ok_json(&serde_json::json!({"ok": true, "deleted": target.display().to_string()})));
+                }
+                Err(e) => {
+                    let _ = request.respond(json_response(500, format!("{{\"error\":\"{}\"}}", e)));
+                }
+            }
+        }
         _ => {
             let _ = request.respond(not_found());
         }
     }
 }
 
-fn collect_outputs(dir: &Path, out: &mut Vec<serde_json::Value>, depth: usize) {
+fn collect_outputs(root: &Path, dir: &Path, out: &mut Vec<serde_json::Value>, depth: usize) {
     if depth > 5 {
         return;
     }
@@ -626,20 +727,41 @@ fn collect_outputs(dir: &Path, out: &mut Vec<serde_json::Value>, depth: usize) {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
+        // 相对 root 的路径（含平台段），供内容/删除接口精确定位
+        let rel = dir
+            .strip_prefix(root)
+            .map(|p| p.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"))
+            .unwrap_or_else(|_| dir.display().to_string());
+        // 截图数 / 语音段数 / 时长
+        let screenshots = std::fs::read_dir(dir.join("frames"))
+            .map(|it| it.flatten().filter(|e| e.path().is_file()).count())
+            .unwrap_or(0);
+        let segments = std::fs::read_to_string(dir.join("timeline.jsonl"))
+            .map(|s| s.lines().filter(|l| l.contains("\"type\":\"speech\"") || l.contains("\"type\": \"speech\"")).count())
+            .unwrap_or(0);
+        let duration = std::fs::read_to_string(dir.join("meta.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("duration").and_then(|d| d.as_f64()))
+            .unwrap_or(0.0);
         out.push(serde_json::json!({
             "title": title,
             "path": dir.display().to_string(),
+            "rel": rel,
             "has_md": has_md,
             "has_html": has_html,
             "has_summary": has_summary,
             "summary": summary,
+            "screenshots": screenshots,
+            "segments": segments,
+            "duration": duration,
         }));
         return;
     }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             if e.path().is_dir() {
-                collect_outputs(&e.path(), out, depth + 1);
+                collect_outputs(root, &e.path(), out, depth + 1);
             }
         }
     }
