@@ -124,21 +124,32 @@ impl Checkpoint {
                     .collect();
                 let mut f = std::fs::OpenOptions::new()
                     .create(true)
-                    .append(true)
+                    .read(true)
+                    .write(true)
+                    // 保留既有内容（partial resume），显式不 truncate
+                    .truncate(false)
                     .open(&path)
                     .with_context(|| format!("打开 checkpoint {}", path.display()))?;
                 let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
                 if loaded.valid_len < file_len {
-                    // 打开 append 句柄前把文件截断到最后一个完整行：
+                    // 打开写入句柄前把文件截断到最后一个完整行：
                     // 否则崩溃残留的半截行会和新记录拼成一行中间损坏 JSON，
                     // 下次 resume 直接硬错误（自我污染）。
+                    // 注意：不能用 append-only 句柄做 set_len——Windows 上
+                    // FILE_APPEND_DATA 不含写长度权限，会 Access denied。
                     f.set_len(loaded.valid_len)
                         .with_context(|| format!("截断 checkpoint 残行 {}", path.display()))?;
                 } else if loaded.needs_newline {
                     // 末行是合法 JSON 但缺尾换行（手改文件）：先补换行再追加
+                    use std::io::Seek as _;
+                    f.seek(std::io::SeekFrom::End(0))?;
                     f.write_all(b"\n")
                         .with_context(|| format!("补换行 {}", path.display()))?;
                 }
+                // 非 append 句柄：后续 record 前定位到文件尾（单写者进程，一次即可）
+                use std::io::Seek as _;
+                f.seek(std::io::SeekFrom::End(0))
+                    .with_context(|| format!("seek checkpoint {}", path.display()))?;
                 cp.file = Some(f);
             }
         }
