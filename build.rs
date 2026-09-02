@@ -1,7 +1,7 @@
 //! macOS arm64：编译并静态链接 Apple 原生 ASR/VAD 模块（speech-swift）。
 //! 其他平台或设置 COURSE2MD_NO_APPLE=1 时跳过（course2md 回落 llama.cpp 路径）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -29,7 +29,19 @@ fn main() {
     // 无条件跑 swift build：SPM 自己做增量（无变动时秒级返回）。
     // 曾经的「libCAppleASR.a 存在即跳过」stamp 判断是真 bug：
     // 只改 Swift 源码（不碰 Package.swift）时会链上旧的静态库。
-    let ok = run(Command::new("swift")
+    //
+    // 优先 swiftbuild 构建系统（Swift 6.2+）：旧 native 系统不会编译
+    // mlx-swift Cmlx 里的 .metal shader，产不出 default.metallib，
+    // CoreML 推理运行时必挂（CI macos-26 默认 Xcode 较老时踩中）。
+    // 工具链不支持 swiftbuild 时回退默认构建系统。
+    let ok = run(Command::new("swift").args([
+        "build",
+        "-c",
+        "release",
+        "--build-system",
+        "swiftbuild",
+    ])
+    .current_dir(&pkg)) || run(Command::new("swift")
         .args(["build", "-c", "release"])
         .current_dir(&pkg));
     if !ok {
@@ -103,14 +115,21 @@ fn main() {
     // MLX 运行时需要 metallib 与可执行文件同目录（mlx.metallib）。
     // 默认取 SPM build 产物（mlx-swift_Cmlx.bundle 内的 default.metallib）；
     // 仅当仓库根存在手动放置的 mlx.metallib 时才优先用它（便于 runner 固定版本）。
+    // 注意 .build 下的布局随构建系统不同（swiftbuild: out/Products/Release，
+    // native: <triple>/release），canonical 路径找不到就递归搜索兜底。
     let vendored = pkg.join("mlx.metallib");
     let products = build_dir.canonicalize().unwrap_or(build_dir);
     let bundle = if vendored.is_file() {
-        vendored
+        Some(vendored)
     } else {
-        products.join("mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib")
+        let expect = products.join("mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib");
+        if expect.is_file() {
+            Some(expect)
+        } else {
+            find_file_recursive(&pkg.join(".build"), "default.metallib", 8)
+        }
     };
-    if bundle.is_file() {
+    if let Some(bundle) = bundle {
         if let Ok(out_dir) = std::env::var("OUT_DIR") {
             // OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out
             let exe_dir = PathBuf::from(out_dir).join("../../../");
@@ -124,8 +143,8 @@ fn main() {
         }
     } else {
         println!(
-            "cargo:warning=未找到 mlx.metallib（{}），CoreML 推理可能失败",
-            bundle.display()
+            "cargo:warning=未找到 mlx.metallib（{} 下递归搜索无果），CoreML 推理可能失败",
+            pkg.join(".build").display()
         );
     }
     // Swift 5 语言模式包的兼容钩子 + clang 运行时（___isPlatformVersionAtLeast 等）
@@ -241,4 +260,26 @@ fn run(cmd: &mut Command) -> bool {
             false
         }
     }
+}
+
+/// 在 dir 下递归查找指定文件名（限深，跳过 symlink 防环）。
+/// 用于 SPM 产物定位：.build 布局随构建系统（swiftbuild/native）不同。
+fn find_file_recursive(dir: &Path, name: &str, depth: u32) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut dirs = vec![];
+    for e in entries.flatten() {
+        let p = e.path();
+        if e.file_name() == name && p.is_file() {
+            return Some(p);
+        }
+        // 不跟随符号链接（.build/release → out/Products/Release 会造成重复遍历）
+        if p.is_dir() && !e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            dirs.push(p);
+        }
+    }
+    dirs.into_iter()
+        .find_map(|d| find_file_recursive(&d, name, depth - 1))
 }
