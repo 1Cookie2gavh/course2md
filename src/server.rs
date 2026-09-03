@@ -523,9 +523,21 @@ fn handle(mgr: &Arc<Manager>, mut request: tiny_http::Request) {
             // 已有转换输出或在队列中 → 跳过并提示，不重复建任务。
             let dedup = v.get("dedup").and_then(|x| x.as_bool()).unwrap_or(true);
             if sources.is_empty() {
+                eprintln!(
+                    "[http] POST /api/tasks 400: sources 为空（body {} 字节，原始: {}）",
+                    body.len(),
+                    body.chars().take(200).collect::<String>()
+                );
                 let _ = request.respond(json_response(400, "{\"error\":\"sources 为空\"}".into()));
                 return;
             }
+            eprintln!(
+                "[http] POST /api/tasks sources={} dedup={} out={:?}（body {} 字节）",
+                sources.len(),
+                dedup,
+                out_dir,
+                body.len()
+            );
             // 已转换输出的去重键：id 目录名 -> rel；local 平台另记 标题目录 -> rel
             let mut existing: std::collections::HashMap<String, String> = Default::default();
             let mut local_titles: std::collections::HashMap<String, String> = Default::default();
@@ -586,6 +598,11 @@ fn handle(mgr: &Arc<Manager>, mut request: tiny_http::Request) {
                     queued_keys.insert(k);
                 }
             }
+            eprintln!(
+                "[http] POST /api/tasks -> created={} skipped={}",
+                ids.len(),
+                skipped.len()
+            );
             let _ = request.respond(ok_json(&serde_json::json!({"ids": ids, "skipped": skipped})));
         }
         (tiny_http::Method::Get, "/api/config") => {

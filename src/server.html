@@ -277,15 +277,21 @@ $('start').onclick = () => {
   const out = $('out').value.trim();
   if(out) body.out = out;
   fetch('/api/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
-    .then(r=>r.json()).then(d=>{
+    .then(r => r.json().catch(()=>({})).then(d => ({ok:r.ok, status:r.status, d})))
+    .then(({ok, status, d}) => {
       $('sources').value = '';
+      if(!ok){
+        // 明确区分“提交失败/服务端错误”与“去重跳过”，避免误导
+        $('startHint').textContent = '❌ 提交失败（HTTP ' + status + '）：' + (d.error || '未知错误');
+        return;
+      }
       const parts = [];
       if((d.ids||[]).length) parts.push('已加入队列 ' + d.ids.length + ' 个：' + d.ids.join(', '));
       if((d.skipped||[]).length){
         parts.push('⏭ 跳过重复 ' + d.skipped.length + ' 个：'
           + d.skipped.map(s=>s.source + '：' + s.reason).join('；'));
       }
-      $('startHint').textContent = parts.length ? parts.join('。') : '（全部被跳过，无新任务）';
+      $('startHint').textContent = parts.length ? parts.join('。') : '（未创建任何任务，请检查输入内容）';
       loadTasks();
     }).catch(e=>alert('提交失败：'+e));
 };
