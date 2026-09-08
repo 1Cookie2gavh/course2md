@@ -199,6 +199,10 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ServerCmd,
     },
+    /// Log in to Bilibili by QR code (preview/subtitles/downloads use this session)
+    LoginBilibili,
+    /// Remove the saved Bilibili login session
+    LogoutBilibili,
 }
 
 #[derive(Subcommand)]

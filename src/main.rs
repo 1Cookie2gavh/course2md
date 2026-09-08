@@ -1,6 +1,6 @@
 use clap::Parser;
 use course2md::cli::{Cli, Command, ConfigCmd, LlmCmd, ModelsCmd, RunOpts, ServerCmd};
-use course2md::{config, doctor, llm, models, pipeline, server, settings};
+use course2md::{auth, config, doctor, llm, models, pipeline, server, settings};
 use tracing_subscriber::EnvFilter;
 
 fn init_logging(verbose: u8, quiet: bool) {
@@ -291,6 +291,8 @@ fn main() -> anyhow::Result<()> {
                 ServerCmd::Run { port } => server::run(port),
             }
         }
+        Some(Command::LoginBilibili) => auth::login(),
+        Some(Command::LogoutBilibili) => auth::logout(),
         None => {
             let source = match cli.source {
                 Some(s) if config::looks_like_source(&s) => s,
