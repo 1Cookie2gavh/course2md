@@ -77,6 +77,7 @@ fn clear_state() {
 struct Task {
     id: u64,
     source: String,
+    title: Option<String>, // 解析出的视频标题（任务列表展示），None = 尚未取到
     status: String, // queued | running | done | failed
     stage: String,
     progress: u8, // 0-100
@@ -137,6 +138,7 @@ impl Manager {
         let task = Task {
             id,
             source: source.to_string(),
+            title: None,
             status: "queued".into(),
             stage: "排队中".into(),
             progress: 0,
@@ -342,6 +344,106 @@ fn parse_stats(log: &str) -> (Option<u32>, Option<u32>) {
     (None, None)
 }
 
+// ---------------------------------------------------------------- task titles
+
+/// 拉取一个任务来源的视频标题（任务列表展示用）：本地文件取文件名主名（无需网络），
+/// 远程 URL 走 exe 同目录的 yt-dlp shim `--print title`（自动带代理/登录 cookie 策略）。
+/// 网络最多等 15 秒，超时杀掉进程并返回 None（任务本身照常转换）。
+fn fetch_task_title(exe_dir: &Path, source: &str) -> Option<String> {
+    if source_looks_local(source) {
+        return Path::new(source)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty());
+    }
+    if !source.starts_with("http://") && !source.starts_with("https://") {
+        return None;
+    }
+    let yt = if cfg!(windows) {
+        exe_dir.join("yt-dlp.exe")
+    } else {
+        exe_dir.join("yt-dlp")
+    };
+    if !yt.is_file() {
+        return None;
+    }
+    let mut child = match Command::new(&yt)
+        .args(["--no-download", "--print", "%(title)s"])
+        .arg(source)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                if !st.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() > Duration::from_secs(15) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(_) => return None,
+        }
+    }
+    use std::io::BufRead;
+    let out = child.stdout.take()?;
+    let mut buf = String::new();
+    let _ = std::io::BufReader::new(out).read_line(&mut buf);
+    let t = buf.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// 给任务补标题（已取到则跳过）；供 worker 与预取线程共用。
+fn fill_task_title(mgr: &Manager, id: u64) {
+    let (exe_dir, source) = {
+        let tasks = mgr.tasks.lock().unwrap();
+        let t = match tasks.iter().find(|t| t.id == id) {
+            Some(t) => t,
+            None => return,
+        };
+        if t.title.is_some() {
+            return;
+        }
+        (mgr.cmd.parent().map(|p| p.to_path_buf()), t.source.clone())
+    };
+    let Some(dir) = exe_dir else { return };
+    let title = fetch_task_title(&dir, &source);
+    mgr.update(id, |t| {
+        t.title = title;
+    });
+}
+
+/// 后台预取线程：为所有还没有标题的任务抓标题（入队后几秒内任务列表即可显示）。
+/// 常驻空闲（400ms 轮询），与 worker 串行转换互不阻塞。
+fn prefetch_loop(mgr: Arc<Manager>) {
+    loop {
+        let target = {
+            let tasks = mgr.tasks.lock().unwrap();
+            tasks.iter().find(|t| t.title.is_none()).map(|t| t.id)
+        };
+        match target {
+            Some(id) => fill_task_title(&mgr, id),
+            None => std::thread::sleep(Duration::from_millis(400)),
+        }
+    }
+}
+
 fn worker_loop(mgr: Arc<Manager>) {
     loop {
         let id = {
@@ -362,6 +464,8 @@ fn worker_loop(mgr: Arc<Manager>) {
             )
         };
         let mut args: Vec<String> = vec![];
+        // 开跑前确保标题已就位（预取线程一般已填充；此处兜底）
+        fill_task_title(&mgr, id);
         args.push(source.clone());
         if let Some(out) = &out_dir
             && !out.trim().is_empty()
@@ -452,6 +556,10 @@ pub fn run(port: u16) -> Result<()> {
     std::thread::spawn({
         let mgr = Arc::clone(&mgr);
         move || worker_loop(mgr)
+    });
+    std::thread::spawn({
+        let mgr = Arc::clone(&mgr);
+        move || prefetch_loop(mgr)
     });
     tracing::info!("course2md web 服务已启动: http://{addr}");
     println!("course2md web 服务已启动: http://{addr}  (Ctrl+C 停止)");

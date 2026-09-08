@@ -110,7 +110,7 @@ a { color: var(--link); }
 
 <div class="card">
   <h2 style="margin-top:0">任务列表</h2>
-  <table id="tasks"><thead><tr><th>#</th><th>来源</th><th>状态</th><th>进度</th><th>耗时</th><th>结果</th><th>日志</th></tr></thead><tbody></tbody></table>
+  <table id="tasks"><thead><tr><th>#</th><th>标题</th><th>来源</th><th>状态</th><th>进度</th><th>耗时</th><th>结果</th><th>日志</th></tr></thead><tbody></tbody></table>
 </div>
 
 <div class="card">
@@ -176,7 +176,11 @@ function renderTasks(){
       ? `${t.screenshots!=null?t.screenshots+'图':'—'} / ${t.segments!=null?t.segments+'段':'—'}`
       : (t.status==='failed' ? '✗' : '—');
     tr.innerHTML = `<td>${t.id}</td>
-      <td>${esc(t.source)}<br><span class="muted">${esc(t.stage)}</span></td>
+      <td style="max-width:340px">
+        <div title="${esc(t.title||t.source)}" style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.title||'…')}</div>
+        <div class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.stage)}</div>
+      </td>
+      <td><span class="muted" title="${esc(t.source)}" style="display:block;max-width:300px;font-size:.8rem;word-break:break-all">${esc(t.source)}</span></td>
       <td>${badge(t.status)}</td>
       <td><span class="progress"><div style="width:${t.progress}%"></div></span> ${Math.round(t.progress)}%</td>
       <td>${fmtSec(t.elapsed_secs)}</td>
