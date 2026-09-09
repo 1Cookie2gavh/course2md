@@ -17,14 +17,11 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     crate::error::require_cmd("ffmpeg")?;
     crate::error::require_cmd("ffprobe")?;
     use config::AsrProvider;
-    if !matches!(
-        cfg.provider,
-        AsrProvider::Coreml | AsrProvider::Api | AsrProvider::Npu
-    ) {
-        crate::error::require_cmd("llama-server")?;
-    } else if cfg.provider == AsrProvider::Coreml
-        && crate::error::require_cmd("llama-server").is_err()
-    {
+    let llama_present = crate::error::require_cmd("llama-server").is_ok();
+    if matches!(cfg.provider, AsrProvider::Gpu | AsrProvider::Cpu) && !llama_present {
+        // 有平台字幕时不走本地识别：把硬性校验推迟到“真正要转写”之前（字幕路径不受影响）
+        tracing::warn!("未找到 llama-server：将在真正需要本地语音识别时报错（字幕可用则无需）");
+    } else if cfg.provider == AsrProvider::Coreml && !llama_present {
         // fallback 是 best-effort：提前告知而不是失败后才发现
         tracing::warn!("未找到 llama-server：CoreML 若失败将无法回退到 gpu 后端（best-effort）");
     }
@@ -175,6 +172,15 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         let frames = frames_res?;
         audio_res?;
         tracing::info!(device = %cfg.provider, "transcribe");
+        // 真正需要本地语音识别时才硬性校验 llama-server（字幕路径无需本地识别，
+        // 精简包/无 llama 环境在此给出明确指引而非莫名失败）
+        if matches!(cfg.provider, config::AsrProvider::Gpu | config::AsrProvider::Cpu)
+            && crate::error::require_cmd("llama-server").is_err()
+        {
+            anyhow::bail!(
+                "该视频没有可用字幕，需要本地语音识别，但未找到 llama-server。请改用完整版，或 --provider api"
+            );
+        }
         let events = asr::run(&cfg, &cfg.audio_path()).await?;
         (frames, events)
     };
