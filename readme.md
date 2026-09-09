@@ -11,6 +11,50 @@ Turn YouTube, Bilibili, or local course/meeting recordings into slide-illustrate
 
 ---
 
+## ✨ Fork additions (maintained on [1Cookie2gavh/course2md](https://github.com/1Cookie2gavh/course2md), based on upstream v1.3.0)
+
+### Local Web service
+
+Paste URLs / local file paths into the browser and queue conversions without the CLI:
+
+```bash
+course2md server start      # background daemon, default http://127.0.0.1:18080 (auto-increments if busy)
+course2md server status     # show PID / port / health
+course2md server stop       # stop the daemon
+```
+
+Open the printed URL in a browser (e.g. `http://127.0.0.1:18080`):
+- One source per line; mix Bilibili / YouTube / local files;
+- Tasks run **serially** (one at a time — fits a single-GPU llama speech backend);
+- **Dedup is enabled by default**: a video already in 【已转换输出】 or the queue
+  (matched by Bilibili BV id / YouTube id / local file name) is skipped with a notice;
+  uncheck 启用去重 to force a re-run;
+- The task table shows the **resolved video title**, live stage and progress;
+- Deleting an output also prunes empty parent directories.
+
+`course2md doctor`, model management, and `--provider gpu/cpu` behave exactly as in the CLI —
+the web UI is just a scheduler around the same local pipeline.
+
+### Bilibili login (recommended: higher quality + AI-subtitle fast path)
+
+```bash
+course2md login-bilibili    # prints a QR code → scan with the Bilibili mobile app (~30 days valid)
+course2md logout-bilibili   # remove the saved login
+```
+
+Once logged in:
+1. Downloads are **more stable (far fewer HTTP 412)** and can reach higher resolution / login-only content;
+2. **Bilibili AI-subtitle fast path**: under `transcript-source auto` course2md fetches the
+   official AI captions first and, when they cover the video, **skips local GPU/CPU speech
+   recognition** — several times faster. Partially-generated captions (common for very long
+   videos) are re-fetched with backoff; only if still unusable does it fall back to ASR.
+
+> ⚠️ The login is stored as cookies at `%APPDATA%/course2md/auth/bilibili.cookies.txt`
+> (`~/.config/course2md/auth/...` on macOS/Linux). Treat it as a **secret**: never commit it,
+> never share it. Re-run the login command to refresh after expiry.
+
+---
+
 ## Quick Start
 
 > Make sure you completed the [Installation](#installation) section first.

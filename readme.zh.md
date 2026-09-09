@@ -11,6 +11,51 @@
 
 ---
 
+## ✨ 本仓库附加功能（fork 维护，基于上游 v1.3.0）
+
+> 以下为 [1Cookie2gavh/course2md](https://github.com/1Cookie2gavh/course2md) 分支上维护的**附加能力**：
+> 本地 Web 服务 + 浏览器任务管理 + Bilibili 登录态（扫码）与「B 站 AI 字幕快路径」。
+> 详细变更与排障记录见本仓库提交历史。
+
+### 本地 Web 服务（Windows / 任意平台均可）
+
+把链接/本地路径粘贴到浏览器即可排队转换，无需手敲命令行：
+
+```bash
+course2md server start      # 后台常驻，默认 http://127.0.0.1:18080（端口被占用会自动顺延）
+course2md server status     # 查看 PID / 端口 / 健康状态
+course2md server stop       # 停止服务
+```
+
+浏览器打开启动时打印的地址（如 `http://127.0.0.1:18080`）：
+- 粘贴视频链接或本地文件路径，**每行一个**，可混合 B 站 / YouTube / 本地视频；
+- 任务**串行执行**（一次一个，适配单 GPU 的 llama 语音识别）；
+- 「启用去重」默认勾选：同一视频（B 站 BV 号 / YouTube id / 本地文件名）已在
+  【已转换输出】或任务队列中时自动跳过并提示；需要强制重转请取消勾选；
+- 任务列表直接显示**解析出的视频标题**、实时阶段与进度；
+- 删除输出后自动清理空目录。
+
+> 提示：`doctor` 依赖检测、模型下载、`--provider gpu/cpu` 等能力与 CLI 完全一致；
+> Web 只是调度的外壳，实际转换仍是完整本地管线。
+
+### Bilibili 登录态（强烈推荐：更高清晰度 + AI 字幕快路径）
+
+```bash
+course2md login-bilibili    # 终端显示二维码 → 手机 B 站 App 扫码（约 30 天有效）
+course2md logout-bilibili   # 清除登录态
+```
+
+登录后自动获得两项能力：
+1. **下载**更稳定（显著减少 412 限流）、可获取更高清晰度/登录专属内容；
+2. **B 站 AI 字幕快路径**：`transcript-source auto` 下优先抓取官方 AI 字幕，
+   命中即**跳过本地 GPU/CPU 语音识别**，转换速度提升数倍；字幕仍在生成（覆盖不足）时
+   自动重试，仍不可用才回落 ASR。B 站长视频字幕可能分片/延迟生成，逻辑已做覆盖度校验。
+
+> ⚠️ 登录态以 cookie 形式保存在 `%APPDATA%/course2md/auth/bilibili.cookies.txt`（macOS/Linux 为
+> `~/.config/course2md/auth/...`），属于**敏感凭据**：不要提交进仓库、不要外泄；到期重新扫码即可。
+
+---
+
 ## 快速上手
 
 > 请先完成[安装指南](#安装指南)。
