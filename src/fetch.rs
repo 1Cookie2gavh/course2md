@@ -191,59 +191,99 @@ fn bilibili_ai_subtitle_srt(url: &str, out_dir: &Path) -> Result<Option<PathBuf>
     let Some(bvid) = extract_bvid(url) else {
         return Ok(None);
     };
-    // 1) cid
+    // 1) cid（顺带拿分 P 时长，用于字幕覆盖度校验）
     let page = bili_http_get(
         &format!("https://api.bilibili.com/x/player/pagelist?bvid={bvid}&jsonp=jsonp"),
         &cookie,
     )?;
-    let Some(cid) = page["data"].as_array().and_then(|a| a.first()).and_then(|f| f["cid"].as_u64()) else {
+    let Some(first) = page["data"].as_array().and_then(|a| a.first()) else {
         return Ok(None);
     };
-    // 2) 字幕列表（player/v2；空 url 偶发，重试几次）
+    let Some(cid) = first["cid"].as_u64() else {
+        return Ok(None);
+    };
+    let duration_secs = first["duration"].as_f64();
+    // 2) 字幕列表：wbi/v2 优先（长视频的 URL 往往只在 wbi/v2 返回），v2 兜底；
+    //    subtitle_url 偶发为空 → 两个端点交替重试几次
     let mut chosen: Option<String> = None;
-    for _ in 0..4 {
-        let v = bili_http_get(
-            &format!("https://api.bilibili.com/x/player/v2?bvid={bvid}&cid={cid}"),
-            &cookie,
-        )?;
-        let subs = v["data"]["subtitle"]["subtitles"].as_array().cloned().unwrap_or_default();
-        for lan in ["ai-zh", "ai-en"] {
-            if let Some(s) = subs
-                .iter()
-                .find(|s| s["lan"].as_str() == Some(lan) && s["subtitle_url"].as_str().is_some_and(|u| !u.is_empty()))
-            {
-                chosen = s["subtitle_url"].as_str().map(|u| u.to_string());
+    let eps = [
+        "https://api.bilibili.com/x/player/wbi/v2",
+        "https://api.bilibili.com/x/player/v2",
+    ];
+    for _ in 0..6 {
+        for ep in eps {
+            let v = bili_http_get(&format!("{ep}?bvid={bvid}&cid={cid}"), &cookie)?;
+            let subs = v["data"]["subtitle"]["subtitles"].as_array().cloned().unwrap_or_default();
+            for lan in ["ai-zh", "ai-en"] {
+                if let Some(s) = subs
+                    .iter()
+                    .find(|s| s["lan"].as_str() == Some(lan) && s["subtitle_url"].as_str().is_some_and(|u| !u.is_empty()))
+                {
+                    chosen = s["subtitle_url"].as_str().map(|u| u.to_string());
+                    break;
+                }
+            }
+            if chosen.is_some() {
                 break;
             }
         }
         if chosen.is_some() {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(1200));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
     }
     let Some(sub_url) = chosen else {
         return Ok(None);
     };
-    // 3) 字幕 JSON
+    // 3) 字幕 JSON。长视频的 AI 字幕可能仍在生成/接口暂态：内容覆盖不足时
+    //    间隔递增重试几次（最长约 2 分钟），仍不足才放弃回落其它路径。
     let abs = if sub_url.starts_with("//") {
         format!("https:{sub_url}")
     } else {
         sub_url
     };
-    let j: serde_json::Value = ureq::get(&abs)
-        .set(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0 Safari/537.36",
-        )
-        .timeout(std::time::Duration::from_secs(20))
-        .call()
-        .with_context(|| "AI 字幕内容请求失败")?
-        .into_string()
-        .with_context(|| "AI 字幕响应读取失败")?
-        .parse()
-        .with_context(|| "AI 字幕响应非 JSON")?;
-    let body = j["body"].as_array().cloned().unwrap_or_default();
-    if body.is_empty() {
+    let mut body: Vec<serde_json::Value> = Vec::new();
+    for attempt in 0..4 {
+        let j: serde_json::Value = ureq::get(&abs)
+            .set(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0 Safari/537.36",
+            )
+            .set("Referer", "https://www.bilibili.com/")
+            .timeout(std::time::Duration::from_secs(25))
+            .call()
+            .with_context(|| "AI 字幕内容请求失败")?
+            .into_string()
+            .with_context(|| "AI 字幕响应读取失败")?
+            .parse()
+            .with_context(|| "AI 字幕响应非 JSON")?;
+        body = j["body"].as_array().cloned().unwrap_or_default();
+        if body.is_empty() {
+            return Ok(None);
+        }
+        let last_to = body.iter().filter_map(|x| x["to"].as_f64()).fold(0.0_f64, f64::max);
+        if subtitle_coverage_ok(last_to, duration_secs) {
+            break;
+        }
+        if attempt < 3 {
+            let wait = if attempt == 0 { 15 } else { 30 };
+            tracing::warn!(
+                last_to,
+                cues = body.len(),
+                wait_s = wait,
+                "B 站 AI 字幕覆盖不足（可能仍在生成），{wait}s 后重试"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(wait));
+        }
+    }
+    let last_to = body.iter().filter_map(|x| x["to"].as_f64()).fold(0.0_f64, f64::max);
+    if !subtitle_coverage_ok(last_to, duration_secs) {
+        tracing::warn!(
+            last_to,
+            duration = ?duration_secs,
+            cues = body.len(),
+            "B 站 AI 字幕仍未生成完整，弃用并回落其它路径"
+        );
         return Ok(None);
     }
     // 4) 写 .srt（与 yt-dlp 产物同目录约定：out/.subs/*.srt）
@@ -256,6 +296,15 @@ fn bilibili_ai_subtitle_srt(url: &str, out_dir: &Path) -> Result<Option<PathBuf>
     }
     std::fs::write(&path, srt)?;
     Ok(Some(path))
+}
+
+/// 字幕覆盖度是否可用：未知时长时要求至少 30 条且覆盖 ≥180s；
+/// 已知时长时要求覆盖 ≥60%（不足说明是 B 站未生成完全的残字幕）。
+fn subtitle_coverage_ok(last_to: f64, duration_secs: Option<f64>) -> bool {
+    match duration_secs {
+        Some(dur) if dur > 0.0 => last_to >= dur * 0.6,
+        _ => last_to >= 180.0,
+    }
 }
 
 
@@ -368,5 +417,18 @@ mod tests {
         assert!(srt.contains("00:00:00,080 --> 00:00:02,080\n第一句 测试"), "SRT 时间戳/内容格式须与 subtitle::parse_subtitle 契约一致: {srt}");
         assert!(srt.contains("00:00:02,080 --> 00:00:04,540\n第二句"));
         assert!(!srt.contains("00:00:03,000"), "空内容 cue 应被跳过");
+    }
+
+    #[test]
+    fn subtitle_coverage_guard() {
+        // 全长覆盖 / >60% → 可用
+        assert!(subtitle_coverage_ok(416.0, Some(416.0)));
+        assert!(subtitle_coverage_ok(300.0, Some(416.0)));
+        // B 站超长视频只生成了开头一小段 → 弃用（回落 ASR）
+        assert!(!subtitle_coverage_ok(113.0, Some(5906.0)));
+        assert!(!subtitle_coverage_ok(476.0, Some(5906.0)));
+        // 未知时长兜底：≥180s 才算数
+        assert!(subtitle_coverage_ok(200.0, None));
+        assert!(!subtitle_coverage_ok(100.0, None));
     }
 }
