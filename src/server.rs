@@ -44,6 +44,29 @@ fn state_path() -> PathBuf {
     crate::config::config_dir().join("server.json")
 }
 
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+/// 状态文件候选：配置目录 → TEMP → exe 所在目录（后两者用于受限/沙箱终端，
+/// 此时写 %APPDATA% 会被拒绝；exe 目录在受限环境通常仍可写）。
+fn state_paths() -> Vec<PathBuf> {
+    let mut v = vec![state_path()];
+    let t = std::env::temp_dir().join("course2md").join("server.json");
+    if !v.contains(&t) {
+        v.push(t);
+    }
+    if let Some(d) = exe_dir() {
+        let p = d.join("server.json");
+        if !v.contains(&p) {
+            v.push(p);
+        }
+    }
+    v
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct ServerState {
     pid: Option<u32>,
@@ -55,20 +78,37 @@ fn save_state(pid: u32, port: u16) -> Result<()> {
         pid: Some(pid),
         port: Some(port),
     })?;
-    std::fs::write(state_path(), s)?;
-    Ok(())
+    let mut last_err: Option<std::io::Error> = None;
+    for p in state_paths() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        match std::fs::write(&p, &s) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    match last_err {
+        Some(e) => Err(anyhow::anyhow!("保存状态文件失败: {e}")),
+        None => Err(anyhow::anyhow!("保存状态文件失败")),
+    }
 }
 
 fn load_state() -> Option<ServerState> {
-    let p = state_path();
-    if !p.is_file() {
-        return None;
+    for p in state_paths() {
+        if let Ok(s) = std::fs::read_to_string(&p)
+            && let Ok(state) = serde_json::from_str(&s)
+        {
+            return Some(state);
+        }
     }
-    serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()
+    None
 }
 
 fn clear_state() {
-    let _ = std::fs::remove_file(state_path());
+    for p in state_paths() {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 // ---------------------------------------------------------------- tasks
@@ -1148,23 +1188,53 @@ fn kill_pid(pid: u32) -> Result<()> {
     }
 }
 
+/// 打开后台日志文件：配置目录 → TEMP → exe 所在目录，全部失败则丢弃输出
+/// （受限/沙箱终端里常写不进 %APPDATA% 与 TEMP，但 exe 目录通常可写）。
+fn open_server_log() -> (Option<std::fs::File>, Option<PathBuf>) {
+    let mut candidates: Vec<PathBuf> = vec![crate::config::config_dir().join("server.log")];
+    candidates.push(std::env::temp_dir().join("course2md-server.log"));
+    if let Some(d) = exe_dir() {
+        candidates.push(d.join("server.log"));
+    }
+    for path in &candidates {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::File::create(path) {
+            Ok(f) => {
+                if path != &candidates[0] {
+                    eprintln!("警告：无法写入日志 {}，已改用 {}", candidates[0].display(), path.display());
+                }
+                return (Some(f), Some(path.clone()));
+            }
+            Err(e) => eprintln!("警告：无法写入日志 {}（{e}）", path.display()),
+        }
+    }
+    eprintln!("警告：无法创建任何日志文件，后台输出将被丢弃（服务仍会启动）");
+    (None, None)
+}
+
 /// `server start`：启动后台守护进程（关终端仍可访问）。
 pub fn start(base_port: u16) -> Result<u16> {
     let port = find_free_port(base_port).context("找不到可用端口")?;
     let exe = std::env::current_exe().context("获取自身路径失败")?;
-    let log_path = crate::config::config_dir().join("server.log");
-    if let Some(dir) = log_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let log = std::fs::File::create(&log_path).context("创建日志文件失败")?;
+    let (log, log_path) = open_server_log();
+    let stdout = match &log {
+        Some(f) => Stdio::from(f.try_clone()?),
+        None => Stdio::null(),
+    };
+    let stderr = match log {
+        Some(f) => Stdio::from(f),
+        None => Stdio::null(),
+    };
     #[cfg(windows)]
     let child = {
         use std::os::windows::process::CommandExt;
         Command::new(&exe)
             .args(["server", "run", "--port", &port.to_string()])
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
+            .stdout(stdout)
+            .stderr(stderr)
             // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP：无窗口、独立进程组，关终端不杀
             .creation_flags(0x08000000 | 0x00000200)
             .spawn()
@@ -1173,8 +1243,8 @@ pub fn start(base_port: u16) -> Result<u16> {
     let child = Command::new(&exe)
         .args(["server", "run", "--port", &port.to_string()])
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn();
     let child = child.context("启动后台服务失败")?;
     // 等健康检查通过（最多 ~10s）
@@ -1195,8 +1265,13 @@ pub fn start(base_port: u16) -> Result<u16> {
         let _ = kill_pid(child.id());
         bail!("服务启动超时（端口 {port}）");
     }
-    save_state(child.id(), port)?;
+    if let Err(e) = save_state(child.id(), port) {
+        eprintln!("警告：状态文件保存失败（{e}）——server stop/status 可能不可用，请记录端口 {port}");
+    }
     println!("course2md server 已启动（后台常驻）: http://127.0.0.1:{port}");
+    if let Some(p) = log_path {
+        println!("日志: {}", p.display());
+    }
     println!("停止：course2md server stop");
     Ok(port)
 }
@@ -1268,6 +1343,9 @@ pub fn status() -> Result<()> {
                 println!(
                     "PID {pid} | 端口 {port} | 进程存活: {alive} | 服务健康: {healthy} | http://127.0.0.1:{port}"
                 );
+                if !alive && !healthy {
+                    println!("（状态文件已过期：进程已退出；可直接执行 course2md server start 重新启动）");
+                }
             }
             Ok(())
         }
