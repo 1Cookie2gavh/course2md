@@ -203,20 +203,41 @@ impl Manager {
 
 fn parse_progress(line: &str) -> Option<(String, u8)> {
     let l = line.to_lowercase();
-    if l.contains("asr done") {
-        return Some(("识别完成".into(), 60));
+    if l.contains("summary done") {
+        return Some(("总结完成".into(), 98));
     }
     if l.contains("llm summary") {
         return Some(("LLM 总结".into(), 92));
     }
-    if l.contains("summary done") {
-        return Some(("总结完成".into(), 98));
+    if l.contains("asr done") {
+        return Some(("识别完成".into(), 60));
+    }
+    if l.contains("probe platform subtitles") {
+        return Some(("探测字幕".into(), 10));
+    }
+    if l.contains("使用 b 站 ai 字幕") || l.contains("subtitle transcript") {
+        return Some(("获取字幕".into(), 50));
+    }
+    if l.contains("slide sample") {
+        return Some(("场景采样".into(), 12));
+    }
+    if l.contains("ssim scan done") {
+        return Some(("场景检测完成".into(), 45));
+    }
+    if l.contains("slides extracted") {
+        return Some(("截图提取完成".into(), 55));
+    }
+    if l.contains("merged sections") {
+        return Some(("合并段落".into(), 95));
     }
     if l.contains("download video") || l.contains("下载") {
         return Some(("下载视频".into(), 8));
     }
     if l.contains("extract slides") {
         return Some(("提取画面/音频".into(), 15));
+    }
+    if l.contains("llm polish") {
+        return Some(("LLM 润色".into(), 88));
     }
     if l.contains("transcribe") {
         return Some(("语音识别".into(), 30));
@@ -305,7 +326,19 @@ fn run_conversion(mgr: &Arc<Manager>, id: u64, _source: &str, args: &[String]) {
                 }
             }
         });
-        let status = child.wait()?;
+        // 轮询等待进程结束：期间每 1.5s 刷新一次“耗时”，长视频处理时页面
+        // 不会看起来像卡死（阶段/进度由日志解析更新，耗时由心跳更新）。
+        let status = loop {
+            match child.try_wait()? {
+                Some(st) => break st,
+                None => {
+                    mgr.update(id, |t| {
+                        t.elapsed_secs = Some(t_started.elapsed().as_secs_f64());
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                }
+            }
+        };
         let _ = reader.join();
         let _ = out_reader.join();
         if status.success() {
