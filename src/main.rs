@@ -142,7 +142,28 @@ fn resolve_asr_api(opts: &RunOpts, file: &settings::ConfigFile) -> crate::settin
     a
 }
 
+/// 把当前 exe 所在目录放到 PATH 最前面，保证 ffmpeg/ffprobe/yt-dlp/llama-server
+/// 等外部工具优先使用“应用自带的那份”，而不是 PATH 中其它副本（受限环境旧副本
+/// 会带来错误的文件访问限制），同时让 yt-dlp 合并时用对的 ffmpeg。
+fn prepend_exe_dir_to_path() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    let dir = dir.to_path_buf();
+    let old = std::env::var_os("PATH").unwrap_or_default();
+    let mut parts: Vec<std::path::PathBuf> = vec![dir.clone()];
+    for p in std::env::split_paths(&old) {
+        if p != dir {
+            parts.push(p);
+        }
+    }
+    if let Ok(joined) = std::env::join_paths(parts) {
+        // SAFETY: 在 main 最开头、尚未创建任何线程时调用，之后不再并发修改环境变量。
+        unsafe { std::env::set_var("PATH", joined); }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    prepend_exe_dir_to_path();
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Models { cmd }) => {

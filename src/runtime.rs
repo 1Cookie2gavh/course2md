@@ -137,10 +137,11 @@ pub fn wait_ready(
     }
 }
 
-/// 在 PATH 上查找可执行文件（Windows 自动尝试 .exe 后缀）。
-/// PATH 找不到时兜底查找当前可执行文件所在目录：course2md 与 ffmpeg/ffprobe/
-/// llama-server/yt-dlp 常同目录部署（tools\bin），而后台守护进程继承的 PATH
-/// 可能不含该目录（如从脚本/受限环境 `server start` 拉起）。
+/// 查找外部工具（Windows 自动尝试 .exe 后缀）。
+///
+/// **优先当前可执行文件同目录**：course2md 与 ffmpeg/ffprobe/llama-server/yt-dlp
+/// 常同目录部署（tools\bin），应用要使用自带的那份，而不是 PATH 里其它副本
+/// （例如受限环境里的旧副本会继承错误的文件访问限制），随后再搜索 PATH 兜底。
 pub fn which(cmd: &str) -> Option<PathBuf> {
     let names: Vec<String> = if cfg!(windows) {
         vec![cmd.to_string(), format!("{cmd}.exe")]
@@ -148,13 +149,17 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
         vec![cmd.to_string()]
     };
     let mut search: Vec<PathBuf> = vec![];
-    if let Some(path) = std::env::var_os("PATH") {
-        search.extend(std::env::split_paths(&path));
-    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         search.push(dir.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for d in std::env::split_paths(&path) {
+            if !search.contains(&d) {
+                search.push(d);
+            }
+        }
     }
     search
         .into_iter()
