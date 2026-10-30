@@ -75,8 +75,14 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     };
     let platform = config::platform_from(&cfg.url, &meta.extractor);
     cfg.out_dir = config::course_dir(&cfg.out_root, &platform, &title, &id);
-    tokio::fs::create_dir_all(&cfg.out_dir).await?;
-    meta.save(&cfg.meta_path())?;
+    tokio::fs::create_dir_all(&cfg.out_dir).await.with_context(|| {
+        format!(
+            "创建输出目录失败：{}（检查路径是否可写；若守护进程运行在受限/沙箱终端，可能禁止写该位置）",
+            cfg.out_dir.display()
+        )
+    })?;
+    meta.save(&cfg.meta_path())
+        .with_context(|| format!("写入 meta.json 失败：{}", cfg.meta_path().display()))?;
     tracing::info!(
         title = %meta.title,
         platform = %platform,

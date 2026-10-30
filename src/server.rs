@@ -540,6 +540,18 @@ fn not_found() -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     json_response(404, "{\"error\":\"not found\"}".into())
 }
 
+/// 输出目录可写探针：建目录 + 写一个临时文件再删除。
+/// 用于在任务创建阶段就暴露“受限/沙箱终端无法写盘”的问题。
+fn probe_writable(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("无法创建目录 {}", root.display()))?;
+    let probe = root.join(format!(".course2md_write_probe_{}", std::process::id()));
+    std::fs::write(&probe, b"ok")
+        .with_context(|| format!("无法写入 {}", probe.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 /// URL 百分号解码（前端 encodeURIComponent 会把 / 编成 %2F，此处还原为路径分隔符）。
 fn percent_decode(s: &str) -> String {
     fn hex(b: u8) -> Option<u8> {
@@ -686,6 +698,23 @@ fn handle(mgr: &Arc<Manager>, mut request: tiny_http::Request) {
                 out_dir,
                 body.len()
             );
+            // 输出目录可写预检：字节级 write 探针。受限/沙箱环境里写盘失败会让
+            // 每个任务都在“fetch metadata 之后”莫名失败（os error 5），这里提前给出
+            // 明确指引。
+            let out_root = out_dir
+                .as_deref()
+                .map(PathBuf::from)
+                .or_else(|| crate::settings::load().ok().and_then(|c| c.defaults.out.clone()))
+                .unwrap_or_else(|| PathBuf::from("out"));
+            if let Err(e) = probe_writable(&out_root) {
+                let msg = format!(
+                    "输出目录不可写：{}（{e}）。如果守护进程是从受限/沙箱终端启动的，请把输出目录改到可写位置，或在普通终端重新执行 course2md server start",
+                    out_root.display()
+                );
+                eprintln!("[http] POST /api/tasks 400: {msg}");
+                let _ = request.respond(json_response(400, serde_json::json!({"error": msg}).to_string()));
+                return;
+            }
             // 已转换输出的去重键：id 目录名 -> rel；local 平台另记 标题目录 -> rel
             let mut existing: std::collections::HashMap<String, String> = Default::default();
             let mut local_titles: std::collections::HashMap<String, String> = Default::default();
@@ -1421,6 +1450,19 @@ mod tests {
         assert_eq!(titles.get("web 测试").map(String::as_str), Some("local/web 测试/web_test-406484cb"));
         assert!(!titles.contains_key("消防演练"), "bilibili 平台标题不应进入 local 标题集合");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_probe_reports_unwritable_target() {
+        let base = std::env::temp_dir().join(format!("c2m_probe_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // 目录可写
+        assert!(probe_writable(&base).is_ok());
+        // 目标是一个已存在的普通文件 → 不可写
+        let file = base.join("not_a_dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(probe_writable(&file).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
