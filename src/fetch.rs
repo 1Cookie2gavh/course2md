@@ -323,6 +323,22 @@ pub async fn download(url: &str, dest: &Path, max_height: u32, verbose: bool) ->
     for attempt in 0..3 {
         if attempt > 0 {
             tracing::warn!(attempt, "retry yt-dlp");
+            // 续传残留可能损坏或与远端不匹配（典型：HTTP 416 Requested Range Not
+            // Satisfiable），重试前清理半截文件，从头下载，避免重试也必然失败。
+            if let Some(dir) = tmp.parent() {
+                let prefix = tmp
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if name.starts_with(&prefix) {
+                            let _ = std::fs::remove_file(e.path());
+                        }
+                    }
+                }
+            }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
         let mut cmd = Command::new("yt-dlp");
